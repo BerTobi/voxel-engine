@@ -509,6 +509,59 @@ static void test_lava_source_held(void)
 }
 
 /* =========================================================================
+ * Case 6b (0.2 regression) - a player edit OVER a registered source retires it.
+ * sim_init auto-registers a lava cell as a held Dirichlet source. When a player
+ * break/place overwrites that exact cell with a NON-emissive voxel, the engine
+ * calls sim_notify_edit, which must retire the stale source slot - otherwise the
+ * PHASE-2 re-stamp loop pins the (now stone/air) cell to the lava hold every
+ * tick: an invisible heat "ghost". Phase A: confirm the source holds hot. Phase
+ * B: overwrite with ambient stone + sim_notify_edit, tick, assert it COOLS to
+ * ambient (pre-fix it would stay at CODE_LAVA forever).
+ * ========================================================================= */
+static void test_edit_over_source_retires_slot(void)
+{
+    Chunk c;
+    fill_uniform(&c, MAT_STONE, CODE_AMBIENT);
+
+    uint16_t li = (uint16_t)vox_index(8, 8, 8);
+    c.voxels[li] = make_solid(MAT_LAVA, (uint8_t)CODE_LAVA);
+
+    SimState s;
+    int t, a_hot, b_cool;
+    uint8_t after_break;
+    char buf[200];
+
+    sim_build_conduct_lut();
+    sim_init(&s, &c);                       /* auto-registers the lava source */
+
+    /* Phase A: the source holds hot. */
+    for (t = 0; t < 50; ++t) sim_tick(&s);
+    a_hot = (vox_temp_code(c.voxels[li]) == (uint8_t)CODE_LAVA);
+
+    /* Phase B: a player breaks/places over the source cell -> non-emissive
+     * voxel + notify. (world_edit_voxel does the chunk_set; we do it directly.) */
+    c.voxels[li] = make_solid(MAT_STONE, (uint8_t)CODE_AMBIENT);
+    sim_notify_edit(&s, (int)li);
+    for (t = 0; t < 300; ++t) sim_tick(&s);
+    after_break = vox_temp_code(c.voxels[li]);
+    /* With the slot retired the cell is ordinary stone: it must NOT be pinned to
+     * the lava hold - it cools far out of the hot range, down into the cool band.
+     * (It settles a touch ABOVE pure ambient, not exactly at it: the heat the
+     * source injected during Phase A is conserved and redistributes across the
+     * closed chunk to a slightly-warm equilibrium. The defect was a 1160 C ghost;
+     * cooling to ~29 C proves the slot is gone.) */
+    b_cool = (after_break != (uint8_t)CODE_LAVA) && (after_break <= (uint8_t)CODE_WARM);
+
+    snprintf(buf, sizeof buf,
+             "A held-hot=%d (want code %u); B after edit+notify code=%u, want<=warm %u, not lava %u",
+             a_hot, (unsigned)CODE_LAVA, (unsigned)after_break,
+             (unsigned)CODE_WARM, (unsigned)CODE_LAVA);
+    report("case6b_edit_over_source_retires_slot", a_hot && b_cool, buf);
+
+    sim_shutdown(&s);
+}
+
+/* =========================================================================
  * Case 7 - unit checks on the fixed-point bridge.
  *  (7a) temp_to_heat / heat_to_code round-trip the binding starter codes
  *       exactly (the codec is integer-valued Celsius, so a code -> heat ->
@@ -1415,6 +1468,7 @@ int main(void)
     test_conductivity_ordering();
     test_uniform_chunk_sleeps();
     test_lava_source_held();
+    test_edit_over_source_retires_slot();
     test_unit_fixedpoint();
 
     /* Phase transitions (milestone 3.5): melt / plateau / energy / freeze / gate. */

@@ -137,6 +137,17 @@ static GLuint     g_atlas_tex = 0;
 static ChunkSlot  g_slots[MAX_RENDER_CHUNKS];
 static int        g_inited = 0;
 
+/* Block-targeting wireframe overlay (0.2 break/place): a position-only program
+ * and a static unit-cube line buffer. render_highlight_voxel translates the cube
+ * to a world voxel via u_origin and draws its 12 edges. Independent of the chunk
+ * program (its own uniforms); if it fails to build, the highlight just no-ops. */
+static GLuint     g_overlay_prog     = 0;
+static GLint      g_overlay_u_mvp    = -1;
+static GLint      g_overlay_u_origin = -1;
+static GLint      g_overlay_u_color  = -1;
+static GLuint     g_wire_vbo         = 0;   /* unit-cube edges (block highlight) */
+static GLuint     g_cross_vbo        = 0;   /* unit crosshair (2 lines, NDC)     */
+
 /* Per-frame uniform state captured in render_begin so render_end's liquid pass
  * can re-bind the liquid program with the SAME mvp/sun without a second API
  * call. render_end takes no camera arg this milestone (single-chunk demo), so
@@ -360,6 +371,25 @@ static const char *FS_LIQUID =
     "    gl_FragColor.rgb = mix(gl_FragColor.rgb, SKY_COLOR, v_fog);\n"
     "}\n";
 
+/* Overlay program for the block-target wireframe: position only (reuses the
+ * a_pos attribute slot), translated to a world voxel by u_origin, flat dark
+ * colour. GLSL 1.20, same conservative subset as the chunk shaders. */
+static const char *VS_OVERLAY =
+    "#version 120\n"
+    "uniform mat4 u_mvp;\n"
+    "uniform vec3 u_origin;\n"   /* world position of the target voxel's corner */
+    "attribute vec3 a_pos;\n"    /* unit-cube edge vertex, 0..1 (+/- a hair)    */
+    "void main() {\n"
+    "    gl_Position = u_mvp * vec4(a_pos + u_origin, 1.0);\n"
+    "}\n";
+
+static const char *FS_OVERLAY =
+    "#version 120\n"
+    "uniform vec3 u_color;\n"     /* set per draw: dark block outline / light crosshair */
+    "void main() {\n"
+    "    gl_FragColor = vec4(u_color, 1.0);\n"
+    "}\n";
+
 /* ====================================================================== */
 /* Shader compile / link plumbing                                          */
 /* ====================================================================== */
@@ -574,6 +604,42 @@ int render_init(void)
         fprintf(stderr, "render: liquid program build failed (liquids will not draw)\n");
     } else {
         cache_uniform_locations(&g_liquid);
+    }
+
+    /* Block-target wireframe overlay program + its unit-cube line buffer. Reuses
+     * build_program (which binds a_pos at LOC_POS; the chunk attribute names just
+     * don't exist in this shader and are ignored at link). Non-fatal on failure:
+     * render_highlight_voxel then no-ops. */
+    g_overlay_prog = build_program(VS_OVERLAY, FS_OVERLAY);
+    if (g_overlay_prog == 0) {
+        fprintf(stderr, "render: overlay program build failed (no block highlight)\n");
+    } else {
+        g_overlay_u_mvp    = glGetUniformLocation(g_overlay_prog, "u_mvp");
+        g_overlay_u_origin = glGetUniformLocation(g_overlay_prog, "u_origin");
+        g_overlay_u_color  = glGetUniformLocation(g_overlay_prog, "u_color");
+        {
+            /* 12 edges (24 verts) of a unit cube, inflated a hair so the lines sit
+             * just outside the block faces and don't z-fight with the block. */
+            const GLfloat L = -0.003f, H = 1.003f;
+            const GLfloat wire[24 * 3] = {
+                L,L,L, H,L,L,  H,L,L, H,L,H,  H,L,H, L,L,H,  L,L,H, L,L,L, /* bottom */
+                L,H,L, H,H,L,  H,H,L, H,H,H,  H,H,H, L,H,H,  L,H,H, L,H,L, /* top    */
+                L,L,L, L,H,L,  H,L,L, H,H,L,  H,L,H, H,H,H,  L,L,H, L,H,H  /* posts  */
+            };
+            /* Unit crosshair: a + at the origin in a normalized space the draw
+             * scales into clip coords (so it stays centred + square per aspect). */
+            const GLfloat cross[4 * 3] = {
+                -1.0f, 0.0f, 0.0f,  1.0f, 0.0f, 0.0f,   /* horizontal */
+                 0.0f,-1.0f, 0.0f,  0.0f, 1.0f, 0.0f    /* vertical   */
+            };
+            glGenBuffers(1, &g_wire_vbo);
+            glBindBuffer(GL_ARRAY_BUFFER, g_wire_vbo);
+            glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)sizeof(wire), wire, GL_STATIC_DRAW);
+            glGenBuffers(1, &g_cross_vbo);
+            glBindBuffer(GL_ARRAY_BUFFER, g_cross_vbo);
+            glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)sizeof(cross), cross, GL_STATIC_DRAW);
+            glBindBuffer(GL_ARRAY_BUFFER, 0);
+        }
     }
 
     /* Placeholder material atlas. */
@@ -963,6 +1029,83 @@ void render_end(void)
     /* Buffer swap is the platform's job (plat_swap_buffers). */
 }
 
+void render_highlight_voxel(int wx, int wy, int wz)
+{
+    if (!g_inited || g_overlay_prog == 0 || g_wire_vbo == 0 || !g_frame_have_mvp)
+        return;
+
+    glUseProgram(g_overlay_prog);
+    if (g_overlay_u_mvp >= 0)
+        glUniformMatrix4fv(g_overlay_u_mvp, 1, GL_FALSE, g_frame_mvp);
+    if (g_overlay_u_origin >= 0)
+        glUniform3f(g_overlay_u_origin, (GLfloat)wx, (GLfloat)wy, (GLfloat)wz);
+    if (g_overlay_u_color >= 0)
+        glUniform3f(g_overlay_u_color, 0.05f, 0.05f, 0.05f);   /* near-black outline */
+
+    /* Depth-TESTED (a highlight behind a wall stays hidden) but no depth WRITE,
+     * no blend, no cull (lines have no winding). Drawn after render_end so it
+     * overlays both the opaque and liquid passes. */
+    glDepthMask(GL_FALSE);
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_BLEND);
+    glLineWidth(2.0f);
+
+    glBindBuffer(GL_ARRAY_BUFFER, g_wire_vbo);
+    glEnableVertexAttribArray(LOC_POS);
+    glVertexAttribPointer(LOC_POS, 3, GL_FLOAT, GL_FALSE,
+                          (GLsizei)(3 * sizeof(GLfloat)), (const void *)0);
+    glDrawArrays(GL_LINES, 0, 24);
+    glDisableVertexAttribArray(LOC_POS);
+
+    /* Restore the state the next frame's opaque pass expects. */
+    glDepthMask(GL_TRUE);
+    glEnable(GL_CULL_FACE);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glUseProgram(g_opaque.program);
+}
+
+void render_crosshair(float aspect)
+{
+    /* A small + at the screen centre, drawn directly in clip space: the overlay
+     * VS computes u_mvp * vec4(a_pos,1), so a diagonal scale matrix maps the unit
+     * cross to NDC. The x scale is divided by aspect so the cross stays SQUARE
+     * (equal pixel length on both axes) on a non-square window. Always on top
+     * (depth test off), light colour so it reads over terrain. */
+    const float SIZE = 0.018f;             /* half-length in NDC */
+    float m[16];
+    int i;
+    if (!g_inited || g_overlay_prog == 0 || g_cross_vbo == 0)
+        return;
+    for (i = 0; i < 16; ++i) m[i] = 0.0f;
+    m[0]  = (aspect > 0.0f) ? SIZE / aspect : SIZE;
+    m[5]  = SIZE;
+    m[10] = 1.0f;
+    m[15] = 1.0f;
+
+    glUseProgram(g_overlay_prog);
+    if (g_overlay_u_mvp >= 0)    glUniformMatrix4fv(g_overlay_u_mvp, 1, GL_FALSE, m);
+    if (g_overlay_u_origin >= 0) glUniform3f(g_overlay_u_origin, 0.0f, 0.0f, 0.0f);
+    if (g_overlay_u_color >= 0)  glUniform3f(g_overlay_u_color, 0.90f, 0.90f, 0.90f);
+
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_BLEND);
+    glLineWidth(2.0f);
+
+    glBindBuffer(GL_ARRAY_BUFFER, g_cross_vbo);
+    glEnableVertexAttribArray(LOC_POS);
+    glVertexAttribPointer(LOC_POS, 3, GL_FLOAT, GL_FALSE,
+                          (GLsizei)(3 * sizeof(GLfloat)), (const void *)0);
+    glDrawArrays(GL_LINES, 0, 4);
+    glDisableVertexAttribArray(LOC_POS);
+
+    /* Restore the defaults the next frame's opaque pass expects. */
+    glEnable(GL_DEPTH_TEST);
+    glEnable(GL_CULL_FACE);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glUseProgram(g_opaque.program);
+}
+
 void render_shutdown(void)
 {
     int i;
@@ -993,6 +1136,18 @@ void render_shutdown(void)
         g_atlas_tex = 0;
     }
 
+    if (g_wire_vbo != 0) {
+        glDeleteBuffers(1, &g_wire_vbo);
+        g_wire_vbo = 0;
+    }
+    if (g_cross_vbo != 0) {
+        glDeleteBuffers(1, &g_cross_vbo);
+        g_cross_vbo = 0;
+    }
+    if (g_overlay_prog != 0) {
+        glDeleteProgram(g_overlay_prog);
+        g_overlay_prog = 0;
+    }
     if (g_liquid.program != 0) {
         glDeleteProgram(g_liquid.program);
         g_liquid.program = 0;

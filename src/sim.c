@@ -1544,6 +1544,44 @@ void sim_tick(SimState *s)
 /* =====================================================================
  * Teardown  (sim.h sim_shutdown)
  * ===================================================================== */
+/* A player edit changed voxel li in the simulated chunk out from under the CA
+ * (a block broken to air, or a new block placed). Re-seed the authoritative
+ * heat[] from the voxel's now-current temperature code, clear any in-progress
+ * latent bank (the material/phase may have changed), and wake the cell plus its
+ * 6 face neighbours so heat diffusion and fluid flow re-evaluate around the edit
+ * on the next tick. main.c calls this only when the edited chunk is the one this
+ * SimState is bound to (s->chunk), so the world layer needs no sim dependency. */
+void sim_notify_edit(SimState *s, int li)
+{
+    if (s == NULL || s->chunk == NULL)
+        return;
+    if (li < 0 || li >= CHUNK_VOXELS)
+        return;
+
+    /* If this cell was a registered Dirichlet SOURCE (sim_init auto-registers the
+     * first SIM_MAX_SOURCES emissive lava cells) and the edit replaced it with a
+     * NON-emissive voxel (a placed block, or air from a break), retire the slot.
+     * Otherwise the PHASE-2 re-stamp loop would keep pinning this cell to the
+     * lava hold temperature every tick - an invisible heat "ghost" that never
+     * quiesces. A cell that is STILL emissive (lava placed back) stays held via
+     * the MAT_EMISSIVE flag path (is_held_source) and needs no slot. */
+    {
+        int idx = source_index_of(s, li);
+        if (idx >= 0 &&
+            !(material_get(vox_mat(s->chunk->voxels[li]))->flags & MAT_EMISSIVE)) {
+            s->sources[idx].active    = 0;
+            s->sources[idx].li        = 0;
+            s->sources[idx].hold_code = 0;
+            s->sources[idx].is_spring = 0;
+        }
+    }
+
+    s->heat[li]   = temp_to_heat(vox_temp_code(s->chunk->voxels[li]));
+    s->latent[li] = 0;
+    active_enqueue(s, li);   /* wake the edited cell itself */
+    wake_ring(s, li);        /* and its 6 face neighbours */
+}
+
 void sim_shutdown(SimState *s)
 {
     int i;

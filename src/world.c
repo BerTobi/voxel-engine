@@ -461,6 +461,62 @@ void world_evict(WorldStore *ws, int cx, int cy, int cz)
 }
 
 /* ======================================================================== *
+ *  Voxel edit API (player break/place; Section 10)                          *
+ * ======================================================================== */
+
+/* WORLD voxel coord -> chunk coord (floor) + local index 0..CHUNK_DIM-1. Uses
+ * div/mod with a floor correction rather than a shift, so it is correct for
+ * NEGATIVE world coords (e.g. w=-1 -> chunk -1, local CHUNK_DIM-1) without
+ * relying on implementation-defined signed right-shift. */
+static void wvox_to_chunk(int w, int *chunk, int *local)
+{
+    int c = w / CHUNK_DIM;
+    int l = w % CHUNK_DIM;
+    if (l < 0) { l += CHUNK_DIM; c -= 1; }   /* floor toward -inf */
+    *chunk = c;
+    *local = l;
+}
+
+Voxel world_get_voxel(const WorldStore *ws, int wx, int wy, int wz)
+{
+    int cx, cy, cz, lx, ly, lz;
+    Chunk *c;
+    wvox_to_chunk(wx, &cx, &lx);
+    wvox_to_chunk(wy, &cy, &ly);
+    wvox_to_chunk(wz, &cz, &lz);
+    c = world_get(ws, cx, cy, cz);
+    if (c == NULL)
+        return 0;                    /* unloaded space reads as MAT_AIR */
+    return chunk_get(c, lx, ly, lz);
+}
+
+int world_edit_voxel(WorldStore *ws, int wx, int wy, int wz, Voxel v)
+{
+    int cx, cy, cz, lx, ly, lz;
+    Chunk *c, *n;
+    wvox_to_chunk(wx, &cx, &lx);
+    wvox_to_chunk(wy, &cy, &ly);
+    wvox_to_chunk(wz, &cz, &lz);
+    c = world_get(ws, cx, cy, cz);
+    if (c == NULL)
+        return 0;                    /* can't edit an unloaded chunk */
+
+    chunk_set(c, lx, ly, lz, v);
+    c->flags |= CHUNK_MODIFIED;       /* persist this edit on eviction */
+    remesh_enqueue(ws, c);            /* sets DIRTY_MESH + enqueues (deduped) */
+
+    /* A boundary-plane edit changes the shared seam, so the abutting resident
+     * neighbour must re-mesh too (its faces toward this voxel may open/close). */
+    if (lx == 0)             { n = world_get(ws, cx - 1, cy, cz); if (n) remesh_enqueue(ws, n); }
+    if (lx == CHUNK_DIM - 1) { n = world_get(ws, cx + 1, cy, cz); if (n) remesh_enqueue(ws, n); }
+    if (ly == 0)             { n = world_get(ws, cx, cy - 1, cz); if (n) remesh_enqueue(ws, n); }
+    if (ly == CHUNK_DIM - 1) { n = world_get(ws, cx, cy + 1, cz); if (n) remesh_enqueue(ws, n); }
+    if (lz == 0)             { n = world_get(ws, cx, cy, cz - 1); if (n) remesh_enqueue(ws, n); }
+    if (lz == CHUNK_DIM - 1) { n = world_get(ws, cx, cy, cz + 1); if (n) remesh_enqueue(ws, n); }
+    return 1;
+}
+
+/* ======================================================================== *
  *  Lifecycle                                                               *
  * ======================================================================== */
 

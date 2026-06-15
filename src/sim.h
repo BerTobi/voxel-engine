@@ -579,6 +579,14 @@ int  sim_init(SimState *s, Chunk *c);
  * deterministic for fluids (in-place + moved_mask + parity sweep). */
 void sim_tick(SimState *s);
 
+/* Notify the sim that a PLAYER EDIT changed voxel li in the bound chunk (a block
+ * broken to air, or one placed). Re-seeds heat[li] from the voxel's current temp,
+ * clears its latent bank, and wakes li + its 6 face neighbours so heat/fluid
+ * re-evaluate around the edit. Call AFTER mutating the voxel, and ONLY when the
+ * edited chunk is this SimState's bound chunk (s->chunk). No-op if unbound or li
+ * is out of range. li is a local 0..CHUNK_VOXELS-1 index (vox_index). */
+void sim_notify_edit(SimState *s, int li);
+
 /* Register a held Dirichlet heat source at local index li, held at hold_code
  * each tick (the source never cools, continuously driving diffusion). Used by
  * tests and by sim_init for lava. If the voxel's material is PHASE_LIQUID the

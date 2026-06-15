@@ -63,6 +63,7 @@ static int g_capture_desired = 0;    /* engine INTENT (plat_set_mouse_capture); 
                                       * re-armed on refocus, dropped on blur      */
 static int g_warp_pending   = 0;     /* a recenter SetCursorPos is in flight     */
 static int g_mdx = 0, g_mdy = 0;     /* accumulated relative motion (read+clear) */
+static int g_mb_left = 0, g_mb_right = 0; /* read-and-clear click counters       */
 static int g_cursor_hidden  = 0;     /* tracks our balanced ShowCursor(FALSE)    */
 static int g_client_w = 0;           /* requested client size, for the centre    */
 static int g_client_h = 0;
@@ -91,6 +92,12 @@ static int vk_to_plat(WPARAM vk)
     /* The generic VK_SHIFT also arrives for the left shift on some setups; fold
      * it onto the same engine key so movement input is reliable. */
     case VK_SHIFT:   return PLAT_KEY_LSHIFT;
+    /* Number-row digits ('1'..'5' == 0x31..0x35): placement-material select. */
+    case '1':        return PLAT_KEY_1;
+    case '2':        return PLAT_KEY_2;
+    case '3':        return PLAT_KEY_3;
+    case '4':        return PLAT_KEY_4;
+    case '5':        return PLAT_KEY_5;
     default:         return -1;
     }
 }
@@ -250,6 +257,18 @@ static LRESULT CALLBACK plat_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM 
             return 0;
         break;
     }
+
+    case WM_LBUTTONDOWN:
+        /* Edge-triggered click for block break. Only while captured (a live
+         * session) so a click that re-focuses the window doesn't also break. */
+        if (g_mouse_captured)
+            g_mb_left++;
+        return 0;
+
+    case WM_RBUTTONDOWN:
+        if (g_mouse_captured)
+            g_mb_right++;
+        return 0;
 
     default:
         break;
@@ -553,6 +572,15 @@ void plat_get_size(int *w, int *h)
      * this is the requested size (set in plat_create_window) or 0. */
     if (w) *w = g_client_w;
     if (h) *h = g_client_h;
+}
+
+void plat_mouse_buttons(int *left_clicks, int *right_clicks)
+{
+    /* Read-and-clear the per-button press counts accumulated in plat_wndproc. */
+    if (left_clicks)  *left_clicks  = g_mb_left;
+    if (right_clicks) *right_clicks = g_mb_right;
+    g_mb_left = 0;
+    g_mb_right = 0;
 }
 
 #endif /* _WIN32 */

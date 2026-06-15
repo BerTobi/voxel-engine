@@ -66,6 +66,18 @@ void render_draw_chunk(int slot);
  * swap buffers - that is the platform's plat_swap_buffers(). */
 void render_end(void);
 
+/* Draw a wireframe outline around world voxel (wx,wy,wz) - the block-target
+ * highlight for break/place. Uses the MVP captured in render_begin, depth-tested
+ * but not depth-writing. Call AFTER render_end (so it overlays the scene) and
+ * before plat_swap_buffers; a no-op if the overlay program failed to build. */
+void render_highlight_voxel(int wx, int wy, int wz);
+
+/* Draw a small crosshair (+) at the screen centre. `aspect` (width/height) keeps
+ * it square on non-square windows. Screen-space, always on top (no depth test).
+ * Call after render_end and before plat_swap_buffers; a no-op if the overlay
+ * program failed to build. */
+void render_crosshair(float aspect);
+
 /* Release GL resources (programs, atlas texture, all pooled VBOs/IBOs). */
 void render_shutdown(void);
 

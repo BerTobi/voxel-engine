@@ -70,6 +70,12 @@ void   plat_mouse_delta(int *dx, int *dy);
  * also releases capture automatically on window close so the cursor reappears. */
 void   plat_set_mouse_capture(int on);
 
+/* Read-and-clear the number of NEW left/right mouse-button PRESSES since the last
+ * call (edge-triggered, so a single physical click registers exactly once and
+ * rapid clicks are not lost). Either pointer may be NULL. Used for block break
+ * (left) and place (right). Returns (0,0) when capture is off / no clicks. */
+void   plat_mouse_buttons(int *left_clicks, int *right_clicks);
+
 /* ---- Keycodes (engine-portable; the backend maps OS scancodes to these) -- */
 #define PLAT_KEY_ESC     0
 #define PLAT_KEY_W       1
@@ -78,6 +84,11 @@ void   plat_set_mouse_capture(int on);
 #define PLAT_KEY_D       4
 #define PLAT_KEY_SPACE   5
 #define PLAT_KEY_LSHIFT  6
-#define PLAT_KEY_COUNT   7   /* size of the backend's key-state array */
+#define PLAT_KEY_1       7   /* number row 1..5: placement-material select       */
+#define PLAT_KEY_2       8
+#define PLAT_KEY_3       9
+#define PLAT_KEY_4      10
+#define PLAT_KEY_5      11
+#define PLAT_KEY_COUNT  12   /* size of the backend's key-state array */
 
 #endif /* PLATFORM_H */

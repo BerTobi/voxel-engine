@@ -23,11 +23,15 @@ WINCC   := i686-w64-mingw32-gcc
 
 # ---- Version (single source of truth: src/version.h) -------------------------
 # Parsed from the header so `make archive` files binaries under the right folder
-# without a second place to bump. Factorio-style MAJOR.MINOR.PATCH.
+# without a second place to bump. Factorio-style MAJOR.MINOR.PATCH, plus an
+# optional PRERELEASE suffix ("-dev" while a MINOR is in progress, "" on release)
+# so a work-in-progress build archives under e.g. 0.2.0-dev and never collides
+# with the final 0.2.0.
 VER_MAJOR := $(shell sed -n 's/^\#define VOXEL_VERSION_MAJOR *\([0-9]*\).*/\1/p' src/version.h)
 VER_MINOR := $(shell sed -n 's/^\#define VOXEL_VERSION_MINOR *\([0-9]*\).*/\1/p' src/version.h)
 VER_PATCH := $(shell sed -n 's/^\#define VOXEL_VERSION_PATCH *\([0-9]*\).*/\1/p' src/version.h)
-VERSION   := $(VER_MAJOR).$(VER_MINOR).$(VER_PATCH)
+VER_PRE   := $(shell sed -n 's/^\#define VOXEL_VERSION_PRERELEASE *"\([^"]*\)".*/\1/p' src/version.h)
+VERSION   := $(VER_MAJOR).$(VER_MINOR).$(VER_PATCH)$(VER_PRE)
 
 # ---- Flags -------------------------------------------------------------------
 # Common flags for every build: C99, all warnings, headers from src/.
@@ -63,6 +67,7 @@ CORE    := \
 	$(SRC)/world.c \
 	$(SRC)/persist.c \
 	$(SRC)/progress.c \
+	$(SRC)/raycast.c \
 	$(SRC)/gl_loader.c \
 	$(SRC)/render.c \
 	$(SRC)/main.c
@@ -94,7 +99,7 @@ WIN_LDFLAGS := -static -static-libgcc -Wl,--gc-sections -mwindows
 WIN_LIBS    := -lopengl32 -lgdi32 -luser32
 
 # ---- Targets -----------------------------------------------------------------
-.PHONY: all linux win test testsim testworld testpersist testprogress version archive clean
+.PHONY: all linux win test testsim testworld testpersist testprogress testraycast testedit version archive clean
 
 # Default target: native dev build.
 all: linux
@@ -170,6 +175,20 @@ testpersist: | $(BUILD)
 testprogress: | $(BUILD)
 	$(CC) -std=c99 -Wall -Wextra -Isrc -o $(BUILD)/m9_test $(SRC)/material.c $(SRC)/chunk.c $(SRC)/sim.c $(SRC)/progress.c $(SRC)/test_progress.c -lm
 	$(BUILD)/m9_test
+
+# testraycast: the pure-math voxel DDA (raycast.c) against a synthetic grid. No
+# GL, no platform, no world. The 0.2 block break/place targeting core.
+# apt: build-essential
+testraycast: | $(BUILD)
+	$(CC) $(CFLAGS) -o $(BUILD)/ray_test $(SRC)/raycast.c $(SRC)/test_raycast.c -lm
+	$(BUILD)/ray_test
+
+# testedit: world_get_voxel / world_edit_voxel on a headless WorldStore (sets the
+# voxel, flags MODIFIED|DIRTY_MESH, dirties boundary neighbours). No GL/platform.
+# apt: build-essential
+testedit: | $(BUILD)
+	$(CC) $(CFLAGS) -o $(BUILD)/edit_test $(SRC)/material.c $(SRC)/chunk.c $(SRC)/worldgen.c $(SRC)/world.c $(SRC)/persist.c $(SRC)/test_edit.c -lm
+	$(BUILD)/edit_test
 
 # Create the build directory on demand (order-only prerequisite).
 $(BUILD):

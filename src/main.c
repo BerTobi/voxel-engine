@@ -76,6 +76,7 @@
 #include "worldgen.h"
 #include "persist.h"
 #include "progress.h"
+#include "raycast.h"
 #include "version.h"
 
 /* ---- Frame scheduling constants (binding, ARCHITECTURE.md Section 6) ------ */
@@ -344,6 +345,64 @@ static Voxel make_liquid(uint8_t mat)
     vox_set_temp_code(&v, temp_encode_c(20.0));
     vox_set_flags(&v, VF_LIQUID);
     return v;
+}
+
+/* ---- Block break / place (0.2) ------------------------------------------ *
+ * A voxel ray (raycast.c) from the eye along the look direction finds the first
+ * solid block: left-click breaks it, right-click places the selected material in
+ * the empty cell before it. Number keys 1..5 pick the placement material; the
+ * targeted block is highlighted. Edits go through world_edit_voxel (remesh +
+ * persist) and, when they land in the simulated chunk, wake the sim. */
+#define BLOCK_REACH   6.0f      /* player edit reach, in voxels */
+
+/* Placement palette, selected by number keys 1..5. */
+static const uint8_t PLACE_MATS[5] = {
+    MAT_STONE, MAT_DIRT, MAT_COPPER, MAT_WATER, MAT_LAVA
+};
+
+/* floor(w/16) without relying on implementation-defined signed right-shift. */
+static int floordiv16(int w)
+{
+    return (w >= 0) ? (w >> 4) : -(((-w) + 15) >> 4);
+}
+
+/* A clean AIR voxel at ambient 20 C (NOT the cold code-0 a zeroed voxel decodes
+ * to): breaking a block must not drop a -40 C cold sink into the simulated chunk. */
+static Voxel air_voxel(void)
+{
+    Voxel v = 0;
+    vox_set_temp_code(&v, temp_encode_c(20.0));
+    return v;
+}
+
+/* Raycast solid predicate: the ray stops at OPAQUE blocks; air and (translucent)
+ * liquids are passed through, so you target the first real surface. ctx is the
+ * WorldStore. */
+static int ray_solid(void *ctx, int x, int y, int z)
+{
+    Voxel v = world_get_voxel((const WorldStore *)ctx, x, y, z);
+    return (material_get(vox_mat(v))->flags & MAT_OPAQUE) != 0;
+}
+
+/* Build the voxel to PLACE for material id m (liquids carry VF_LIQUID + full
+ * fill; solids a full opaque cube), reusing the demo voxel makers. */
+static Voxel place_voxel(uint8_t m)
+{
+    return (material_get(m)->phase == (uint8_t)PHASE_LIQUID) ? make_liquid(m)
+                                                             : make_voxel(m);
+}
+
+/* Apply a player edit at world voxel (wx,wy,wz); if that voxel lives in the
+ * chunk the sim is bound to, wake the sim around it so heat/fluid react. */
+static void edit_and_notify(WorldStore *w, SimState *s, int wx, int wy, int wz, Voxel v)
+{
+    if (!world_edit_voxel(w, wx, wy, wz, v))
+        return;
+    if (s != NULL && s->chunk != NULL) {
+        int cx = floordiv16(wx), cy = floordiv16(wy), cz = floordiv16(wz);
+        if (s->chunk->cx == cx && s->chunk->cy == cy && s->chunk->cz == cz)
+            sim_notify_edit(s, vox_index(wx - cx * 16, wy - cy * 16, wz - cz * 16));
+    }
 }
 
 static void demo_decorate(Chunk *c)
@@ -853,12 +912,16 @@ int main(void)
     /* ---- 9. The frame loop (Section 6 shape) ----------------------------- */
     frame_prev_ms = plat_time_ms();
 
+    int sel_mat = 0;   /* placement-material index into PLACE_MATS (0 = stone) */
+
     for (;;) {
         double frame_start = plat_time_ms();
         double real_dt_ms  = frame_start - frame_prev_ms;
         float  dt_s;
         double frame_used;
         double sleep_ms;
+        int    hl_have = 0;          /* block-target highlight valid this frame  */
+        int    hl_x = 0, hl_y = 0, hl_z = 0;
 
         frame_prev_ms = frame_start;
         if (real_dt_ms > 250.0)        /* guard: post-stall / debugger pause   */
@@ -959,6 +1022,42 @@ int main(void)
             cam_target.x = cam_pos.x + fwd.x;
             cam_target.y = cam_pos.y + fwd.y;
             cam_target.z = cam_pos.z + fwd.z;
+
+            /* --- Block break / place (live sessions only) ----------------- *
+             * Cast from the eye along the look dir to the first solid block.
+             * Left-click breaks it; right-click places the selected material in
+             * the empty cell before it; number keys 1..5 pick the material. The
+             * hit block is highlighted (hl_*). A VOXEL_SHOT capture skips all of
+             * this so headless frames stay clean and reproducible. */
+            if (shot_path == NULL) {
+                RayHit ray = raycast_voxel(cam_pos.x, cam_pos.y, cam_pos.z,
+                                           fwd.x, fwd.y, fwd.z,
+                                           BLOCK_REACH, ray_solid, world);
+                int lc = 0, rc = 0, i;
+
+                if (ray.hit) { hl_have = 1; hl_x = ray.hx; hl_y = ray.hy; hl_z = ray.hz; }
+
+                for (i = 0; i < 5; ++i) {
+                    if (plat_key_down(PLAT_KEY_1 + i) && sel_mat != i) {
+                        sel_mat = i;
+                        fprintf(stderr, "[place] slot %d -> material id %d\n",
+                                i + 1, (int)PLACE_MATS[i]);
+                    }
+                }
+
+                plat_mouse_buttons(&lc, &rc);
+                if (ray.hit && lc > 0)
+                    edit_and_notify(world, sim, ray.hx, ray.hy, ray.hz, air_voxel());
+                if (ray.hit && rc > 0) {
+                    /* Don't place a block into the voxel the eye occupies. */
+                    int ex = (int)floorf(cam_pos.x);
+                    int ey = (int)floorf(cam_pos.y);
+                    int ez = (int)floorf(cam_pos.z);
+                    if (!(ray.px == ex && ray.py == ey && ray.pz == ez))
+                        edit_and_notify(world, sim, ray.px, ray.py, ray.pz,
+                                        place_voxel(PLACE_MATS[sel_mat]));
+                }
+            }
         }
 
         /* --- Stream the loaded window around the camera (Section 6/7) ----- *
@@ -1143,6 +1242,15 @@ int main(void)
                     render_draw_chunk(slot);
             }
             render_end();
+
+            /* Block-target wireframe overlay + centre crosshair. Drawn after
+             * render_end so they sit on top of the opaque + liquid scene. hl_have
+             * is set by the per-frame raycast (live only); the crosshair is also
+             * live-only, so VOXEL_SHOT captures stay clean and reproducible. */
+            if (hl_have)
+                render_highlight_voxel(hl_x, hl_y, hl_z);
+            if (shot_path == NULL)
+                render_crosshair(aspect);
         }
 
         /* Headless one-shot capture: grab the back buffer GL just drew (before

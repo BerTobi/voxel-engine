@@ -67,6 +67,7 @@ static int        g_should_close = 0;
 static int    g_mouse_captured = 0;
 static int    g_warp_pending   = 0;   /* a recenter warp is in flight; eat its event */
 static int    g_mdx = 0, g_mdy = 0;   /* accumulated relative motion, pixels */
+static int    g_mb_left = 0, g_mb_right = 0; /* read-and-clear click counters  */
 static Cursor g_blank_cursor   = 0;   /* invisible 1x1 cursor for the hidden pointer */
 static int    g_win_w = 0, g_win_h = 0; /* cached client size so the centre is known */
 
@@ -89,6 +90,11 @@ static int keysym_to_plat(KeySym ks)
     case XK_d: case XK_D: return PLAT_KEY_D;
     case XK_space:       return PLAT_KEY_SPACE;
     case XK_Shift_L:     return PLAT_KEY_LSHIFT;
+    case XK_1:           return PLAT_KEY_1;
+    case XK_2:           return PLAT_KEY_2;
+    case XK_3:           return PLAT_KEY_3;
+    case XK_4:           return PLAT_KEY_4;
+    case XK_5:           return PLAT_KEY_5;
     default:             return -1;
     }
 }
@@ -168,7 +174,7 @@ int plat_create_window(int w, int h, const char *title)
     swa.border_pixel      = 0;
     swa.event_mask        = ExposureMask | StructureNotifyMask |
                             KeyPressMask | KeyReleaseMask |
-                            PointerMotionMask;
+                            PointerMotionMask | ButtonPressMask;
 
     g_win = XCreateWindow(g_dpy, root,
                           0, 0, (unsigned)w, (unsigned)h, 0,
@@ -346,6 +352,14 @@ void plat_poll(void)
             g_warp_pending = 1;
             break;
         }
+        case ButtonPress:
+            /* Edge-triggered mouse clicks for block break/place. Only while
+             * captured (a live session); Button1 = left, Button3 = right. */
+            if (g_mouse_captured) {
+                if (ev.xbutton.button == Button1) g_mb_left++;
+                else if (ev.xbutton.button == Button3) g_mb_right++;
+            }
+            break;
         case ConfigureNotify:
             /* The window was resized (or moved). Cache the new size so the
              * mouse-look recenter target and plat_get_size track it, and resize
@@ -416,6 +430,15 @@ void plat_get_size(int *w, int *h)
      * exists this is the requested size (set in plat_create_window) or 0. */
     if (w) *w = g_win_w;
     if (h) *h = g_win_h;
+}
+
+void plat_mouse_buttons(int *left_clicks, int *right_clicks)
+{
+    /* Read-and-clear the per-button press counts accumulated in plat_poll. */
+    if (left_clicks)  *left_clicks  = g_mb_left;
+    if (right_clicks) *right_clicks = g_mb_right;
+    g_mb_left = 0;
+    g_mb_right = 0;
 }
 
 void plat_mouse_delta(int *dx, int *dy)

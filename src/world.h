@@ -404,6 +404,26 @@ Chunk   *world_resident_at(const WorldStore *ws, uint32_t i);
 int  world_render_slot(const WorldStore *ws, const Chunk *c);
 
 /* ======================================================================== *
+ *  10. VOXEL EDIT API  (player block break / place; 0.2)                    *
+ * ======================================================================== */
+/* Read the voxel at WORLD voxel coordinate (wx,wy,wz). Returns 0 (MAT_AIR) when
+ * the containing chunk is not resident, so a raycast treats unloaded space as
+ * empty. Read-only; the COLD residency hash, not the neigh fast-path. */
+Voxel world_get_voxel(const WorldStore *ws, int wx, int wy, int wz);
+
+/* Set the voxel at WORLD voxel coordinate (wx,wy,wz) and do all the bookkeeping a
+ * player edit needs: flag the chunk CHUNK_MODIFIED (so the edit persists on
+ * eviction) and CHUNK_DIRTY_MESH + enqueue it for remesh, and - if the voxel sits
+ * on a chunk-boundary plane - dirty + enqueue the abutting resident neighbour(s)
+ * so the shared seam re-culls. The actual relight+remesh+upload happens in the
+ * next world_stream_update drain. Returns 1 if edited, 0 if the chunk is not
+ * resident (an edit to unloaded space is dropped - the caller should only edit
+ * voxels the raycast actually hit, which are by definition resident). Does NOT
+ * touch the simulation; the caller wakes the sim via sim_notify_edit when the
+ * edited chunk is the simulated one (the world layer has no sim dependency). */
+int  world_edit_voxel(WorldStore *ws, int wx, int wy, int wz, Voxel v);
+
+/* ======================================================================== *
  *  10. STREAMING DRIVER  (the per-frame entry point - Section 6/7)          *
  * ======================================================================== */
 /* Move the loaded window to centre on world position (player_x, player_z), then

@@ -406,15 +406,32 @@ static void demo_decorate(Chunk *c)
         chunk_set(c, 6, y, 2, make_voxel(MAT_STONE));
 
     /* Water demo (ARCHITECTURE Section 3): a raised 3x3x5 block of water (fill 15,
-     * 45 cells) suspended over the bare east pedestal (x 9..11, z 5..7, y
-     * floor+3..floor+7), clear of the lava pool. With air below it the fluid pass
-     * drains it straight DOWN onto the pedestal floor each tick, then water
-     * (viscosity 0) equalises into a level puddle that spreads west to meet - and
-     * is BLOCKED by - the lava wall (different liquids do not merge). The spread
-     * stays interior, clear of the chunk's 0/15 faces. */
+     * 45 cells) that FALLS and settles into a level pool inside a WALLED stone
+     * BASIN, east of the lava tub. The basin is essential: the demo HOME chunk
+     * sits at cy 1, so its local-Y 0 is a CHUNK-BOUNDARY face. Cross-chunk
+     * vertical fluid flow is deferred, so water that runs off an open pedestal
+     * edge cascades to that boundary and pools there - visually "floating" a full
+     * chunk above the terrain below, never touching ground. Containing the water
+     * (like the lava tub) makes it a clean puddle resting on the pedestal floor.
+     * Basin footprint x8..12, z4..8 (extends the pedestal a little east/south,
+     * staying interior to the chunk); a 1-thick wall ring rises to floor+6, tall
+     * enough to hold the settled pool (45 cells / 3x3 = 5 deep -> floor..floor+4)
+     * with freeboard, so nothing spills. The pool is clear of the lava tub (x<=7)
+     * and the chunk's 0/15 faces; different liquids never merge anyway. */
+    for (x = 8; x <= 12; ++x)
+        for (z = 4; z <= 8; ++z) {
+            for (y = 0; y < DEMO_FLOOR_Y; ++y)              /* extend pedestal floor */
+                chunk_set(c, x, y, z, make_voxel(MAT_STONE));
+            if (x == 8 || x == 12 || z == 4 || z == 8)      /* perimeter wall ring   */
+                for (y = DEMO_FLOOR_Y; y <= DEMO_FLOOR_Y + 6; ++y)
+                    chunk_set(c, x, y, z, make_voxel(MAT_STONE));
+        }
+    /* The raised water column inside the basin (interior x9..11, z5..7), starting
+     * a couple of cells above the floor so it visibly FALLS and equalises into a
+     * level pool that rests on - and touches - the pedestal floor. */
     for (x = 9; x <= 11; ++x)
         for (z = 5; z <= 7; ++z)
-            for (y = DEMO_FLOOR_Y + 3; y <= DEMO_FLOOR_Y + 7; ++y)
+            for (y = DEMO_FLOOR_Y + 2; y <= DEMO_FLOOR_Y + 6; ++y)
                 chunk_set(c, x, y, z, make_liquid(MAT_WATER));
 }
 
@@ -1067,8 +1084,18 @@ int main(void)
             float proj[16];
             float view[16];
             float mvp[16];
-            float aspect = (float)win_w / (float)win_h;
+            /* Use the LIVE window size for the aspect ratio so a user resize /
+             * maximize doesn't distort the view (the backend has already resized
+             * the GL viewport via WM_SIZE / ConfigureNotify). Falls back to the
+             * creation size if the platform reports nothing yet; headless
+             * VOXEL_SHOT never resizes, so this stays the fixed capture size. */
+            int cur_w = win_w, cur_h = win_h;
+            float aspect;
             uint32_t n, ri;
+
+            plat_get_size(&cur_w, &cur_h);
+            if (cur_w <= 0 || cur_h <= 0) { cur_w = win_w; cur_h = win_h; }
+            aspect = (float)cur_w / (float)cur_h;
 
             mat4_perspective(proj, (float)(70.0 * M_PI / 180.0),
                              aspect, 0.1f, 1000.0f);

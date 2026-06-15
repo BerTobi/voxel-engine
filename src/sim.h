@@ -646,8 +646,13 @@ static inline uint8_t sim_temp_glow(uint8_t temp_code) {
  * is an exact integer count of heat units). Inline. */
 static inline int32_t temp_to_heat(uint8_t code) {
     /* temp_decode_c returns an integer number of degrees C (1 or 20 C steps),
-     * so the cast is exact; shift into Q6 heat units. */
-    return (int32_t)temp_decode_c(code) << HEAT_FRAC_BITS;
+     * so the cast is exact; scale into Q6 heat units. We MULTIPLY by HEAT_ONE_C
+     * (== 1<<HEAT_FRAC_BITS) rather than left-shift: codes 0..39 decode to a
+     * NEGATIVE Celsius (code 0 == -40 C), and `negative << n` is undefined
+     * behaviour in C99/C11 (6.5.7p4) - it aborts every -fsanitize=undefined
+     * build. The multiply is byte-identical for all 256 codes and well-defined
+     * for negatives (this is the same safe idiom the latent-heat math uses). */
+    return (int32_t)temp_decode_c(code) * HEAT_ONE_C;
 }
 static inline uint8_t heat_to_code(int32_t heat) {
     /* Re-quantize: heat units -> Celsius (a divide by 64, rounded) -> code.

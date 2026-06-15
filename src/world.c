@@ -221,11 +221,20 @@ int world_render_slot(const WorldStore *ws, const Chunk *c)
  * (each pool index appears at most once at a time). */
 static void remesh_enqueue(WorldStore *ws, Chunk *c)
 {
+    uint32_t next;
     if (c->flags & CHUNK_DIRTY_MESH)
-        return;                          /* already queued */
+        return;                          /* already queued (the dedup key) */
+    /* Ring-full guard (defense-in-depth, like gen_enqueue): the CHUNK_DIRTY_MESH
+     * dedup already caps live entries at WORLD_POOL_SLOTS == WORLD_REMESHQ_CAP so
+     * this never fires, but enforcing it means a lapped ring can't silently drop
+     * a remesh. If it WOULD overflow, keep the flag clear so a later enqueue can
+     * still queue the chunk. */
+    next = (ws->remeshq_tail + 1u) % WORLD_REMESHQ_CAP;
+    if (next == ws->remeshq_head)
+        return;                          /* ring full: drop (invariant: unreachable) */
     c->flags |= CHUNK_DIRTY_MESH;
     ws->remeshq[ws->remeshq_tail] = pool_index(ws, c);
-    ws->remeshq_tail = (ws->remeshq_tail + 1u) % WORLD_REMESHQ_CAP;
+    ws->remeshq_tail = next;
 }
 
 static int remesh_empty(const WorldStore *ws)
@@ -239,10 +248,19 @@ static int remesh_empty(const WorldStore *ws)
 
 static void gen_enqueue(WorldStore *ws, int cx, int cy, int cz)
 {
+    /* Ring-full guard: a head==tail ring cannot tell "full" from "empty", so if
+     * the tail were ever allowed to lap the head, gen_empty() would read EMPTY
+     * and silently drop every still-queued coord. enqueue_in_range now rebuilds
+     * the queue from empty each move and pushes at most WORLD_WINDOW_CHUNKS (338)
+     * distinct coords < WORLD_GENQ_CAP (402), so this can't fire - it enforces
+     * world.h's "queues never overflow" invariant rather than assuming it. */
+    uint32_t next = (ws->genq_tail + 1u) % WORLD_GENQ_CAP;
+    if (next == ws->genq_head)
+        return;                          /* ring full: drop (invariant: unreachable) */
     ws->genq_cx[ws->genq_tail] = cx;
     ws->genq_cy[ws->genq_tail] = cy;
     ws->genq_cz[ws->genq_tail] = cz;
-    ws->genq_tail = (ws->genq_tail + 1u) % WORLD_GENQ_CAP;
+    ws->genq_tail = next;
 }
 
 static int gen_empty(const WorldStore *ws)
@@ -376,8 +394,15 @@ Chunk *world_insert(WorldStore *ws, int cx, int cy, int cz)
      * flag-flip that remesh_enqueue's dedup would skip). */
     if (!(c->flags & CHUNK_DIRTY_MESH))
         c->flags |= CHUNK_DIRTY_MESH;
-    ws->remeshq[ws->remeshq_tail] = pidx;
-    ws->remeshq_tail = (ws->remeshq_tail + 1u) % WORLD_REMESHQ_CAP;
+    {
+        /* Same ring-full guard as remesh_enqueue (this push bypasses its dedup
+         * because worldgen already raised CHUNK_DIRTY_MESH on this fresh slab). */
+        uint32_t next = (ws->remeshq_tail + 1u) % WORLD_REMESHQ_CAP;
+        if (next != ws->remeshq_head) {
+            ws->remeshq[ws->remeshq_tail] = pidx;
+            ws->remeshq_tail = next;
+        }
+    }
 
     return c;
 }
@@ -611,6 +636,21 @@ static void evict_out_of_range(WorldStore *ws, int center_cx, int center_cz)
 static void enqueue_in_range(WorldStore *ws, int center_cx, int center_cz)
 {
     int dx, dz, cy;
+
+    /* Rebuild the gen queue from EMPTY. This is the dedup: the old code only
+     * skipped coords that were already RESIDENT, never coords already sitting in
+     * the queue, so every move re-flooded the still-pending in-band chunks
+     * (drain removes only WORLD_GEN_BUDGET=8/frame). The backlog grew until the
+     * ring lapped its head and silently dropped chunks (window collapse + a
+     * permanent hole once the player stops). enqueue_in_range is the ONLY
+     * producer and runs on every move over the WHOLE window, so clearing first
+     * loses nothing: each still-needed (non-resident, in-range) coord is just
+     * re-added below. The triple loop visits each coord once, so the queue holds
+     * at most WORLD_WINDOW_CHUNKS (338) distinct entries < WORLD_GENQ_CAP (402):
+     * no duplicates, no lap. Coords that fell OUT of range are correctly dropped
+     * (we don't want to generate them). */
+    ws->genq_head = ws->genq_tail = 0;
+
     for (cy = WORLD_BAND_Y0; cy <= WORLD_BAND_Y1; ++cy) {
         for (dz = -WORLD_RADIUS; dz <= WORLD_RADIUS; ++dz) {
             for (dx = -WORLD_RADIUS; dx <= WORLD_RADIUS; ++dx) {

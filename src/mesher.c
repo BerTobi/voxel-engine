@@ -157,6 +157,17 @@ static inline int is_liquid(Voxel v) {
     return material_get(vox_mat(v))->phase == (uint8_t)PHASE_LIQUID;
 }
 
+/* A drained PHASE_LIQUID voxel (fill == 0) is logically EMPTY: the sim no longer
+ * produces one (see sim.c fluid_step: non-spring held sources conserve fill, and
+ * a draining body reverts to MAT_AIR), but if a stray one ever appears the mesher
+ * must not draw it as a phantom cube. Treat it like air at the source-voxel test
+ * so neither the opaque nor the liquid sweep emits it. Solids are unaffected
+ * (their fill field is unused) so the M1 mesher tests are byte-identical. */
+static inline int is_drained_liquid(Voxel v) {
+    return material_get(vox_mat(v))->phase == (uint8_t)PHASE_LIQUID
+        && vox_fill(v) == 0;
+}
+
 /* ---- The merge key (per potential face on a slice plane) ----------------- */
 
 typedef struct {
@@ -339,9 +350,13 @@ static int emit_quad(MeshBuffer *mb, int d, int ua, int va, int plane,
  * rule, partitioning the chunk's faces into two streams (one shared merge body,
  * no duplicated merge code - ARCHITECTURE 5.1):
  *   liquid_pass == 0 (OPAQUE stream): source voxel must be non-air and NOT
- *     PHASE_LIQUID; a face is emitted toward an AIR neighbour (unchanged solid
- *     rule). A liquid neighbour is non-air, so a solid face behind a liquid
- *     stays culled exactly as before liquids were split out.
+ *     PHASE_LIQUID; a face is emitted toward a SEE-THROUGH neighbour - air OR a
+ *     (translucent) liquid - and culled only behind another opaque solid. This
+ *     is what makes a SUBMERGED surface visible: the lake bed, basin walls, and
+ *     the floor under water all face into liquid, so they must be drawn (you see
+ *     them through the water from above OR from inside it). It is NOT interior
+ *     bloat - a solid<->solid face is still culled; only the bounded solid<->
+ *     liquid interface (a real, visible surface) is added.
  *   liquid_pass == 1 (LIQUID stream): source voxel must be PHASE_LIQUID; a
  *     liquid face is emitted ONLY toward AIR (a liquid against solid or against
  *     another liquid culls - the pinned RENDER PLAN rule). The fill-height top
@@ -379,7 +394,8 @@ static uint32_t sweep_axis(const Chunk *c, MeshBuffer *mb, int d, int dir,
 
                 FaceKey *m = &mask[v][u];
                 m->present = 0;
-                if (is_air(here)) continue; /* air emits no faces */
+                if (is_air(here) || is_drained_liquid(here))
+                    continue;               /* air / drained liquid: no faces */
 
                 /* Phase partition: the opaque sweep meshes only non-liquid
                  * source voxels; the liquid sweep meshes only PHASE_LIQUID ones.
@@ -395,7 +411,16 @@ static uint32_t sweep_axis(const Chunk *c, MeshBuffer *mb, int d, int dir,
                 nc[0] = cc[0]; nc[1] = cc[1]; nc[2] = cc[2];
                 nc[d] += dir;
                 Voxel neigh = sample(c, nc[0], nc[1], nc[2]);
-                if (!is_air(neigh)) continue; /* occluded by solid neighbour */
+                if (liquid_pass) {
+                    /* A liquid face shows only against AIR (liquid behind solid
+                     * or behind another liquid culls - the pinned render rule). */
+                    if (!is_air(neigh)) continue;
+                } else {
+                    /* A SOLID face shows against anything see-through (air OR a
+                     * liquid), so submerged surfaces are visible; it is culled
+                     * only behind another opaque solid. */
+                    if (!is_air(neigh) && !is_liquid(neigh)) continue;
+                }
 
                 /* Visible face. Key it by appearance.
                  * Light: a face is lit by the AIR cell it faces into, so sample

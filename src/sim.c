@@ -543,7 +543,10 @@ static int try_phase_change(SimState *s, int li)
     if (md->melt_point_c < 0)
         return 0;
 
-    threshold_heat = (int32_t)md->melt_point_c << HEAT_FRAC_BITS;
+    /* MULTIPLY (not <<) by HEAT_ONE_C: safe here today (melt_point_c >= 0 past
+     * the guard above) but the multiply matches temp_to_heat's well-defined
+     * idiom and removes the latent negative-shift hazard for free. */
+    threshold_heat = (int32_t)md->melt_point_c * HEAT_ONE_C;
     /* Read the PRECISE temperature from the authoritative heat[] (full 1/64 C
      * resolution), NOT the re-decoded 8-bit code: banking against the precise
      * value is what makes the plateau and the latent energy accounting exact. */
@@ -828,7 +831,7 @@ static void fluid_revert_to_air(SimState *s, int li)
  * by the viscosity step budget + the every-Nth-tick cadence, moving at most
  * floor(gap/2) per neighbour and requiring gap>=2 (the anti-oscillation gate).
  * The cell below / each recipient is woken and marked moved. */
-static int fluid_step(SimState *s, int li, int is_source)
+static int fluid_step(SimState *s, int li, int is_source, int is_spring)
 {
     Voxel *vox = s->chunk->voxels;
     uint8_t mat = vox_mat(vox[li]);
@@ -844,6 +847,18 @@ static int fluid_step(SimState *s, int li, int is_source)
 
     if (f <= 0)
         return 0;                       /* nothing to move (sources re-fill later) */
+
+    /* A NON-SPRING held source conserves its fill IN PLACE - it must not donate.
+     * Such a voxel (a plain held source, or any MAT_EMISSIVE lava, which is held
+     * by flag and is NOT a spring) holds HEAT only (the held/spring DECOUPLE).
+     * If it were allowed to donate, it would drain to fill=0 and then: the
+     * revert-to-air below is skipped for sources, PHASE 2 refills only SPRINGS,
+     * and the sleep guard never sleeps a held source - leaving a permanent fill=0
+     * "phantom" that the mesher still draws as a glowing cube and that keeps
+     * waking neighbours (act.count grows without bound; an uncontained pool can
+     * flood the whole chunk). Only springs (sim_set_spring) flow + refill. */
+    if (is_source && !is_spring)
+        return 0;
 
     /* ---- (a) GRAVITY / DOWNWARD (never viscosity-gated) -------------------- */
     if (ly - 1 >= 0) {
@@ -1479,7 +1494,11 @@ void sim_tick(SimState *s)
                 continue;               /* data-driven: only liquids flow */
             if (moved_test(s, li))
                 continue;               /* already received fill this tick */
-            if (fluid_step(s, li, is_held_source(s, li)))
+            /* Pass the held flag AND the spring flag distinctly: fluid_step
+             * keeps a held source from reverting to air at fill=0, but only a
+             * SPRING is allowed to flow/donate (a non-spring held source - incl.
+             * MAT_EMISSIVE lava - conserves fill in place; see fluid_step). */
+            if (fluid_step(s, li, is_held_source(s, li), is_spring_source(s, li)))
                 changed = 1;
         }
     }

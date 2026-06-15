@@ -19,7 +19,7 @@
 
 #define VOXEL_VERSION_MAJOR 0
 #define VOXEL_VERSION_MINOR 1
-#define VOXEL_VERSION_PATCH 0
+#define VOXEL_VERSION_PATCH 1
 
 /* Build the "0.1.0" string from the numbers (one source of truth). */
 #define VOXEL__STR2(x) #x

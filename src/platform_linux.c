@@ -275,6 +275,11 @@ int plat_create_window(int w, int h, const char *title)
         return 1;
     }
 
+    /* Set the initial viewport explicitly (the context is current now). The
+     * server will also send a ConfigureNotify with the real mapped size, which
+     * re-applies glViewport if the WM gave us a different size. */
+    glViewport(0, 0, g_win_w, g_win_h);
+
     /* Capture the monotonic clock origin now so plat_time_ms() starts near 0. */
     clock_gettime(CLOCK_MONOTONIC, &g_clock_origin);
     g_clock_inited = 1;
@@ -341,6 +346,23 @@ void plat_poll(void)
             g_warp_pending = 1;
             break;
         }
+        case ConfigureNotify:
+            /* The window was resized (or moved). Cache the new size so the
+             * mouse-look recenter target and plat_get_size track it, and resize
+             * the GL viewport so the scene fills the window rather than staying
+             * clipped to the creation size. StructureNotifyMask (selected at
+             * creation) delivers this. The context is current by now (made
+             * current at the end of plat_create_window), so glViewport is safe. */
+            if (ev.xconfigure.width > 0 && ev.xconfigure.height > 0) {
+                int nw = ev.xconfigure.width;
+                int nh = ev.xconfigure.height;
+                if (nw != g_win_w || nh != g_win_h) {
+                    g_win_w = nw;
+                    g_win_h = nh;
+                    glViewport(0, 0, nw, nh);
+                }
+            }
+            break;
         case ClientMessage:
             /* Window-manager close button (WM_DELETE_WINDOW). */
             if ((Atom)ev.xclient.data.l[0] == g_wm_delete) {
@@ -386,6 +408,14 @@ int plat_key_down(int keycode)
     if (keycode < 0 || keycode >= PLAT_KEY_COUNT)
         return 0;
     return g_keys[keycode];
+}
+
+void plat_get_size(int *w, int *h)
+{
+    /* The live drawable size, kept current by ConfigureNotify. Before the window
+     * exists this is the requested size (set in plat_create_window) or 0. */
+    if (w) *w = g_win_w;
+    if (h) *h = g_win_h;
 }
 
 void plat_mouse_delta(int *dx, int *dy)

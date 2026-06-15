@@ -11,8 +11,8 @@ GeForce Go 7800 GTX (OpenGL 2.1), 32-bit Windows XP. The hardware constraint is
 the design discipline. It cross-compiles to one **static `.exe`** (no DLLs) and
 also runs natively on Linux for development.
 
-**Status:** `0.1.0` — the tech-demo foundation is complete; gameplay starts next.
-See [`CHANGELOG.md`](CHANGELOG.md).
+**Status:** `0.1.1` — the tech-demo foundation (shipped as `0.1.0`), now with its
+first round of bug fixes; gameplay starts next. See [`CHANGELOG.md`](CHANGELOG.md).
 
 ## What works (0.1.0)
 

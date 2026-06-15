@@ -28,6 +28,12 @@ int    plat_should_close(void);
 /* Present the back buffer (SwapBuffers / glXSwapBuffers; vsync if enabled). */
 void   plat_swap_buffers(void);
 
+/* Current drawable size in pixels (the live client/window size, which tracks
+ * user resizes; the backend resizes the GL viewport to match). Either pointer
+ * may be NULL. Before the window exists, reports the requested size or 0. The
+ * engine reads this each frame to keep the projection aspect ratio correct. */
+void   plat_get_size(int *w, int *h);
+
 /* Monotonic high-resolution clock in milliseconds since startup, as a double.
  * QueryPerformanceCounter on XP/M170, clock_gettime(CLOCK_MONOTONIC) on Linux. */
 double plat_time_ms(void);

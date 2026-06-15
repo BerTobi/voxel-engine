@@ -58,7 +58,9 @@ static unsigned char g_keys[PLAT_KEY_COUNT];
  * that lands exactly on the centre right after a warp (g_warp_pending). All of
  * this is plain XP-safe Win32: GetCursorPos/SetCursorPos/ShowCursor/ClipCursor -
  * no raw input (WM_INPUT) and no post-XP APIs. */
-static int g_mouse_captured = 0;     /* capture on/off (idempotent toggling)     */
+static int g_mouse_captured = 0;     /* capture ENGAGED right now (grab active)  */
+static int g_capture_desired = 0;    /* engine INTENT (plat_set_mouse_capture);  *
+                                      * re-armed on refocus, dropped on blur      */
 static int g_warp_pending   = 0;     /* a recenter SetCursorPos is in flight     */
 static int g_mdx = 0, g_mdy = 0;     /* accumulated relative motion (read+clear) */
 static int g_cursor_hidden  = 0;     /* tracks our balanced ShowCursor(FALSE)    */
@@ -109,8 +111,53 @@ static void plat_mouse_release(void)
     g_mdx = g_mdy = 0;
 }
 
-/* Window procedure: close requests and key state. Anything we don't handle
- * goes to DefWindowProc so XP draws the frame, sizes the window, etc. */
+/* Actually ENGAGE the grab: hide the cursor, recenter it to the client centre
+ * (priming g_warp_pending to swallow that warp), and confine it to the client
+ * rect. Factored out of plat_set_mouse_capture so the focus handler can re-arm
+ * capture on refocus without duplicating the logic. Idempotent (no-op if already
+ * engaged or there is no window). Does NOT touch g_capture_desired - that is the
+ * engine's intent and is owned by plat_set_mouse_capture. */
+static void mouse_engage(void)
+{
+    POINT pt;
+
+    if (g_mouse_captured || !g_hwnd)
+        return;
+    g_mouse_captured = 1;
+
+    if (!g_cursor_hidden) {
+        ShowCursor(FALSE);
+        g_cursor_hidden = 1;
+    }
+
+    pt.x = g_client_w / 2;
+    pt.y = g_client_h / 2;
+    if (ClientToScreen(g_hwnd, &pt)) {
+        SetCursorPos(pt.x, pt.y);
+        g_warp_pending = 1;
+    }
+    g_mdx = g_mdy = 0;
+
+    {
+        RECT  cr;
+        POINT tl, br;
+        if (GetClientRect(g_hwnd, &cr)) {
+            tl.x = cr.left;  tl.y = cr.top;
+            br.x = cr.right; br.y = cr.bottom;
+            if (ClientToScreen(g_hwnd, &tl) && ClientToScreen(g_hwnd, &br)) {
+                RECT clip;
+                clip.left   = tl.x;
+                clip.top    = tl.y;
+                clip.right  = br.x;
+                clip.bottom = br.y;
+                ClipCursor(&clip);
+            }
+        }
+    }
+}
+
+/* Window procedure: close requests, key state, focus changes, and resize.
+ * Anything we don't handle goes to DefWindowProc so XP draws the frame etc. */
 static LRESULT CALLBACK plat_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
 {
     switch (msg) {
@@ -127,6 +174,57 @@ static LRESULT CALLBACK plat_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM 
         plat_mouse_release();
         g_should_close = 1;
         return 0;
+
+    case WM_ACTIVATE:
+        /* Focus change (Alt-Tab, click-away, click-back). CRITICAL on the XP
+         * target: while captured, plat_poll recenters the SYSTEM cursor to the
+         * client centre 30-60x/sec via SetCursorPos. If we kept capturing after
+         * losing the foreground we would yank the desktop's cursor back into a
+         * backgrounded window every frame - unusable until the engine is killed.
+         * So DROP the grab on deactivate (without forgetting the engine's intent)
+         * and RE-ARM it on activate if the engine still wants it. */
+        if (LOWORD(wparam) == WA_INACTIVE) {
+            if (g_mouse_captured)
+                plat_mouse_release();    /* stop the recenter; keep g_capture_desired */
+        } else {
+            if (g_capture_desired)
+                mouse_engage();          /* refocused: re-grab if still wanted */
+        }
+        break;                           /* let DefWindowProc do default activation */
+
+    case WM_SIZE:
+        /* The client area was resized (drag-border / maximize / restore). Cache
+         * the new client size (LOWORD/HIWORD of lparam) so the mouse-look centre
+         * and plat_get_size track it, and resize the GL viewport so the scene
+         * fills the window instead of staying clipped to the creation size.
+         * Skip a zero size (minimize) and skip glViewport until the GL context
+         * exists (WM_SIZE also fires during CreateWindow, before wglMakeCurrent). */
+        {
+            int nw = (int)LOWORD(lparam);
+            int nh = (int)HIWORD(lparam);
+            if (nw > 0 && nh > 0) {
+                g_client_w = nw;
+                g_client_h = nh;
+                if (g_hglrc)
+                    glViewport(0, 0, nw, nh);
+                /* If captured, re-confine to the new client rect. */
+                if (g_mouse_captured) {
+                    RECT  cr;
+                    POINT tl, br;
+                    if (GetClientRect(hwnd, &cr)) {
+                        tl.x = cr.left;  tl.y = cr.top;
+                        br.x = cr.right; br.y = cr.bottom;
+                        if (ClientToScreen(hwnd, &tl) && ClientToScreen(hwnd, &br)) {
+                            RECT clip;
+                            clip.left = tl.x; clip.top = tl.y;
+                            clip.right = br.x; clip.bottom = br.y;
+                            ClipCursor(&clip);
+                        }
+                    }
+                }
+            }
+        }
+        break;                           /* DefWindowProc handles the rest */
 
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN: {
@@ -297,6 +395,11 @@ int plat_create_window(int w, int h, const char *title)
     SetForegroundWindow(g_hwnd);
     SetFocus(g_hwnd);
 
+    /* Set the initial viewport explicitly: WM_SIZE fired during CreateWindow
+     * before the context was current (so it skipped glViewport), and we want the
+     * first frame to fill the client area regardless of the GL default. */
+    glViewport(0, 0, g_client_w, g_client_h);
+
     /* Capture the QueryPerformanceCounter origin now so plat_time_ms() starts
      * near 0. If the platform has no high-res counter (vanishingly rare, but
      * possible on very old hardware), leave the clock uninited -> time stays 0. */
@@ -359,7 +462,7 @@ void plat_poll(void)
      * then warp the cursor back to centre - except we ignore the one sample that
      * lands precisely on the centre right after our own warp, so the synthetic
      * recenter motion never leaks into the accumulated delta. */
-    if (g_mouse_captured && g_hwnd) {
+    if (g_mouse_captured && g_hwnd && GetForegroundWindow() == g_hwnd) {
         POINT p;
         int   cx = g_client_w / 2;
         int   cy = g_client_h / 2;
@@ -427,58 +530,29 @@ void plat_mouse_delta(int *dx, int *dy)
 
 void plat_set_mouse_capture(int on)
 {
-    POINT pt;
-
     /* No-op before the window exists (implicitly OFF at startup). */
     if (!g_hwnd)
         return;
 
     if (on) {
-        if (g_mouse_captured)
-            return;                 /* idempotent: on -> on */
-        g_mouse_captured = 1;
-
-        /* Hide the cursor. ShowCursor maintains an internal display counter; we
-         * only ever drive it one step below zero and track that with a flag so
-         * the count can never drift no matter how often capture toggles. */
-        if (!g_cursor_hidden) {
-            ShowCursor(FALSE);
-            g_cursor_hidden = 1;
-        }
-
-        /* Recenter immediately so the first sampled delta is measured from the
-         * client centre, and prime g_warp_pending to swallow that warp sample. */
-        pt.x = g_client_w / 2;
-        pt.y = g_client_h / 2;
-        if (ClientToScreen(g_hwnd, &pt)) {
-            SetCursorPos(pt.x, pt.y);
-            g_warp_pending = 1;
-        }
-        g_mdx = g_mdy = 0;
-
-        /* Confine the pointer to the client rect (XP-safe) so it cannot click
-         * through to other windows while captured. */
-        {
-            RECT  cr;
-            POINT tl, br;
-            if (GetClientRect(g_hwnd, &cr)) {
-                tl.x = cr.left;  tl.y = cr.top;
-                br.x = cr.right; br.y = cr.bottom;
-                if (ClientToScreen(g_hwnd, &tl) && ClientToScreen(g_hwnd, &br)) {
-                    RECT clip;
-                    clip.left   = tl.x;
-                    clip.top    = tl.y;
-                    clip.right  = br.x;
-                    clip.bottom = br.y;
-                    ClipCursor(&clip);
-                }
-            }
-        }
+        g_capture_desired = 1;
+        /* Engage now only if we actually hold the foreground; if the engine asks
+         * for capture while backgrounded, the WM_ACTIVATE handler engages it on
+         * refocus. mouse_engage is idempotent (on -> on). */
+        if (GetForegroundWindow() == g_hwnd)
+            mouse_engage();
     } else {
-        if (!g_mouse_captured)
-            return;                 /* idempotent: off -> off */
-        plat_mouse_release();
+        g_capture_desired = 0;
+        plat_mouse_release();       /* idempotent: off -> off */
     }
+}
+
+void plat_get_size(int *w, int *h)
+{
+    /* The live CLIENT size, kept current by WM_SIZE. Before the window exists
+     * this is the requested size (set in plat_create_window) or 0. */
+    if (w) *w = g_client_w;
+    if (h) *h = g_client_h;
 }
 
 #endif /* _WIN32 */

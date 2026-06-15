@@ -1,0 +1,21 @@
+DISCOVERY: your forge sustained ~200 C
+DISCOVERY: your forge sustained ~500 C
+DISCOVERY: your forge sustained ~1000 C
+DISCOVERY: copper melts (observed ~1080 C)
+main: wrote screenshot /tmp/m9b.ppm
+
+=== PROGRESSION JOURNAL ===
+-- Discoveries (4) --
+  [t1] your forge sustained ~200 C
+  [t4] your forge sustained ~500 C
+  [t31] your forge sustained ~1000 C
+  [t3076] copper melts (observed ~1080 C)
+-- Observed material facts --
+  air: seen (observed 7211x)
+  stone: seen (observed 456x)
+  water: seen (observed 391x)
+  copper: observed molten ~1080 C; pools and flows (observed 64x)
+-- Capability --
+  current tier: forge (~1000 C)
+  workable now: water                                                                                                                                                                                                                                                   
+===========================

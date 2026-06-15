@@ -1,0 +1,671 @@
+/* world.c - The WorldStore: resident-chunk registry, slab pool, and the
+ * player-centred streaming window. The runtime implementation of the contract
+ * in world.h (ARCHITECTURE.md Section 1.5 ownership, 2.5 open-addressing chunk
+ * hash + 21-bit packed key + cached-neigh inner loop, Section 7 loaded window /
+ * distance eviction / fixed slab pool / no per-chunk malloc, Section 6 budgeted
+ * per-frame work drain).
+ *
+ * Pure C99, single-threaded. NO GL and NO OS here: worldgen, meshing, and the
+ * render-slot upload are reached only through the WorldCallbacks function
+ * pointers handed in at world_init, so this file builds and unit-tests headless
+ * (test_world.c passes NULL render callbacks). Memory is bounded: every array
+ * is fixed-size on the struct and the slab pool is one calloc that never grows.
+ *
+ * Persistence of MODIFIED chunks (Section 8) is now WIRED through an OPTIONAL,
+ * injected PersistStore* (ws->store, set via world_set_persist after init; NULL
+ * == disabled == today's pure-regen behaviour). The three hooks the design
+ * reserves are now live:
+ *   - world_insert / LOAD : try persist_load_chunk FIRST; on a hit the chunk's
+ *     mat|temp|fill are restored from disk and cb.gen is SKIPPED; on a miss (the
+ *     common case, and always when store==NULL) fall through to cb.gen exactly
+ *     as before. Either way the chunk is lit + meshed by the normal remesh queue.
+ *   - world_evict / EVICT : a chunk carrying CHUNK_MODIFIED is written back via
+ *     persist_save_chunk BEFORE its slab returns to the pool, so an edit survives
+ *     the eviction that fires when the player roams away. An unmodified chunk is
+ *     dropped with zero I/O (the seed is its storage).
+ *   - world_shutdown / FLUSH : every resident is evicted (so every modified one
+ *     is saved through the evict hook), then persist_flush lands the region
+ *     headers/indices, so edits survive a process restart, not just an eviction.
+ * The WorldStore does NOT own the handle (persist_close is the caller's job);
+ * worldgen stays deterministic, so an UNMODIFIED chunk still costs zero bytes.
+ */
+#include <stdlib.h>
+#include <string.h>
+
+#include "world.h"
+#include "persist.h"   /* PersistStore + persist_load/save/flush (Section 8).
+                        * world.h forward-declares PersistStore and stays
+                        * persist.h-free; world.c is the one place that actually
+                        * calls the persist_* API, so the on-disk format leaks no
+                        * further than this translation unit. A NULL ws->store
+                        * (the default after world_init's memset, and what
+                        * test_world.c always runs with) makes every persist call
+                        * a documented no-op, so the streaming/regen behaviour is
+                        * byte-for-byte unchanged when persistence is disabled. */
+
+/* ======================================================================== *
+ *  Small helpers                                                           *
+ * ======================================================================== */
+
+/* Pool index of a resident chunk: its offset into the contiguous slab array.
+ * Valid only for a chunk that came from ws->pool (every resident chunk does). */
+static inline uint32_t pool_index(const WorldStore *ws, const Chunk *c)
+{
+    return (uint32_t)(c - ws->pool);
+}
+
+/* Chebyshev (chessboard) distance between two chunk columns, used by the
+ * window/eviction policy. */
+static inline int cheby(int ax, int az, int bx, int bz)
+{
+    int dx = ax - bx; if (dx < 0) dx = -dx;
+    int dz = az - bz; if (dz < 0) dz = -dz;
+    return (dx > dz) ? dx : dz;
+}
+
+/* The 6 axis-adjacent unit steps in canonical Face order
+ * (0=-X,1=+X,2=-Y,3=+Y,4=-Z,5=+Z), matching chunk.h's neigh[] layout. The
+ * opposite of dir is (dir ^ 1) (NEG/POS pairing). */
+static const int NEIGH_DX[6] = { -1, +1,  0,  0,  0,  0 };
+static const int NEIGH_DY[6] = {  0,  0, -1, +1,  0,  0 };
+static const int NEIGH_DZ[6] = {  0,  0,  0,  0, -1, +1 };
+
+/* ======================================================================== *
+ *  Residency hash (Section 2.5): open-addressing, linear probe, no         *
+ *  tombstones (backward-shift deletion).                                   *
+ * ======================================================================== */
+
+/* A slot is EMPTY iff ptr==NULL (key==0 alone is ambiguous because chunk
+ * (0,0,0) packs to key 0; the ptr disambiguates - so we test ptr). */
+static inline int slot_empty(const ChunkSlot *s)
+{
+    return s->ptr == NULL;
+}
+
+/* Find the resident Chunk at (cx,cy,cz), or NULL. Cold path only. */
+Chunk *world_get(const WorldStore *ws, int cx, int cy, int cz)
+{
+    uint64_t key = chunk_key(cx, cy, cz);
+    uint32_t mask = WORLD_HASH_CAP - 1u;
+    uint32_t i = key_hash(key) & mask;
+
+    /* Linear probe until an empty slot (key absent) or a key match. The table
+     * is kept well under load 0.7 and tombstone-free, so this terminates. */
+    for (;;) {
+        const ChunkSlot *s = &ws->table[i];
+        if (slot_empty(s))
+            return NULL;                 /* hit an empty slot -> not resident */
+        if (s->key == key && s->ptr != NULL)
+            return s->ptr;
+        i = (i + 1u) & mask;
+    }
+}
+
+/* Insert (key,ptr) into the table. Caller guarantees the key is not already
+ * present and the table has room (load factor invariant). */
+static void table_insert(WorldStore *ws, uint64_t key, Chunk *c)
+{
+    uint32_t mask = WORLD_HASH_CAP - 1u;
+    uint32_t i = key_hash(key) & mask;
+
+    while (!slot_empty(&ws->table[i]))
+        i = (i + 1u) & mask;
+
+    ws->table[i].key = key;
+    ws->table[i].ptr = c;
+    ws->table_count++;
+}
+
+/* Remove `key` and close the probe chain via backward-shift (Robin-Hood-for-
+ * linear-probing) deletion, so the table stays tombstone-free across an
+ * unbounded number of insert/evict cycles. Standard linear-probing deletion
+ * with an explicit hole index and a scan cursor: after clearing the matched
+ * slot, pull forward any later entry that probed past the hole and whose home
+ * is at-or-before the hole (so it stays reachable by a forward probe). */
+static void table_delete(WorldStore *ws, uint64_t key)
+{
+    uint32_t mask = WORLD_HASH_CAP - 1u;
+    uint32_t i = key_hash(key) & mask;
+    uint32_t hole;
+
+    /* locate the key */
+    for (;;) {
+        ChunkSlot *s = &ws->table[i];
+        if (slot_empty(s))
+            return;                      /* not present (defensive) */
+        if (s->key == key && s->ptr != NULL)
+            break;
+        i = (i + 1u) & mask;
+    }
+    hole = i;
+
+    /* clear it */
+    ws->table[hole].key = 0;
+    ws->table[hole].ptr = NULL;
+    ws->table_count--;
+
+    /* backward-shift: pull forward any entry that probed past `hole` */
+    uint32_t j = (hole + 1u) & mask;
+    for (;;) {
+        ChunkSlot *s = &ws->table[j];
+        if (slot_empty(s))
+            break;                       /* end of cluster */
+
+        uint32_t home = key_hash(s->key) & mask;
+        /* Can the entry at j legally occupy `hole`? It can iff `hole` lies in
+         * the cyclic interval [home .. j], i.e. moving it back keeps it
+         * reachable by a forward probe from its home. */
+        uint32_t dist_j    = (j    - home) & mask;   /* how far j is past home */
+        uint32_t dist_hole = (hole - home) & mask;   /* how far hole is past home */
+
+        if (dist_hole <= dist_j) {
+            /* relocate j into the hole, open a new hole at j */
+            ws->table[hole] = ws->table[j];
+            ws->table[j].key = 0;
+            ws->table[j].ptr = NULL;
+            hole = j;
+        }
+        j = (j + 1u) & mask;
+    }
+}
+
+/* ======================================================================== *
+ *  Resident iteration list (dense pool indices + O(1) swap-remove)         *
+ * ======================================================================== */
+
+static void resident_add(WorldStore *ws, uint32_t pidx)
+{
+    ws->resident_at[pidx] = ws->resident_count;
+    ws->resident[ws->resident_count] = pidx;
+    ws->resident_count++;
+}
+
+static void resident_remove(WorldStore *ws, uint32_t pidx)
+{
+    uint32_t at   = ws->resident_at[pidx];
+    uint32_t last = ws->resident_count - 1u;
+
+    if (at != last) {
+        uint32_t moved = ws->resident[last];
+        ws->resident[at]       = moved;
+        ws->resident_at[moved] = at;     /* the moved chunk's new position */
+    }
+    ws->resident_count = last;
+}
+
+uint32_t world_resident_count(const WorldStore *ws)
+{
+    return ws->resident_count;
+}
+
+Chunk *world_resident_at(const WorldStore *ws, uint32_t i)
+{
+    if (i >= ws->resident_count)
+        return NULL;
+    return &ws->pool[ws->resident[i]];
+}
+
+int world_render_slot(const WorldStore *ws, const Chunk *c)
+{
+    return ws->render_slot[pool_index(ws, c)];
+}
+
+/* ======================================================================== *
+ *  Remesh queue (pool indices, deduped by CHUNK_DIRTY_MESH)                *
+ * ======================================================================== */
+
+/* Queue chunk c for (re)mesh, unless it is already dirty/queued. The
+ * CHUNK_DIRTY_MESH flag is the dedup key: a chunk touched by several neighbour
+ * changes in one frame is enqueued at most once. Capacity == WORLD_POOL_SLOTS,
+ * which is the max number of distinct live chunks, so the ring never overflows
+ * (each pool index appears at most once at a time). */
+static void remesh_enqueue(WorldStore *ws, Chunk *c)
+{
+    if (c->flags & CHUNK_DIRTY_MESH)
+        return;                          /* already queued */
+    c->flags |= CHUNK_DIRTY_MESH;
+    ws->remeshq[ws->remeshq_tail] = pool_index(ws, c);
+    ws->remeshq_tail = (ws->remeshq_tail + 1u) % WORLD_REMESHQ_CAP;
+}
+
+static int remesh_empty(const WorldStore *ws)
+{
+    return ws->remeshq_head == ws->remeshq_tail;
+}
+
+/* ======================================================================== *
+ *  Gen queue (coords to generate; bounded ring)                            *
+ * ======================================================================== */
+
+static void gen_enqueue(WorldStore *ws, int cx, int cy, int cz)
+{
+    ws->genq_cx[ws->genq_tail] = cx;
+    ws->genq_cy[ws->genq_tail] = cy;
+    ws->genq_cz[ws->genq_tail] = cz;
+    ws->genq_tail = (ws->genq_tail + 1u) % WORLD_GENQ_CAP;
+}
+
+static int gen_empty(const WorldStore *ws)
+{
+    return ws->genq_head == ws->genq_tail;
+}
+
+/* ======================================================================== *
+ *  Neighbour maintenance (M5 seamless meshing as the window slides)        *
+ * ======================================================================== */
+
+/* Re-derive c->neigh[6] from the current hash and write the reciprocal
+ * back-pointer on every resident neighbour. A newly-wired neighbour has its
+ * seam toward c re-culled, so it is queued for remesh. A non-resident neighbour
+ * leaves neigh[dir]=NULL (mesher treats that boundary as AIR). Returns the
+ * number of resident neighbours wired (0..6). */
+int world_wire_neighbours(WorldStore *ws, Chunk *c)
+{
+    int dir;
+    int wired = 0;
+
+    for (dir = 0; dir < 6; ++dir) {
+        Chunk *n = world_get(ws,
+                             c->cx + NEIGH_DX[dir],
+                             c->cy + NEIGH_DY[dir],
+                             c->cz + NEIGH_DZ[dir]);
+        c->neigh[dir] = n;
+        if (n != NULL) {
+            n->neigh[dir ^ 1] = c;       /* reciprocal back-pointer */
+            remesh_enqueue(ws, n);       /* its seam toward c now culls */
+            wired++;
+        }
+    }
+    return wired;
+}
+
+/* On evict: NULL the evictee out of each resident neighbour's back-pointer and
+ * queue those neighbours for remesh (their seam faces toward c re-open). */
+static void unwire_neighbours(WorldStore *ws, Chunk *c)
+{
+    int dir;
+    for (dir = 0; dir < 6; ++dir) {
+        Chunk *n = c->neigh[dir];
+        if (n != NULL) {
+            n->neigh[dir ^ 1] = NULL;
+            remesh_enqueue(ws, n);
+            c->neigh[dir] = NULL;
+        }
+    }
+}
+
+/* ======================================================================== *
+ *  Render-slot allocation (free stack)                                     *
+ * ======================================================================== */
+
+static int slot_acquire(WorldStore *ws)
+{
+    if (ws->slot_free_top == 0u)
+        return -1;                       /* none free (window << slots, can't happen) */
+    return ws->slot_free[--ws->slot_free_top];
+}
+
+static void slot_release(WorldStore *ws, int slot)
+{
+    if (slot < 0)
+        return;
+    ws->slot_free[ws->slot_free_top++] = slot;
+}
+
+/* ======================================================================== *
+ *  Insert / Evict                                                          *
+ * ======================================================================== */
+
+Chunk *world_insert(WorldStore *ws, int cx, int cy, int cz)
+{
+    uint32_t pidx;
+    Chunk   *c;
+    int      slot;
+
+    if (world_get(ws, cx, cy, cz) != NULL)
+        return NULL;                     /* already resident */
+    if (ws->free_top == 0u)
+        return NULL;                     /* pool full: hard invariant violation */
+
+    /* pop a slab */
+    pidx = ws->free_idx[--ws->free_top];
+    c = &ws->pool[pidx];
+
+    /* clear the slab so a recycled slab carries no stale voxels/neigh/flags
+     * before worldgen stamps it (worldgen also sets cx/cy/cz, but be explicit
+     * so the neigh wiring below reads the right coords). */
+    memset(c, 0, sizeof(*c));
+    c->cx = cx;
+    c->cy = cy;
+    c->cz = cz;
+
+    /* Fill the slab. Section 8 gen-vs-stored: PERSISTED edits win over the seed.
+     * Try the save first - persist_load_chunk restores a stored chunk's
+     * mat|temp|fill verbatim (light|ao|flags left 0 for light.c / the CA to
+     * rebake / re-wake) and returns 1 on a HIT, in which case the deterministic
+     * generator is SKIPPED. The common case (and ALWAYS when ws->store == NULL,
+     * e.g. test_world.c) is a MISS (returns 0), so we fall through to cb.gen
+     * exactly as the M7 path did. The chunk is lit + meshed identically below
+     * whichever branch filled it. */
+    if (!persist_load_chunk(ws->store, c, cx, cy, cz)) {
+        /* MISS: regenerate from seed via the required gen callback */
+        ws->cb.gen(c, cx, cy, cz, ws->seed, ws->cb.user);
+    }
+    /* gen sets CHUNK_GEN|CHUNK_DIRTY_MESH; a persist HIT leaves flags 0 (the
+     * remesh enqueue below raises CHUNK_DIRTY_MESH unconditionally, so a loaded
+     * chunk still meshes). Restate coords either way in case a test gen callback,
+     * or the persist loader, did not. */
+    c->cx = cx;
+    c->cy = cy;
+    c->cz = cz;
+
+    /* register residency BEFORE wiring neighbours (so a neighbour's world_get
+     * for THIS chunk would find it, and so the reciprocal wiring is symmetric). */
+    table_insert(ws, chunk_key(cx, cy, cz), c);
+    resident_add(ws, pidx);
+
+    /* assign a render slot for the chunk's residency lifetime */
+    slot = slot_acquire(ws);
+    ws->render_slot[pidx] = slot;
+
+    /* wire neigh[6] both directions; queues touched neighbours for remesh */
+    world_wire_neighbours(ws, c);
+
+    /* queue this chunk itself for (re)mesh. worldgen already raised
+     * CHUNK_DIRTY_MESH, so push it onto the queue explicitly (without the
+     * flag-flip that remesh_enqueue's dedup would skip). */
+    if (!(c->flags & CHUNK_DIRTY_MESH))
+        c->flags |= CHUNK_DIRTY_MESH;
+    ws->remeshq[ws->remeshq_tail] = pidx;
+    ws->remeshq_tail = (ws->remeshq_tail + 1u) % WORLD_REMESHQ_CAP;
+
+    return c;
+}
+
+void world_evict(WorldStore *ws, int cx, int cy, int cz)
+{
+    Chunk   *c = world_get(ws, cx, cy, cz);
+    uint32_t pidx;
+    int      slot;
+
+    if (c == NULL)
+        return;                          /* not resident: no-op */
+
+    pidx = pool_index(ws, c);
+
+    /* Section 8 writeback (now LIVE): a player-MODIFIED chunk is persisted
+     * BEFORE its slab is returned to the pool (and before c->flags is cleared
+     * below), so an edit survives the eviction that fires the instant the player
+     * roams out of range. persist_save_chunk canonicalises to mat|temp|fill,
+     * palettizes + RLE-compresses, and writes it into the region file. An
+     * UNMODIFIED chunk is dropped with ZERO I/O - the deterministic seed is its
+     * storage (gen-vs-stored). ws->store == NULL (persistence disabled) makes
+     * this a no-op, so the M7 ephemeral-regen behaviour is exactly preserved.
+     * A failed save is logged inside persist.c and returns non-zero; we drop the
+     * slab anyway - a disk error must NOT wedge eviction or grow the window. */
+    if ((c->flags & CHUNK_MODIFIED) && ws->store != NULL)
+        (void)persist_save_chunk(ws->store, c);
+
+    /* NULL the evictee out of its resident neighbours and queue them to remesh
+     * (their seams toward c re-open). */
+    unwire_neighbours(ws, c);
+
+    /* remove from the hash (backward-shift, tombstone-free) */
+    table_delete(ws, chunk_key(cx, cy, cz));
+
+    /* drop from the resident list (O(1) swap-remove) */
+    resident_remove(ws, pidx);
+
+    /* free the render slot (mark drawable-as-nothing) */
+    slot = ws->render_slot[pidx];
+    if (slot >= 0) {
+        if (ws->cb.slot_free)
+            ws->cb.slot_free(slot, ws->cb.user);
+        slot_release(ws, slot);
+        ws->render_slot[pidx] = -1;
+    }
+
+    /* If this chunk was sitting in the remesh queue (dirty), clear its dirty
+     * flag so the drain skips the now-dead pool index (the drain re-checks the
+     * flag and residency, but clearing keeps the invariant that a dead slab is
+     * never "dirty"). */
+    c->flags = 0;
+
+    /* return the slab to the pool */
+    ws->free_idx[ws->free_top++] = pidx;
+}
+
+/* ======================================================================== *
+ *  Lifecycle                                                               *
+ * ======================================================================== */
+
+int world_init(WorldStore *ws, uint64_t seed, const WorldCallbacks *cb)
+{
+    uint32_t i;
+
+    if (ws == NULL || cb == NULL || cb->gen == NULL)
+        return 1;                        /* gen is REQUIRED */
+
+    memset(ws, 0, sizeof(*ws));
+    ws->seed = seed;
+    ws->cb   = *cb;
+
+    /* one big contiguous slab pool, reserved once and never grown */
+    ws->pool = (Chunk *)calloc(WORLD_POOL_SLOTS, sizeof(Chunk));
+    if (ws->pool == NULL)
+        return 1;
+
+    /* free-list stack: all slabs free (push in descending order so the first
+     * pop hands out index 0 - tidy, not required). */
+    ws->free_top = 0;
+    for (i = WORLD_POOL_SLOTS; i-- > 0; )
+        ws->free_idx[ws->free_top++] = i;
+
+    /* render-slot free stack: all slots free (descending so slot 0 hands out
+     * first). */
+    ws->slot_free_top = 0;
+    for (i = MAX_RENDER_CHUNKS; i-- > 0; )
+        ws->slot_free[ws->slot_free_top++] = (int)i;
+
+    /* render_slot defaults to -1 (no slot) for every pool index */
+    for (i = 0; i < WORLD_POOL_SLOTS; ++i)
+        ws->render_slot[i] = -1;
+
+    /* queues empty, hash empty (memset already), no center yet. ws->store is
+     * NULL (memset) == persistence disabled until world_set_persist injects a
+     * handle, so an unaugmented caller (test_world.c) runs pure regen. */
+    ws->genq_head = ws->genq_tail = 0;
+    ws->remeshq_head = ws->remeshq_tail = 0;
+    ws->have_center = 0;
+
+    return 0;
+}
+
+/* Inject (or detach with NULL) the optional persistence handle. Separate from
+ * world_init so the init signature - and every existing caller, including
+ * test_world.c - stays unchanged (world_init leaves ws->store == NULL). The
+ * store is borrowed, NOT owned: the caller opened it (persist_open) and the
+ * caller closes it (persist_close); world_shutdown only flushes through it. */
+void world_set_persist(WorldStore *ws, PersistStore *store)
+{
+    if (ws == NULL)
+        return;                          /* tolerate a NULL store handle too */
+    ws->store = store;
+}
+
+void world_shutdown(WorldStore *ws)
+{
+    if (ws == NULL)
+        return;
+
+    /* Evict every resident so render slots are freed via the callback and
+     * neighbour pointers are cleared. Walk the dense list from the end (evict
+     * does a swap-remove, so popping the last is stable). The evict path
+     * already persists each CHUNK_MODIFIED chunk (the writeback hook above), so
+     * this loop IS the Section 8 shutdown flush of resident edits. */
+    while (ws->resident_count > 0u) {
+        Chunk *c = &ws->pool[ws->resident[ws->resident_count - 1u]];
+        world_evict(ws, c->cx, c->cy, c->cz);
+    }
+
+    /* Land the region headers/indices high-water marks to disk now that every
+     * resident modified chunk has been written through evict. persist_flush
+     * does NOT close the handles - the store is borrowed (world_set_persist
+     * comment), so the caller still owns persist_close(). NULL store -> no-op,
+     * so a non-persisted world (test_world.c) shuts down exactly as in M7. */
+    if (ws->store != NULL)
+        (void)persist_flush(ws->store);
+
+    free(ws->pool);
+    ws->pool = NULL;
+}
+
+/* ======================================================================== *
+ *  Budgeted drain (Section 6)                                              *
+ * ======================================================================== */
+
+/* Pop up to WORLD_GEN_BUDGET gen requests: each brings a chunk resident
+ * (world_insert -> pop slab, gen, link, queue self+neighbours for remesh).
+ * Skips coords that became resident already (a duplicate enqueue, or primed). */
+static void drain_gen(WorldStore *ws, int budget)
+{
+    int done = 0;
+    while (done < budget && !gen_empty(ws)) {
+        int cx = ws->genq_cx[ws->genq_head];
+        int cy = ws->genq_cy[ws->genq_head];
+        int cz = ws->genq_cz[ws->genq_head];
+        ws->genq_head = (ws->genq_head + 1u) % WORLD_GENQ_CAP;
+
+        if (world_get(ws, cx, cy, cz) != NULL)
+            continue;                    /* already resident; not a budget spend */
+
+        world_insert(ws, cx, cy, cz);    /* NULL only if pool full (invariant) */
+        done++;
+    }
+}
+
+/* Pop up to WORLD_REMESH_BUDGET remesh requests: light+mesh+upload each chunk
+ * into its render slot, then clear CHUNK_DIRTY_MESH. A queued pool index whose
+ * chunk was evicted (flags cleared, not dirty) is skipped without spending
+ * budget, so a stale entry never touches a recycled slab. */
+static void drain_remesh(WorldStore *ws, int budget)
+{
+    int done = 0;
+    while (done < budget && !remesh_empty(ws)) {
+        uint32_t pidx = ws->remeshq[ws->remeshq_head];
+        ws->remeshq_head = (ws->remeshq_head + 1u) % WORLD_REMESHQ_CAP;
+
+        Chunk *c = &ws->pool[pidx];
+        if (!(c->flags & CHUNK_DIRTY_MESH))
+            continue;                    /* evicted or already meshed: skip */
+
+        if (ws->cb.mesh_upload)
+            ws->cb.mesh_upload(c, ws->render_slot[pidx], ws->cb.user);
+
+        c->flags &= ~(uint8_t)CHUNK_DIRTY_MESH;
+        c->flags &= ~(uint8_t)CHUNK_GEN;
+        done++;
+    }
+}
+
+/* ======================================================================== *
+ *  Streaming window update (the per-frame driver)                          *
+ * ======================================================================== */
+
+/* Convert a world position to a chunk coord: floor(world / CHUNK_DIM). Done in
+ * integer (cast toward zero would mis-round negatives) so the window centre is
+ * correct on either side of the origin. */
+static int floor_div_chunk(float world)
+{
+    int w = (int)world;
+    /* (int) truncates toward zero; for negative non-multiples that is one too
+     * high, so adjust. Compare against world to catch the fractional part. */
+    if ((float)w > world)
+        w -= 1;                          /* world was negative & fractional */
+    /* now w == floor(world); divide by CHUNK_DIM with floor semantics */
+    if (w >= 0)
+        return w / CHUNK_DIM;
+    return -(((-w) + CHUNK_DIM - 1) / CHUNK_DIM);
+}
+
+/* Evict every resident whose (cx,cz) Chebyshev distance from the new centre
+ * exceeds WORLD_RADIUS (the trailing edge). Walks the dense resident list;
+ * because world_evict swap-removes, we do NOT advance i when we evict at i. */
+static void evict_out_of_range(WorldStore *ws, int center_cx, int center_cz)
+{
+    uint32_t i = 0;
+    while (i < ws->resident_count) {
+        Chunk *c = &ws->pool[ws->resident[i]];
+        if (cheby(c->cx, c->cz, center_cx, center_cz) > WORLD_RADIUS) {
+            world_evict(ws, c->cx, c->cy, c->cz);
+            /* a swap-remove pulled another resident into slot i; re-test it */
+        } else {
+            i++;
+        }
+    }
+}
+
+/* Enqueue for generation every in-band chunk within radius of the new centre
+ * that is not already resident (the leading edge). Coords only; the actual
+ * generation happens in the budgeted drain. */
+static void enqueue_in_range(WorldStore *ws, int center_cx, int center_cz)
+{
+    int dx, dz, cy;
+    for (cy = WORLD_BAND_Y0; cy <= WORLD_BAND_Y1; ++cy) {
+        for (dz = -WORLD_RADIUS; dz <= WORLD_RADIUS; ++dz) {
+            for (dx = -WORLD_RADIUS; dx <= WORLD_RADIUS; ++dx) {
+                int cx = center_cx + dx;
+                int cz = center_cz + dz;
+                if (world_get(ws, cx, cy, cz) != NULL)
+                    continue;            /* already resident */
+                gen_enqueue(ws, cx, cy, cz);
+            }
+        }
+    }
+}
+
+void world_stream_update(WorldStore *ws, float player_x, float player_z)
+{
+    int center_cx = floor_div_chunk(player_x);
+    int center_cz = floor_div_chunk(player_z);
+    int moved = (!ws->have_center ||
+                 center_cx != ws->center_cx ||
+                 center_cz != ws->center_cz);
+
+    if (moved) {
+        /* trailing edge out, leading edge enqueued */
+        evict_out_of_range(ws, center_cx, center_cz);
+        enqueue_in_range(ws, center_cx, center_cz);
+        ws->center_cx = center_cx;
+        ws->center_cz = center_cz;
+        ws->have_center = 1;
+    }
+    /* A stationary player with no pending work falls straight through the drain
+     * (both queues empty) and costs nothing. */
+
+    drain_gen(ws, WORLD_GEN_BUDGET);
+    drain_remesh(ws, WORLD_REMESH_BUDGET);
+}
+
+void world_prime(WorldStore *ws, float player_x, float player_z)
+{
+    int center_cx = floor_div_chunk(player_x);
+    int center_cz = floor_div_chunk(player_z);
+
+    /* Re-centre the window (evict out-of-range, enqueue leading edge) exactly
+     * like a move, then drain to EMPTY ignoring the per-frame budget, so the
+     * first frame shows the full terrain and tests are deterministic. */
+    evict_out_of_range(ws, center_cx, center_cz);
+    enqueue_in_range(ws, center_cx, center_cz);
+    ws->center_cx = center_cx;
+    ws->center_cz = center_cz;
+    ws->have_center = 1;
+
+    /* Drain everything. Gen may push new entries onto the remesh queue, so
+     * interleave until both are empty. WORLD_GENQ_CAP / WORLD_REMESHQ_CAP are
+     * sized to the window, so this terminates within the window's bounds. */
+    while (!gen_empty(ws) || !remesh_empty(ws)) {
+        drain_gen(ws, (int)WORLD_GENQ_CAP);
+        drain_remesh(ws, (int)WORLD_REMESHQ_CAP);
+    }
+}

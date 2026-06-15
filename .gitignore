@@ -1,0 +1,18 @@
+# Build artifacts (regenerable from source via the Makefile)
+/build/
+*.o
+*.obj
+*.exe.tmp
+
+# Runtime save data (per-seed region files; not source)
+/saves/
+
+# Editor / OS cruft
+*~
+*.swp
+.DS_Store
+
+# Intentionally TRACKED (do NOT ignore):
+#   archive/      - preserved per-version executables (constant backups, by request)
+#   screenshots/  - documentation captures
+#   src/, *.md, Makefile, .gitignore

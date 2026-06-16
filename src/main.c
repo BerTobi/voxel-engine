@@ -1198,24 +1198,32 @@ int main(void)
                 if (ray.hit && lc > 0)
                     edit_and_notify(world, sim, ray.hx, ray.hy, ray.hz, air_voxel());
                 if (ray.hit && rc > 0) {
-                    /* Don't place a block INTO yourself: in WALK reject any cell
-                     * the body AABB occupies (feet..head), in FLY just the eye
-                     * cell. Otherwise right-click could entomb the player. */
+                    /* Don't place a block INTO yourself: reject a place cell the
+                     * body overlaps. In WALK the body is the collision SPHERE
+                     * (center player.pos, radius pp.r_p) — an orientation-free test
+                     * that works anywhere on the planet; the old world-Y AABB built
+                     * from pos-as-feet wrongly blocked the GROUND cell in front of
+                     * you once "up" stopped being +Y (e.g. on the asteroid's side),
+                     * so right-click placement silently did nothing. FLY rejects
+                     * only the eye cell. */
                     int blocked;
                     if (fly_mode) {
                         blocked = (ray.px == (int)floorf(cam_pos.x) &&
                                    ray.py == (int)floorf(cam_pos.y) &&
                                    ray.pz == (int)floorf(cam_pos.z));
                     } else {
-                        int x0 = (int)floorf(player.pos.x - pp.half_xz);
-                        int x1 = (int)floorf(player.pos.x + pp.half_xz - 1e-4f);
-                        int y0 = (int)floorf(player.pos.y);
-                        int y1 = (int)floorf(player.pos.y + pp.height - 1e-4f);
-                        int z0 = (int)floorf(player.pos.z - pp.half_xz);
-                        int z1 = (int)floorf(player.pos.z + pp.half_xz - 1e-4f);
-                        blocked = (ray.px >= x0 && ray.px <= x1 &&
-                                   ray.py >= y0 && ray.py <= y1 &&
-                                   ray.pz >= z0 && ray.pz <= z1);
+                        /* closest point on the place cell [px,px+1]^3 to the sphere
+                         * center, then sphere-overlap (squared distance < r_p^2). */
+                        float qx = player.pos.x, qy = player.pos.y, qz = player.pos.z;
+                        float dxp, dyp, dzp;
+                        if (qx < (float)ray.px)        qx = (float)ray.px;
+                        else if (qx > (float)ray.px+1) qx = (float)ray.px + 1.0f;
+                        if (qy < (float)ray.py)        qy = (float)ray.py;
+                        else if (qy > (float)ray.py+1) qy = (float)ray.py + 1.0f;
+                        if (qz < (float)ray.pz)        qz = (float)ray.pz;
+                        else if (qz > (float)ray.pz+1) qz = (float)ray.pz + 1.0f;
+                        dxp = player.pos.x - qx; dyp = player.pos.y - qy; dzp = player.pos.z - qz;
+                        blocked = (dxp*dxp + dyp*dyp + dzp*dzp) < pp.r_p * pp.r_p;
                     }
                     if (!blocked)
                         edit_and_notify(world, sim, ray.px, ray.py, ray.pz,

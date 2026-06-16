@@ -501,9 +501,16 @@ int world_edit_voxel(WorldStore *ws, int wx, int wy, int wz, Voxel v)
     if (c == NULL)
         return 0;                    /* can't edit an unloaded chunk */
 
-    chunk_set(c, lx, ly, lz, v);
+    chunk_set(c, lx, ly, lz, v);      /* writes the voxel AND raises CHUNK_DIRTY_MESH */
     c->flags |= CHUNK_MODIFIED;       /* persist this edit on eviction */
-    remesh_enqueue(ws, c);            /* sets DIRTY_MESH + enqueues (deduped) */
+    /* chunk_set already raised CHUNK_DIRTY_MESH, but remesh_enqueue's dedup SKIPS a
+     * chunk that already reads dirty (the flag is its "already queued" marker). A
+     * plain enqueue here would therefore set the flag yet never PUSH the chunk,
+     * leaving it dirty-but-unqueued and never re-meshed - the edit lands in the
+     * voxels (collision/raycast see it) but the mesh stays stale. Clear the flag
+     * first so the enqueue actually queues it (same as world_insert's gen path). */
+    c->flags &= ~(uint8_t)CHUNK_DIRTY_MESH;
+    remesh_enqueue(ws, c);            /* now enqueues + re-raises CHUNK_DIRTY_MESH */
 
     /* A boundary-plane edit changes the shared seam, so the abutting resident
      * neighbour must re-mesh too (its faces toward this voxel may open/close). */

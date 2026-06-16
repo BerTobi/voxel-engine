@@ -311,7 +311,10 @@ static const char *VS_OPAQUE =
     "    float hi  = floor((a_light + 0.5) / 16.0);\n"     /* heat 0..15 */
     "    float sky = lo / 15.0;\n"
     "    v_heat    = hi / 15.0;\n"
-    "    const float AMBIENT = 0.15;\n"   /* unlit floor: dark, not black */
+    "    const float AMBIENT = 0.70;\n"   /* 0.3 asteroid: high flat floor so the ball
+                                           * isn't half-dark (skylight bakes only its +Y
+                                           * cap; true radial skylight deferred). AO
+                                           * still shapes faces. Was 0.15.            */
     "    float lit = clamp(sky * u_sun, 0.0, 1.0);\n"
     "    v_bright = (AMBIENT + (1.0 - AMBIENT) * lit) * a_ao;\n"
     "}\n";

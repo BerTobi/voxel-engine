@@ -51,7 +51,7 @@
 /* Bump on ANY change to generated output (Section 8 versioning). A save written
  * by an older version is "from an older generator" and must not silently
  * regenerate differently (the doc's default: refuse to load on mismatch). */
-#define WG_GEN_VERSION   1u
+#define WG_GEN_VERSION   2u   /* 2: spherical asteroid (was 1: rolling heightmap) */
 
 /* ---- Surface band (binding; the WorldStore vertical band brackets this) ---- *
  * The heightmap surface lives entirely within [WG_HEIGHT_MIN, WG_HEIGHT_MAX]
@@ -72,6 +72,21 @@
  * read.) Every solid voxel is stamped fill=15 and ambient temperature, exactly
  * the chunk_gen_flat convention, so light/mesh/sim see a consistent world. */
 #define WG_DIRT_DEPTH    3
+
+/* ---- Spherical asteroid (0.3 radial-gravity prototype) -------------------- *
+ * The world is a single solid voxel BALL: a voxel is STONE where its world-space
+ * distance from the center WG_PLANET_C* is <= WG_PLANET_R, with a WG_DIRT_DEPTH-
+ * thick DIRT crust just beneath the surface, and AIR outside. Player gravity
+ * (player.c) and the camera (main.c) point at this SAME center, so "down" is
+ * radial everywhere. This replaces the rolling heightmap for the prototype; the
+ * fill is a pure-integer squared-distance test, so determinism is preserved (and
+ * it is independent of `seed` - there is one fixed asteroid). Center is chunk-
+ * interior-ish at the HOME column (DEMO_WORLD_X/Z = 8) and lifted to world-Y 28 so
+ * the whole ball sits in the resident vertical band (see world.h WORLD_BAND_Y1). */
+#define WG_PLANET_CX     8     /* planet center, world voxels (X)                */
+#define WG_PLANET_CY     28    /* planet center, world voxels (Y)                */
+#define WG_PLANET_CZ     8     /* planet center, world voxels (Z)                */
+#define WG_PLANET_R      28    /* planet radius, world voxels (~40 s lap)        */
 
 /* ---- Value-noise lattice (binding; cheap integer hills) -------------------- *
  * Heights are sampled on a coarse square lattice of period WG_NOISE_PERIOD

@@ -160,34 +160,36 @@ void worldgen_fill_chunk(Chunk *c, int cx, int cy, int cz, uint64_t seed)
 {
     uint8_t ambient = temp_encode_c(WG_AMBIENT_C);
     int lx, ly, lz;
+    /* Squared radii (pure integer -> deterministic, no sqrt, no FP drift). */
+    const long R2  = (long)WG_PLANET_R * (long)WG_PLANET_R;
+    const long Rd  = (long)WG_PLANET_R - (long)WG_DIRT_DEPTH;
+    const long Rd2 = Rd * Rd;
+
+    (void)seed;   /* one fixed asteroid; generation is seed-independent */
 
     c->cx = cx;
     c->cy = cy;
     c->cz = cz;
 
-    /* x-fastest, then y, then z, matching vox_index and chunk_gen_flat. The
-     * per-column surface height is computed once at the top of each (lx,lz)
-     * column and reused down the 16 rows - the cost-discipline rule. */
+    /* Spherical asteroid: STONE where world-distance^2 from the center <= R^2,
+     * a WG_DIRT_DEPTH dirt crust just under the surface, AIR outside. lx is the
+     * fastest (contiguous, vox_index = lx + ly*16 + lz*256). */
     for (lz = 0; lz < CHUNK_DIM; ++lz) {
-        int world_z = cz * CHUNK_DIM + lz;
-        for (lx = 0; lx < CHUNK_DIM; ++lx) {
-            int world_x = cx * CHUNK_DIM + lx;
-            int surface = worldgen_height(seed, world_x, world_z);
-
-            for (ly = 0; ly < CHUNK_DIM; ++ly) {
-                int world_y = cy * CHUNK_DIM + ly;
+        long dz = (long)(cz * CHUNK_DIM + lz) - WG_PLANET_CZ;
+        for (ly = 0; ly < CHUNK_DIM; ++ly) {
+            long dy = (long)(cy * CHUNK_DIM + ly) - WG_PLANET_CY;
+            for (lx = 0; lx < CHUNK_DIM; ++lx) {
+                long dx = (long)(cx * CHUNK_DIM + lx) - WG_PLANET_CX;
+                long d2 = dx * dx + dy * dy + dz * dz;
                 Voxel v = 0;
 
-                if (world_y >= surface) {
-                    /* air column at/above the surface */
+                if (d2 > R2) {
                     vox_set_mat(&v, MAT_AIR);
-                } else if (world_y >= surface - WG_DIRT_DEPTH) {
-                    /* dirt cap: the top WG_DIRT_DEPTH solid rows */
-                    vox_set_mat(&v, MAT_DIRT);
+                } else if (d2 > Rd2) {
+                    vox_set_mat(&v, MAT_DIRT);     /* crust */
                     vox_set_fill(&v, 15);
                 } else {
-                    /* stone bulk below */
-                    vox_set_mat(&v, MAT_STONE);
+                    vox_set_mat(&v, MAT_STONE);    /* core */
                     vox_set_fill(&v, 15);
                 }
 

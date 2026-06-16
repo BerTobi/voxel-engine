@@ -142,9 +142,10 @@ typedef struct {
 #define WORLD_RADIUS     6                       /* Chebyshev radius, chunks   */
 #define WORLD_DIAM       (2 * WORLD_RADIUS + 1)  /* 13                         */
 #define WORLD_BAND_Y0    0                       /* lowest resident chunk cy   */
-#define WORLD_BAND_Y1    1                       /* highest resident chunk cy  */
-#define WORLD_BAND_H     (WORLD_BAND_Y1 - WORLD_BAND_Y0 + 1)  /* 2 layers      */
-#define WORLD_WINDOW_CHUNKS (WORLD_DIAM * WORLD_DIAM * WORLD_BAND_H) /* 338     */
+#define WORLD_BAND_Y1    3   /* highest resident chunk cy (0.3: covers the R=28
+                              * asteroid at CY=28, i.e. world-Y 0..63 = cy 0..3) */
+#define WORLD_BAND_H     (WORLD_BAND_Y1 - WORLD_BAND_Y0 + 1)  /* 4 layers      */
+#define WORLD_WINDOW_CHUNKS (WORLD_DIAM * WORLD_DIAM * WORLD_BAND_H) /* 676     */
 
 /* SLAB POOL (Section 7 "Fixed-Size Slab Pool, No Per-Chunk malloc"). A single
  * pre-allocated contiguous array of Chunk slots + a free-list STACK of indices.
@@ -162,8 +163,9 @@ typedef struct {
  * The pool is reserved ONCE at world_init (Section 7 "reserve big and early"):
  * one calloc of WORLD_POOL_SLOTS * sizeof(Chunk). On the XP target this single
  * contiguous block is grabbed before the heap fragments. */
-#define WORLD_POOL_SLACK  64u
-#define WORLD_POOL_SLOTS  (WORLD_WINDOW_CHUNKS + WORLD_POOL_SLACK)  /* 402 */
+#define WORLD_POOL_SLACK  128u  /* >= 2 leading curtains = 2*WORLD_DIAM*WORLD_BAND_H
+                                 * = 2*13*4 = 104 (band grew 2->4 for the ball)   */
+#define WORLD_POOL_SLOTS  (WORLD_WINDOW_CHUNKS + WORLD_POOL_SLACK)  /* 804 */
 
 /* ======================================================================== *
  *  4. PER-FRAME STREAMING BUDGET  (ARCHITECTURE Section 6 / Section 7)      *

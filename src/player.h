@@ -42,6 +42,17 @@ typedef struct {
     float water_term;     /* terminal sink speed in water (3.0)          */
     float swim_vel;       /* swim up/down speed in water (4.0)           */
     float max_substep;    /* max move per collision sub-step, voxels (0.45) */
+    /* ---- 0.3 radial gravity (spherical planet) ----------------------------- *
+     * "down" is toward the center of mass, not -Y; the body is a SPHERE (radius
+     * r_p) so collision is orientation-free (the box never had to reorient). pos
+     * is the sphere CENTER; the eye sits at pos + up*eye along the radial up. The
+     * caller sets center_* to the planet center (worldgen's WG_PLANET_C*); with a
+     * far-away center the field is ~locally flat -Y again (the unit tests use that
+     * to keep their -Y assertions). half_xz/height are now unused by the sim. */
+    float r_p;            /* player collision sphere radius (0.45)        */
+    float center_x;       /* planet center of mass, world voxels (X)      */
+    float center_y;       /*                                       (Y)    */
+    float center_z;       /*                                       (Z)    */
 } PlyParams;
 
 /* The tuned default parameters (Minecraft-ish feel). */

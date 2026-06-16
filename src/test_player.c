@@ -16,7 +16,7 @@ static void check(const char *name, int cond)
 
 /* ---- synthetic worlds (kind: 0 passable, 1 solid, 2 liquid) -------------- */
 static int w_floor(void *c, int x, int y, int z){ (void)c;(void)x;(void)z; return y <= 0 ? 1 : 0; }
-static int w_floor_ceil(void *c,int x,int y,int z){ (void)c;(void)x;(void)z; return (y<=0||y>=4)?1:0; }
+static int w_floor_ceil(void *c,int x,int y,int z){ (void)c;(void)x;(void)z; return (y<=0||y>=3)?1:0; }
 static int w_floor_wallx(void *c,int x,int y,int z){ (void)c;(void)z; if(y<=0)return 1; return x>=2?1:0; }
 static int w_floor_corner(void *c,int x,int y,int z){ if(y<=0)return 1; (void)c; return (x>=2||z>=2)?1:0; }
 static int w_thinwall(void *c,int x,int y,int z){ (void)c;(void)y;(void)z; return x==3?1:0; }
@@ -40,12 +40,22 @@ int main(void)
     const float DT = 1.0f / 30.0f;
     int i;
 
+    /* 0.3 radial gravity: put the planet center FAR below so "down" is ~pure -Y
+     * over these small flat-floor worlds (the locally-flat limit). This keeps the
+     * gravity/collision/wall/anti-tunnel cases meaningful while exercising the new
+     * SPHERE collider (radius pp.r_p). A NEAR center would tilt gravity toward the
+     * origin and drift the player sideways. Rest/clamp heights are now offset by
+     * r_p (sphere surface) instead of the old AABB half-extents. */
+    pp.center_x = 0.0f;
+    pp.center_y = -1.0e6f;
+    pp.center_z = 0.0f;
+
     /* (1) FALL + LAND: drop from y=5 onto the floor (block tops at y=1). Feet
      *     settle at ~1.0, on_ground, vel.y ~ 0. */
     {
         Player p = at(0.5f, 5.0f, 0.5f);
         for (i = 0; i < 90; ++i) player_step(&p, &pp, none, 0, 0, DT, w_floor, 0);
-        check("land: feet rest at ~1.0", fabsf(p.pos.y - 1.0f) < 0.02f);
+        check("land: sphere center rests at ~1.0+r_p", fabsf(p.pos.y - (1.0f + pp.r_p)) < 0.05f);
         check("land: on_ground set", p.on_ground == 1);
         check("land: vertical velocity ~0", fabsf(p.vel.y) < 0.5f);
     }
@@ -58,9 +68,9 @@ int main(void)
         for (i = 0; i < 90; ++i) {
             int jump = (i == 5);   /* one jump once grounded */
             player_step(&p, &pp, none, jump, 0, DT, w_floor_ceil, 0);
-            if (p.pos.y + pp.height > max_head) max_head = p.pos.y + pp.height;
+            if (p.pos.y + pp.r_p > max_head) max_head = p.pos.y + pp.r_p;
         }
-        check("ceiling: head never passes y=4", max_head <= 4.0f + 0.02f);
+        check("ceiling: sphere top never passes y=3", max_head <= 3.0f + 0.05f);
     }
 
     /* (3) WALL: floor + solid x>=2. Walk +X; the AABB max (x+half) clamps to 2.0
@@ -68,7 +78,7 @@ int main(void)
     {
         Player p = at(0.0f, 1.0f, 0.5f);
         for (i = 0; i < 90; ++i) player_step(&p, &pp, v3(1,0,0), 0, 0, DT, w_floor_wallx, 0);
-        check("wall: x clamps to 1.7 (max at 2.0)", p.pos.x <= 1.7f + 0.02f);
+        check("wall: x clamps so sphere edge <= 2.0", p.pos.x <= (2.0f - pp.r_p) + 0.05f);
         check("wall: x velocity killed", fabsf(p.vel.x) < 0.01f);
         check("wall: no Z drift", fabsf(p.pos.z - 0.5f) < 0.02f);
     }
@@ -79,8 +89,8 @@ int main(void)
         Player p = at(0.0f, 1.0f, 0.0f);
         PlyVec diag = v3(0.7071f, 0.0f, 0.7071f);
         for (i = 0; i < 90; ++i) player_step(&p, &pp, diag, 0, 0, DT, w_floor_corner, 0);
-        check("corner: x not penetrated", p.pos.x <= 1.7f + 0.02f);
-        check("corner: z not penetrated", p.pos.z <= 1.7f + 0.02f);
+        check("corner: x not penetrated", p.pos.x <= (2.0f - pp.r_p) + 0.05f);
+        check("corner: z not penetrated", p.pos.z <= (2.0f - pp.r_p) + 0.05f);
         check("corner: position finite", p.pos.x == p.pos.x && p.pos.z == p.pos.z);
     }
 
@@ -91,7 +101,7 @@ int main(void)
         Player p = at(0.0f, 1.0f, 0.5f);
         p.vel.x = 600.0f;             /* ~20 voxels in one clamped 50ms frame */
         player_step(&p, &pp, none, 0, 0, 0.05f, w_thinwall, 0);
-        check("anti-tunnel: stopped before the x=3 wall", p.pos.x + pp.half_xz <= 3.0f + 0.02f);
+        check("anti-tunnel: stopped before the x=3 wall", p.pos.x + pp.r_p <= 3.0f + 0.05f);
         check("anti-tunnel: did NOT pass through", p.pos.x < 3.0f);
     }
 

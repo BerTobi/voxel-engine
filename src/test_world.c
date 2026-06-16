@@ -392,54 +392,50 @@ static void test_worldgen_determinism(void)
                hmax > hmin, "all sampled columns had identical height");
     }
 
-    /* 3d: strata shape matches the chunk_gen_flat convention, per column. */
+    /* 3d: SPHERICAL asteroid fill (0.3) - each voxel is STONE inside radius
+     * R-WG_DIRT_DEPTH, a DIRT crust out to WG_PLANET_R, AIR beyond, keyed on the
+     * squared world-distance from the planet center (mirrors worldgen_fill_chunk).
+     * Test a chunk straddling the ball's top cap (cy=3 -> world-Y 48..63). */
     if (1) {
-        Chunk *c = chunk_alloc(2, 0, 2);
+        int cx = 0, cy = 3, cz = 0;
+        Chunk *c = chunk_alloc(cx, cy, cz);
+        long R2  = (long)WG_PLANET_R * (long)WG_PLANET_R;
+        long Rd  = (long)WG_PLANET_R - (long)WG_DIRT_DEPTH;
+        long Rd2 = Rd * Rd;
         int ok3 = 1; char d3[160]; d3[0] = '\0';
-        int cx = 2, cy = 0, cz = 2;
-        int lx, lz;
+        int lx, ly, lz;
         if (c == NULL) {
-            report("worldgen strata: air/dirt/stone by world-Y compare",
-                   0, "chunk_alloc failed");
+            report("worldgen sphere: stone/dirt/air by radius", 0, "chunk_alloc failed");
             return;
         }
         worldgen_fill_chunk(c, cx, cy, cz, seed);
-        for (lz = 0; lz < CHUNK_DIM && ok3; ++lz) {
-            for (lx = 0; lx < CHUNK_DIM && ok3; ++lx) {
-                int wxx = cx * CHUNK_DIM + lx;
-                int wzz = cz * CHUNK_DIM + lz;
-                int surf = worldgen_height(seed, wxx, wzz);
-                int ly;
-                for (ly = 0; ly < CHUNK_DIM; ++ly) {
-                    int world_y = cy * CHUNK_DIM + ly;
+        for (lz = 0; lz < CHUNK_DIM && ok3; ++lz)
+            for (ly = 0; ly < CHUNK_DIM && ok3; ++ly)
+                for (lx = 0; lx < CHUNK_DIM && ok3; ++lx) {
+                    long dx = (long)(cx * CHUNK_DIM + lx) - WG_PLANET_CX;
+                    long dy = (long)(cy * CHUNK_DIM + ly) - WG_PLANET_CY;
+                    long dz = (long)(cz * CHUNK_DIM + lz) - WG_PLANET_CZ;
+                    long d2 = dx * dx + dy * dy + dz * dz;
                     Voxel v = c->voxels[vox_index(lx, ly, lz)];
-                    uint8_t m = vox_mat(v);
-                    uint8_t expect;
-                    if (world_y >= surf)
-                        expect = MAT_AIR;
-                    else if (world_y >= surf - WG_DIRT_DEPTH)
-                        expect = MAT_DIRT;
-                    else
-                        expect = MAT_STONE;
+                    uint8_t m = vox_mat(v), expect;
+                    if (d2 > R2)        expect = MAT_AIR;
+                    else if (d2 > Rd2)  expect = MAT_DIRT;
+                    else                expect = MAT_STONE;
                     if (m != expect) {
                         ok3 = 0;
                         snprintf(d3, sizeof d3,
-                            "col(wx=%d,wz=%d) y=%d surf=%d mat=%u expected=%u",
-                            wxx, wzz, world_y, surf, m, expect);
+                            "voxel d2=%ld mat=%u expected=%u (R2=%ld Rd2=%ld)",
+                            d2, m, expect, R2, Rd2);
                         break;
                     }
-                    /* solids carry fill=15, air carries fill 0 (the convention). */
                     if (expect != MAT_AIR && vox_fill(v) != 15) {
                         ok3 = 0;
-                        snprintf(d3, sizeof d3,
-                            "solid at y=%d has fill=%u, expected 15",
-                            world_y, vox_fill(v));
+                        snprintf(d3, sizeof d3, "solid d2=%ld has fill=%u, expected 15",
+                                 d2, vox_fill(v));
                         break;
                     }
                 }
-            }
-        }
-        report("worldgen strata: air/dirt/stone by world-Y compare", ok3, d3);
+        report("worldgen sphere: stone/dirt/air by radius", ok3, d3);
         chunk_free(c);
     }
 }

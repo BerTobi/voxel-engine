@@ -212,6 +212,24 @@ static Vec3 vec3_sub(Vec3 a, Vec3 b)
     return r;
 }
 
+static Vec3 vec3_add(Vec3 a, Vec3 b)
+{
+    Vec3 r;
+    r.x = a.x + b.x;
+    r.y = a.y + b.y;
+    r.z = a.z + b.z;
+    return r;
+}
+
+static Vec3 vec3_scale(Vec3 a, float s)
+{
+    Vec3 r;
+    r.x = a.x * s;
+    r.y = a.y * s;
+    r.z = a.z * s;
+    return r;
+}
+
 static Vec3 vec3_cross(Vec3 a, Vec3 b)
 {
     Vec3 r;
@@ -425,6 +443,14 @@ static void demo_decorate(Chunk *c)
     if (c->cx != HOME_CX || c->cy != HOME_CY || c->cz != HOME_CZ)
         return;
 
+    /* --- 0.3 asteroid prototype: demo decoration DISABLED --------------------
+     * The world is now a solid voxel BALL (worldgen.c). The flat-world lava/
+     * water/two-vase demo below would punch a lava+water pit into the asteroid,
+     * so it is short-circuited here. The body is kept (compiled but unreachable)
+     * as the 0.2 water reference; re-enable when fluids return to the sphere. */
+    (void)x; (void)y; (void)z;
+    return;
+
     /* Pedestal: fill the demo footprint (x 2..11, z 2..7) solid stone from the
      * chunk floor up to DEMO_FLOOR_Y-1, giving the demo a flat floor at local-Y
      * DEMO_FLOOR_Y clear of the rolling terrain below. */
@@ -505,6 +531,48 @@ static void demo_decorate(Chunk *c)
         for (z = 5; z <= 7; ++z)
             for (y = DEMO_FLOOR_Y + 2; y <= DEMO_FLOOR_Y + 6; ++y)
                 chunk_set(c, x, y, z, make_liquid(MAT_WATER));
+
+    /* COMMUNICATING VESSELS demo (0.2 connected-body finisher) with a MANUAL VALVE.
+     * Two EQUAL walled vases (4 wide x 3 deep each) split by a SOLID divider whose
+     * base is a DIRT "valve" - so they start DISCONNECTED: the left vase is brim-full
+     * and the right is empty, and nothing moves (the full vase sits asleep). Break
+     * the dirt valve (left-click) to open a floor channel; water then runs into the
+     * empty right vase from below and the connected-body finisher raises it until
+     * BOTH surfaces meet at the same level - hydrostatic equilibrium ON DEMAND (the
+     * local gravity+lateral rule alone only fills the right vase's floor row; the
+     * finisher lifts the rest as a snap). Sits north of the water basin (z 9..13) on
+     * its own stone pedestal, interior to the HOME chunk and clear of its faces; the
+     * right vase is OPEN so the rise reads from above. Footprint x 2..12, z 9..13. */
+    {
+        const int F = DEMO_FLOOR_Y, VTOP = DEMO_FLOOR_Y + 6;  /* < 15: clear of top */
+        /* Pedestal floor + outer wall ring (x2,x12,z9,z13) up to the vase rim. */
+        for (x = 2; x <= 12; ++x)
+            for (z = 9; z <= 13; ++z) {
+                for (y = 0; y < F; ++y)
+                    chunk_set(c, x, y, z, make_voxel(MAT_STONE));
+                if (x == 2 || x == 12 || z == 9 || z == 13)
+                    for (y = F; y <= VTOP; ++y)
+                        chunk_set(c, x, y, z, make_voxel(MAT_STONE));
+            }
+        /* Divider at x=7: a SOLID stone wall (interior depth z 10..12, y F..VTOP) -
+         * a CLOSED valve, so the two vases start disconnected. */
+        for (z = 10; z <= 12; ++z)
+            for (y = F; y <= VTOP; ++y)
+                chunk_set(c, 7, y, z, make_voxel(MAT_STONE));
+        /* The VALVE: a dirt strip at the divider's base (x7, F, z 10..12). Break it
+         * (left-click) to open the floor channel and start the flow on demand; dirt
+         * blocks water exactly like stone until broken, and reads as a distinct
+         * brown band marking where to open. */
+        for (z = 10; z <= 12; ++z)
+            chunk_set(c, 7, F, z, make_voxel(MAT_DIRT));
+        /* Left vase (x 3..6, z 10..12) brim-full to F+5; right vase (x 8..11) left
+         * empty and OPEN. Equal cross-sections, so once the valve opens they level
+         * to a clean common surface; until then the full left vase sits STILL. */
+        for (x = 3; x <= 6; ++x)
+            for (z = 10; z <= 12; ++z)
+                for (y = F; y <= F + 5; ++y)
+                    chunk_set(c, x, y, z, make_liquid(MAT_WATER));
+    }
 }
 
 /* True iff HOME already carries the demo (either decorated this run, or LOADED
@@ -622,7 +690,8 @@ int main(void)
      * yaw/pitch. world_up is the +Y reference for the look-at + strafe frame. */
     Vec3   cam_pos;
     Vec3   cam_target;
-    Vec3   world_up;
+    Vec3   world_up;       /* 0.3: per-frame RADIAL up (was fixed +Y)            */
+    Vec3   planet_center;  /* 0.3: asteroid center of mass (gravity + camera up) */
     float  yaw;     /* degrees; yaw=0 looks toward -Z (matches today's framing) */
     float  pitch;   /* degrees; <0 looks down, clamped to +/-CAM_PITCH_LIMIT    */
 
@@ -633,6 +702,12 @@ int main(void)
     Player     player;
     PlyParams  pp = player_defaults();
     int        fly_mode = 0;     /* set at init: forced on under VOXEL_SHOT */
+
+    /* 0.3 radial gravity: the player falls toward the asteroid center of mass
+     * (same WG_PLANET_* the worldgen + camera use). */
+    pp.center_x = (float)WG_PLANET_CX;
+    pp.center_y = (float)WG_PLANET_CY;
+    pp.center_z = (float)WG_PLANET_CZ;
 
     /* Headless camera control (the streaming-capture knobs of the design):
      *   VOXEL_CAM_X / VOXEL_CAM_Z : starting world look position (override demo)
@@ -855,6 +930,11 @@ int main(void)
     world_up.y = 1.0f;
     world_up.z = 0.0f;
 
+    /* 0.3 asteroid: gravity + the camera's "up" point at this center of mass. */
+    planet_center.x = (float)WG_PLANET_CX;
+    planet_center.y = (float)WG_PLANET_CY;
+    planet_center.z = (float)WG_PLANET_CZ;
+
     yaw   = init_yaw;
     pitch = init_pitch;
     if (pitch >  CAM_PITCH_LIMIT) pitch =  CAM_PITCH_LIMIT;
@@ -1004,22 +1084,33 @@ int main(void)
                 if (yaw <    0.0f) yaw += 360.0f;
             }
 
-            /* Build the look direction from yaw/pitch (degrees -> radians).
-             * yaw=0 -> -Z, pitch<0 -> looking down (matches the env defaults). */
-            ry = yaw   * (float)(M_PI / 180.0);
-            rp = pitch * (float)(M_PI / 180.0);
-            cp = cosf(rp);
-            fwd.x = sinf(ry) * cp;
-            fwd.y = sinf(rp);
-            fwd.z = -cosf(ry) * cp;
+            /* --- 0.3 RADIAL camera basis ------------------------------------
+             * "up" is radial (away from the asteroid center) and rotates as the
+             * eye moves; yaw/pitch are taken RELATIVE to a tangent frame, not the
+             * world +Y. A pole guard keeps the basis from degenerating when up is
+             * (anti)parallel to world Y. world_up is set to this radial up, so the
+             * look-at and the WALK eye offset (below) follow the curvature.
+             *   fwd_flat = tangent forward (yaw heading on the surface, full 3D)
+             *   fwd      = look direction (fwd_flat tilted toward up by pitch)
+             *   right    = tangent right (for strafing) */
+            {
+                Vec3 up_l = vec3_normalize(vec3_sub(cam_pos, planet_center));
+                Vec3 ref, east, north;
+                if (fabsf(up_l.y) < 0.99f) { ref.x = 0.0f; ref.y = 1.0f; ref.z = 0.0f; }
+                else                       { ref.x = 1.0f; ref.y = 0.0f; ref.z = 0.0f; }
+                east  = vec3_normalize(vec3_cross(ref, up_l));
+                north = vec3_cross(up_l, east);          /* orthonormal -> unit   */
+                world_up = up_l;
 
-            /* Horizontal move frame: flatten forward to XZ, derive right. */
-            fwd_flat.x = fwd.x;
-            fwd_flat.y = 0.0f;
-            fwd_flat.z = fwd.z;
-            fwd_flat = vec3_normalize(fwd_flat);
-
-            right = vec3_normalize(vec3_cross(fwd_flat, world_up));
+                ry = yaw   * (float)(M_PI / 180.0);
+                rp = pitch * (float)(M_PI / 180.0);
+                cp = cosf(rp);
+                fwd_flat = vec3_add(vec3_scale(east, sinf(ry)),
+                                    vec3_scale(north, -cosf(ry)));   /* unit       */
+                fwd = vec3_normalize(vec3_add(vec3_scale(fwd_flat, cp),
+                                              vec3_scale(up_l, sinf(rp))));
+                right = vec3_normalize(vec3_cross(fwd_flat, up_l));
+            }
 
             /* F toggles FLY <-> WALK (live only, edge-triggered). Forbidden under
              * VOXEL_SHOT (fly is forced there). Entering WALK, seed the body from
@@ -1030,9 +1121,9 @@ int main(void)
                 if (f_now && !f_prev) {
                     fly_mode = !fly_mode;
                     if (!fly_mode) {                 /* entering WALK */
-                        player.pos.x = cam_pos.x;
-                        player.pos.y = cam_pos.y - pp.eye;
-                        player.pos.z = cam_pos.z;
+                        player.pos.x = cam_pos.x - world_up.x * pp.eye;
+                        player.pos.y = cam_pos.y - world_up.y * pp.eye;
+                        player.pos.z = cam_pos.z - world_up.z * pp.eye;
                         player.vel.x = player.vel.y = player.vel.z = 0.0f;
                         player.on_ground = 0;
                     }
@@ -1041,21 +1132,17 @@ int main(void)
             }
 
             if (fly_mode) {
-                /* FLY: the original free-fly translation (byte-identical, and the
-                 * only mode under VOXEL_SHOT). VOXEL_FLY auto-advances +X. */
+                /* FLY: free-fly in the tangent frame; SPACE/LSHIFT move along the
+                 * RADIAL up. VOXEL_FLY still auto-advances world +X (capture sweep). */
                 Vec3 delta;
-                delta.x = fly_per_frame;
-                delta.y = 0.0f;
-                delta.z = 0.0f;
-                if (plat_key_down(PLAT_KEY_W)) { delta.x += fwd_flat.x*move; delta.z += fwd_flat.z*move; }
-                if (plat_key_down(PLAT_KEY_S)) { delta.x -= fwd_flat.x*move; delta.z -= fwd_flat.z*move; }
-                if (plat_key_down(PLAT_KEY_D)) { delta.x += right.x*move;    delta.z += right.z*move; }
-                if (plat_key_down(PLAT_KEY_A)) { delta.x -= right.x*move;    delta.z -= right.z*move; }
-                if (plat_key_down(PLAT_KEY_SPACE))  delta.y += move;
-                if (plat_key_down(PLAT_KEY_LSHIFT)) delta.y -= move;
-                cam_pos.x += delta.x;
-                cam_pos.y += delta.y;
-                cam_pos.z += delta.z;
+                delta.x = fly_per_frame; delta.y = 0.0f; delta.z = 0.0f;
+                if (plat_key_down(PLAT_KEY_W)) delta = vec3_add(delta, vec3_scale(fwd_flat, move));
+                if (plat_key_down(PLAT_KEY_S)) delta = vec3_sub(delta, vec3_scale(fwd_flat, move));
+                if (plat_key_down(PLAT_KEY_D)) delta = vec3_add(delta, vec3_scale(right,    move));
+                if (plat_key_down(PLAT_KEY_A)) delta = vec3_sub(delta, vec3_scale(right,    move));
+                if (plat_key_down(PLAT_KEY_SPACE))  delta = vec3_add(delta, vec3_scale(world_up, move));
+                if (plat_key_down(PLAT_KEY_LSHIFT)) delta = vec3_sub(delta, vec3_scale(world_up, move));
+                cam_pos = vec3_add(cam_pos, delta);
             } else {
                 /* WALK: yaw-relative wish direction from WASD -> AABB physics ->
                  * derive the eye from the body. Space jumps/swims up, Shift
@@ -1063,18 +1150,19 @@ int main(void)
                 PlyVec wish;
                 float wl;
                 wish.x = 0.0f; wish.y = 0.0f; wish.z = 0.0f;
-                if (plat_key_down(PLAT_KEY_W)) { wish.x += fwd_flat.x; wish.z += fwd_flat.z; }
-                if (plat_key_down(PLAT_KEY_S)) { wish.x -= fwd_flat.x; wish.z -= fwd_flat.z; }
-                if (plat_key_down(PLAT_KEY_D)) { wish.x += right.x;    wish.z += right.z; }
-                if (plat_key_down(PLAT_KEY_A)) { wish.x -= right.x;    wish.z -= right.z; }
-                wl = sqrtf(wish.x*wish.x + wish.z*wish.z);
-                if (wl > 1e-4f) { wish.x /= wl; wish.z /= wl; }
+                if (plat_key_down(PLAT_KEY_W)) { wish.x += fwd_flat.x; wish.y += fwd_flat.y; wish.z += fwd_flat.z; }
+                if (plat_key_down(PLAT_KEY_S)) { wish.x -= fwd_flat.x; wish.y -= fwd_flat.y; wish.z -= fwd_flat.z; }
+                if (plat_key_down(PLAT_KEY_D)) { wish.x += right.x;    wish.y += right.y;    wish.z += right.z; }
+                if (plat_key_down(PLAT_KEY_A)) { wish.x -= right.x;    wish.y -= right.y;    wish.z -= right.z; }
+                wl = sqrtf(wish.x*wish.x + wish.y*wish.y + wish.z*wish.z);
+                if (wl > 1e-4f) { wish.x /= wl; wish.y /= wl; wish.z /= wl; }
                 player_step(&player, &pp, wish,
                             plat_key_down(PLAT_KEY_SPACE), plat_key_down(PLAT_KEY_LSHIFT),
                             dt_s, ply_solid, world);
-                cam_pos.x = player.pos.x;
-                cam_pos.y = player.pos.y + pp.eye;
-                cam_pos.z = player.pos.z;
+                /* eye sits along the RADIAL up from the body (not world +Y) */
+                cam_pos.x = player.pos.x + world_up.x * pp.eye;
+                cam_pos.y = player.pos.y + world_up.y * pp.eye;
+                cam_pos.z = player.pos.z + world_up.z * pp.eye;
             }
 
             /* Derive the look point from the (possibly moved) eye + forward. */

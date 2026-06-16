@@ -1105,7 +1105,9 @@ int main(void)
                 ry = yaw   * (float)(M_PI / 180.0);
                 rp = pitch * (float)(M_PI / 180.0);
                 cp = cosf(rp);
-                fwd_flat = vec3_add(vec3_scale(east, sinf(ry)),
+                /* -sin(yaw) on east: yaw+ (mouse right) must turn toward the camera
+                 * right (cross(fwd,up)); +sin inverted horizontal mouse-look. */
+                fwd_flat = vec3_add(vec3_scale(east, -sinf(ry)),
                                     vec3_scale(north, -cosf(ry)));   /* unit       */
                 fwd = vec3_normalize(vec3_add(vec3_scale(fwd_flat, cp),
                                               vec3_scale(up_l, sinf(rp))));

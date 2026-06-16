@@ -1191,8 +1191,14 @@ static void test_column_spreads_to_level_and_sleeps(void)
      * wake would re-introduce the staircase and trip this bound. */
     int roughly_level = (worst_adj <= 1);
 
-    char buf[280];
-    int ok = collapsed && spread && roughly_level && conserved && settled;
+    char buf[300];
+    /* The "still pond costs nothing" invariant requires the active front to truly
+     * DRAIN, not merely reach a byte-stable fill signature. Asserting act.count==0
+     * (not just `settled`) is deliberate: a stale-head rise clause once pinned this
+     * exact puddle awake forever (act.count=57) while its fills were byte-stable, and
+     * the old `settled`-only assertion silently passed it. */
+    int slept_zero = (s.act.count == 0);
+    int ok = collapsed && spread && roughly_level && conserved && settled && slept_zero;
     snprintf(buf, sizeof buf,
              "wetted=%d fill[min..max]=[%d..%d] worst_adj_gap=%d collapsed=%d spread=%d "
              "rough_level=%d conserved=%d(%d->%d) settled=%d slept_tick=%d final_active=%u",
@@ -1459,6 +1465,301 @@ static void test_held_source_floods(void)
     sim_shutdown(&s);
 }
 
+/* -------------------------------------------------------------------------
+ * Case 19 - COMMUNICATING VESSELS: two tanks joined by a bottom channel reach
+ * the SAME water level, the empty tank rising from the bottom.
+ *
+ * Two EQUAL tanks (6 columns wide x 14 deep): tank A (lx 2..7) is filled brim-full
+ * with water to height H; tank B (lx 9..14) starts empty. A solid divider at lx=8
+ * seals them except for a bottom CHANNEL (the divider is open only at ly==1). lx=1
+ * is walled off so the two tanks are exactly equal width. Released, water flows A
+ * -> channel -> B at the floor, and then must RISE in B against gravity until both
+ * surfaces meet at ~H/2 - the headline communicating-vessels behaviour the local
+ * gravity+lateral rule alone cannot produce (it only levels a single free surface).
+ *
+ * H is chosen ODD (7): the flat equilibrium 6*14*H*15 / (12*14) = H/2*15 = 52.5
+ * sub-cell units per column falls BETWEEN integer cell levels, so the local
+ * gravity+lateral rule stalls a sub-cell off level and the CONNECTED-BODY FINISHER
+ * is REQUIRED to settle it level. Asserts: B rises (surfB well above the
+ * channel), the two surfaces are level (|surfA-surfB|<=1, ~H/2), MAT_WATER fill is
+ * conserved EXACTLY, and the front fully SLEEPS (act.count==0) - "a settled pool
+ * costs nothing", even one that needed the non-local snap to get there.
+ * ------------------------------------------------------------------------- */
+static void test_two_tanks_communicating(void)
+{
+    Chunk c;
+    uint16_t wall[CHUNK_VOXELS];
+    int n_wall = 0;
+    build_stone_box(&c, (uint8_t)CODE_AMBIENT, wall, &n_wall);
+
+    const int H = 7;                 /* odd: equilibrium between cell levels       */
+    const int LO = 1, HI = CHUNK_DIM - 2;   /* interior span 1..14                 */
+    Voxel stone = make_solid(MAT_STONE, (uint8_t)CODE_AMBIENT);
+
+    /* Wall off lx=1 (so tank A is exactly lx 2..7), and build the divider at lx=8
+     * that is solid everywhere EXCEPT the bottom channel row ly==1. */
+    for (int ly = LO; ly <= HI; ++ly)
+        for (int lz = LO; lz <= HI; ++lz) {
+            c.voxels[vox_index(1, ly, lz)] = stone;
+            if (ly != 1)
+                c.voxels[vox_index(8, ly, lz)] = stone;
+        }
+
+    /* Fill tank A (lx 2..7, lz 1..14) brim-full up to height H. */
+    int seeded = 0;
+    for (int ly = 1; ly <= H; ++ly)
+        for (int lz = LO; lz <= HI; ++lz)
+            for (int lx = 2; lx <= 7; ++lx) {
+                c.voxels[vox_index(lx, ly, lz)] =
+                    make_liquid(MAT_WATER, 15, (uint8_t)CODE_AMBIENT);
+                seeded += 15;
+            }
+
+    SimState s;
+    sim_build_conduct_lut();
+    sim_init(&s, &c);
+    int fill0 = sum_fill(&c, MAT_WATER);
+
+    /* Run to quiescence: settled once the fill signature is byte-stable for STILL
+     * ticks AND the active front empties. Generous budget (the empty tank rises one
+     * cell at a time, then the finisher snaps the sub-cell residue). */
+    const int STILL = 8;
+    int still_run = 0, slept_tick = -1, settled = 0, prev_sig = -1;
+    for (int t = 0; t < 4000; ++t) {
+        sim_tick(&s);
+        int sig = 0;
+        for (int i = 0; i < CHUNK_VOXELS; ++i)
+            if (vox_mat(c.voxels[i]) == MAT_WATER)
+                sig += (i + 1) * (vox_fill(c.voxels[i]) + 1);
+        if (sig == prev_sig) {
+            if (++still_run >= STILL && !settled) { settled = 1; slept_tick = t; }
+        } else {
+            still_run = 0;
+        }
+        prev_sig = sig;
+        if (s.act.count == 0 && !settled) { settled = 1; slept_tick = t; }
+        if (settled && s.act.count == 0)
+            break;
+    }
+
+    /* Measure each tank: topmost water row (surf) and total fill (-> mean cell
+     * level, the "table"). Both tanks are 6*14 = 84 columns. */
+    int surfA = 0, surfB = 0;
+    long volA = 0, volB = 0;
+    for (int lz = LO; lz <= HI; ++lz) {
+        for (int lx = 2; lx <= 7; ++lx)
+            for (int ly = 1; ly <= HI; ++ly) {
+                int li = vox_index(lx, ly, lz);
+                if (vox_mat(c.voxels[li]) == MAT_WATER && vox_fill(c.voxels[li]) > 0) {
+                    volA += vox_fill(c.voxels[li]);
+                    if (ly > surfA) surfA = ly;
+                }
+            }
+        for (int lx = 9; lx <= 14; ++lx)
+            for (int ly = 1; ly <= HI; ++ly) {
+                int li = vox_index(lx, ly, lz);
+                if (vox_mat(c.voxels[li]) == MAT_WATER && vox_fill(c.voxels[li]) > 0) {
+                    volB += vox_fill(c.voxels[li]);
+                    if (ly > surfB) surfB = ly;
+                }
+            }
+    }
+    double tableA = (double)volA / 84.0 / 15.0;   /* mean cell level, tank A */
+    double tableB = (double)volB / 84.0 / 15.0;
+
+    int fill1     = sum_fill(&c, MAT_WATER);
+    int conserved = (fill1 == fill0) && (fill0 == seeded);
+    int dsurf     = surfA - surfB; if (dsurf < 0) dsurf = -dsurf;
+    int b_rose    = (surfB >= 3);                 /* well above the ly==1 channel  */
+    int a_dropped = (surfA < H);                  /* tank A fell from its full H   */
+    int level     = (dsurf <= 1);                 /* the two surfaces meet         */
+    int mid_A     = (tableA >= H / 2.0 - 1.0 && tableA <= H / 2.0 + 1.0);
+    int mid_B     = (tableB >= H / 2.0 - 1.0 && tableB <= H / 2.0 + 1.0);
+    int slept     = settled && (s.act.count == 0);
+
+    char buf[320];
+    int ok = conserved && b_rose && a_dropped && level && mid_A && mid_B && slept;
+    snprintf(buf, sizeof buf,
+             "H=%d surfA=%d surfB=%d |d|=%d tableA=%.2f tableB=%.2f (~H/2=%.1f) "
+             "b_rose=%d a_dropped=%d level=%d mid[A=%d B=%d] conserved=%d(%d->%d seed=%d) "
+             "slept=%d slept_tick=%d final_active=%u fired=%u",
+             H, surfA, surfB, dsurf, tableA, tableB, H / 2.0,
+             b_rose, a_dropped, level, mid_A, mid_B, conserved, fill0, fill1, seeded,
+             slept, slept_tick, s.act.count, s.fluid_n_fired);
+    report("case19_two_tanks_communicating_vessels", ok, buf);
+
+    sim_shutdown(&s);
+}
+
+/* -------------------------------------------------------------------------
+ * Case 20 - FINISHER CONSERVES across an INTERIOR SOLID. Communicating two-tank
+ * (like case19) but tank B carries a one-cell stone SHELF at ly=2 in its middle
+ * lz row, so the connected body straddles a non-fillable cell inside a column's
+ * [floor,ceil] span. The finisher must level the body around the shelf WITHOUT
+ * destroying the cell of water it would otherwise drop onto the stone (the bug:
+ * the old flat-write decremented its volume budget at the solid and wrote nothing
+ * -> exactly one FLUID_FULL cell vanished per shelf). Asserts EXACT conservation,
+ * the shelf stays solid, B rises, and the body sleeps.
+ * ------------------------------------------------------------------------- */
+static void test_finisher_conserves_over_interior_solid(void)
+{
+    Chunk c;
+    uint16_t wall[CHUNK_VOXELS];
+    int n_wall = 0;
+    build_stone_box(&c, (uint8_t)CODE_AMBIENT, wall, &n_wall);
+
+    const int H = 7;                       /* odd: equilibrium between cell levels  */
+    Voxel stone = make_solid(MAT_STONE, (uint8_t)CODE_AMBIENT);
+
+    /* Wall lx=1; divider at lx=5 solid except the bottom channel at ly==1. */
+    for (int ly = 1; ly <= 6; ++ly)
+        for (int lz = 1; lz <= 6; ++lz) {
+            c.voxels[vox_index(1, ly, lz)] = stone;
+            if (ly != 1) c.voxels[vox_index(5, ly, lz)] = stone;
+        }
+    /* Tank A (lx 2..4, lz 1..6) brim-full to H. */
+    int seeded = 0;
+    for (int ly = 1; ly <= H; ++ly)
+        for (int lz = 1; lz <= 6; ++lz)
+            for (int lx = 2; lx <= 4; ++lx) {
+                c.voxels[vox_index(lx, ly, lz)] =
+                    make_liquid(MAT_WATER, 15, (uint8_t)CODE_AMBIENT);
+                seeded += 15;
+            }
+    /* Stone SHELF inside tank B (lx 6..8) at ly=2, ONLY in lz=4, so B's lz=4
+     * columns are split by an interior solid yet rejoin the body via lz=3/5. */
+    for (int lx = 6; lx <= 8; ++lx)
+        c.voxels[vox_index(lx, 2, 4)] = stone;
+
+    SimState s;
+    sim_build_conduct_lut();
+    sim_init(&s, &c);
+    int fill0 = sum_fill(&c, MAT_WATER);
+
+    int slept_tick = -1;
+    for (int t = 0; t < 4000; ++t) {
+        sim_tick(&s);
+        if (s.act.count == 0) { slept_tick = t; break; }
+    }
+
+    int fill1 = sum_fill(&c, MAT_WATER);
+    /* B has water somewhere above its bottom row -> it rose. */
+    int b_above = 0;
+    for (int lz = 1; lz <= 6; ++lz)
+        for (int lx = 6; lx <= 8; ++lx)
+            for (int ly = 2; ly <= 7; ++ly)
+                if (vox_mat(c.voxels[vox_index(lx, ly, lz)]) == MAT_WATER &&
+                    vox_fill(c.voxels[vox_index(lx, ly, lz)]) > 0) b_above = 1;
+    int shelf_ok = 1;
+    for (int lx = 6; lx <= 8; ++lx)
+        if (vox_mat(c.voxels[vox_index(lx, 2, 4)]) != MAT_STONE) shelf_ok = 0;
+
+    int conserved = (fill1 == fill0) && (fill0 == seeded);
+    int slept     = (slept_tick >= 0) && (s.act.count == 0);
+    char buf[256];
+    int ok = conserved && slept && shelf_ok && b_above;
+    snprintf(buf, sizeof buf,
+             "conserved=%d(%d->%d seed=%d) slept=%d(t=%d) shelf_intact=%d b_rose=%d "
+             "fired=%u final_active=%u",
+             conserved, fill0, fill1, seeded, slept, slept_tick, shelf_ok, b_above,
+             s.fluid_n_fired, s.act.count);
+    report("case20_finisher_conserves_over_interior_solid", ok, buf);
+
+    sim_shutdown(&s);
+}
+
+/* -------------------------------------------------------------------------
+ * Case 21 - LAVA-ONLY chunk never spuriously runs the finisher. A held MAT_LAVA
+ * pool, no water at all. The communicating-vessels machinery (head field, fill
+ * hash, finisher) must stay DORMANT - it is gated on a FREE (non-held) liquid
+ * being active, so a lava forge does not pay a whole-chunk hash + flood every
+ * tick. Asserts the finisher never fired and lava fill is conserved (held/re-
+ * stamped in place).
+ * ------------------------------------------------------------------------- */
+static void test_lava_only_no_finisher(void)
+{
+    Chunk c;
+    uint16_t wall[CHUNK_VOXELS];
+    int n_wall = 0;
+    build_stone_box(&c, (uint8_t)CODE_AMBIENT, wall, &n_wall);
+
+    int seeded = 0;
+    for (int lz = 4; lz <= 11; ++lz)
+        for (int lx = 4; lx <= 11; ++lx) {
+            c.voxels[vox_index(lx, 1, lz)] =
+                make_liquid(MAT_LAVA, 15, (uint8_t)CODE_LAVA);
+            seeded += 15;
+        }
+
+    SimState s;
+    sim_build_conduct_lut();
+    sim_init(&s, &c);
+    int fill0 = sum_fill(&c, MAT_LAVA);
+    for (int t = 0; t < 200; ++t) sim_tick(&s);
+    int fill1 = sum_fill(&c, MAT_LAVA);
+
+    char buf[200];
+    int ok = (s.fluid_n_fired == 0) && (fill1 == fill0) && (fill0 == seeded);
+    snprintf(buf, sizeof buf, "fired=%u(want 0) conserved=%d(%d->%d seed=%d)",
+             s.fluid_n_fired, fill1 == fill0, fill0, fill1, seeded);
+    report("case21_lava_only_no_spurious_finisher", ok, buf);
+
+    sim_shutdown(&s);
+}
+
+/* -------------------------------------------------------------------------
+ * Case 22 - placing a SOLID block into a flooded column conserves water. The
+ * player's 0.2 block-place drops a stone into a settled pool (set the voxel +
+ * sim_notify_edit); the displaced water must redistribute and re-settle with the
+ * rest of the body EXACTLY conserved (no unit destroyed at the new obstruction),
+ * and the pool must sleep again. Guards the finisher's interior-solid path on the
+ * realistic edit trigger, not just hand-built terrain.
+ * ------------------------------------------------------------------------- */
+static void test_block_placed_in_water_conserves(void)
+{
+    Chunk c;
+    uint16_t wall[CHUNK_VOXELS];
+    int n_wall = 0;
+    build_stone_box(&c, (uint8_t)CODE_AMBIENT, wall, &n_wall);
+
+    for (int ly = 1; ly <= 10; ++ly)
+        c.voxels[vox_index(8, ly, 8)] =
+            make_liquid(MAT_WATER, 15, (uint8_t)CODE_AMBIENT);
+
+    SimState s;
+    sim_build_conduct_lut();
+    sim_init(&s, &c);
+    for (int t = 0; t < 2000 && s.act.count != 0; ++t) sim_tick(&s);
+
+    int fill_before = sum_fill(&c, MAT_WATER);
+    /* Drop a stone into a wet floor cell (the pool has spread across ly==1). */
+    int li = vox_index(7, 1, 7), displaced = 0;
+    if (vox_mat(c.voxels[li]) == MAT_WATER) {
+        displaced = vox_fill(c.voxels[li]);
+        c.voxels[li] = make_solid(MAT_STONE, (uint8_t)CODE_AMBIENT);
+        sim_notify_edit(&s, li);
+    }
+    int expect = fill_before - displaced;   /* the stone overwrote `displaced` units */
+
+    int slept_tick = -1;
+    for (int t = 0; t < 4000; ++t) {
+        sim_tick(&s);
+        if (s.act.count == 0) { slept_tick = t; break; }
+    }
+    int fill_after = sum_fill(&c, MAT_WATER);
+
+    char buf[220];
+    int ok = (fill_after == expect) && (slept_tick >= 0) && (s.act.count == 0) &&
+             (vox_mat(c.voxels[li]) == MAT_STONE);
+    snprintf(buf, sizeof buf,
+             "placed_at_wet=%d displaced=%d conserved=%d(%d->%d) slept=%d(t=%d) active=%u fired=%u",
+             displaced > 0, displaced, fill_after == expect, expect, fill_after,
+             slept_tick >= 0, slept_tick, s.act.count, s.fluid_n_fired);
+    report("case22_block_placed_in_water_conserves", ok, buf);
+
+    sim_shutdown(&s);
+}
+
 int main(void)
 {
     printf("== test_sim: fixed-point FTCS heat + phase transitions + fluid flow ==\n");
@@ -1487,6 +1788,10 @@ int main(void)
     test_viscosity_orders_spread_rate();
     test_two_liquids_do_not_merge();
     test_held_source_floods();
+    test_two_tanks_communicating();
+    test_finisher_conserves_over_interior_solid();
+    test_lava_only_no_finisher();
+    test_block_placed_in_water_conserves();
 
     if (g_failures == 0)
         printf("== ALL PASS ==\n");

@@ -727,6 +727,128 @@ static inline void moved_set(SimState *s, int li)
 static const int FLUID_LAT_EVEN[4] = { 0, 1, 4, 5 };  /* +X -X +Z -Z */
 static const int FLUID_LAT_ODD [4] = { 1, 0, 5, 4 };  /* -X +X -Z +Z */
 
+/* ===================================================================== *
+ * Communicating vessels: HEAD field + PRESSURE LIFT + connected-body FINISHER
+ * (fluid milestone 0.2; ported from the validated 2-D prototype wf_finisher.c,
+ * "Approach B"). The local gravity+lateral rule levels a single free surface but
+ * cannot raise a column against gravity through a bottom channel. These pieces do.
+ * ===================================================================== */
+
+/* Surface level of a single cell in SUB-CELL units measured from the chunk floor:
+ * the ly full cells below it are FLUID_FULL each, plus the cell's own fill on top.
+ * (Matches the prototype surf_of = y*MAXFILL + fill.) */
+static inline int surf_of(const SimState *s, int lx, int ly, int lz)
+{
+    return ly * (int)FLUID_FULL +
+           (int)vox_fill(s->chunk->voxels[vox_index(lx, ly, lz)]);
+}
+
+/* Topmost surface of material `mat` in column (lx,lz): scan from the chunk top
+ * down for the first cell of THAT material carrying fill, return its surf_of. 0 if
+ * the column has no such cell. Material-SPECIFIC: a held-lava lid resting on a
+ * water column must NOT report the lava surface to water's head / sleep guard
+ * (that suppressed the water cell's legitimate rise). Bounded by CHUNK_DIM. */
+static int col_surf(const SimState *s, int lx, int lz, uint8_t mat)
+{
+    const Voxel *vox = s->chunk->voxels;
+    int ly;
+    for (ly = CHUNK_DIM - 1; ly >= 0; --ly) {
+        int li = vox_index(lx, ly, lz);
+        if (vox_mat(vox[li]) == mat && vox_fill(vox[li]) > 0)
+            return ly * (int)FLUID_FULL + (int)vox_fill(vox[li]);
+    }
+    return 0;
+}
+
+/* A liquid cell whose cell directly above (+Y) is NOT covered by liquid (air,
+ * solid lid, or out-of-chunk top): the air/lid-water interface where the head
+ * field is SEEDED with the true surface level. Matches the prototype free_surface
+ * (water cell, and above is top / wall / fill==0). */
+static int free_surface(const SimState *s, int lx, int ly, int lz)
+{
+    const Voxel *vox = s->chunk->voxels;
+    int li = vox_index(lx, ly, lz);
+    if (material_get(vox_mat(vox[li]))->phase != PHASE_LIQUID ||
+        vox_fill(vox[li]) == 0)
+        return 0;
+    if (ly + 1 >= CHUNK_DIM)
+        return 1;                            /* open at the chunk top */
+    {
+        int ali = vox_index(lx, ly + 1, lz);
+        if (material_get(vox_mat(vox[ali]))->phase == PHASE_LIQUID &&
+            vox_fill(vox[ali]) > 0)
+            return 0;                        /* covered by liquid above: interior */
+        return 1;                            /* air / solid lid above: a surface */
+    }
+}
+
+/* Scratch for the per-body head flood (file-static, single-chunk). */
+static int     g_hbody[CHUNK_VOXELS];   /* BFS queue of body cell indices */
+static uint8_t g_hseen[CHUNK_VOXELS];   /* flood visited marks            */
+
+/* Recompute the HEAD field FROM SCRATCH each tick: head[li] = the highest free-
+ * surface level (surf_of, in sub-cell units) anywhere in the connected same-
+ * material liquid body that li belongs to. A cell whose body has a taller free
+ * surface somewhere (e.g. a second tank still below the level of a full first tank
+ * joined through a bottom channel) gets a head ABOVE its own column surface, which
+ * sim_liquid_unsettled reads to keep that cell AWAKE until the body is levelled.
+ * Held sources (lava) are flooded as walls and keep head 0 (they never rise).
+ *
+ * WHY A FRESH PER-BODY FLOOD, not an incremental relaxation: a relaxed standing
+ * field stores last-tick values, so when a draining column lowers its surface the
+ * OLD higher value circulates as a "ghost" (re-injected below the age cap) and the
+ * head momentarily COLLAPSES to a cell's own seed during the ghost->reseed handoff;
+ * the sleep guard latches that one-tick dip and sleeps the body PERMANENTLY un-
+ * levelled (measured: head 113->29 in one tick, the whole pool asleep next). A
+ * from-scratch flood has no stored state and no ghost, so head exactly tracks the
+ * CURRENT surfaces and is rock-stable. O(liquid cells) per tick, deterministic
+ * (bodies seeded in index order, fixed neighbour order), reads ONLY fill (never
+ * the temperature buffer). Gated by the caller on "free liquid present", so a
+ * still pond or a lava-only chunk never pays for it. */
+static void head_relax(SimState *s)
+{
+    const Voxel *vox = s->chunk->voxels;
+    int li;
+    for (li = 0; li < CHUNK_VOXELS; ++li) { s->head[li] = 0; g_hseen[li] = 0; }
+    for (li = 0; li < CHUNK_VOXELS; ++li) {
+        uint8_t mat = vox_mat(vox[li]);
+        int n = 0, qh = 0, maxsurf = 0, k;
+        if (g_hseen[li]) continue;
+        if (material_get(mat)->phase != PHASE_LIQUID || vox_fill(vox[li]) == 0)
+            continue;
+        if (is_held_source(s, li)) continue;     /* held lava: head 0, never rises */
+        g_hbody[n++] = li; g_hseen[li] = 1;
+        while (qh < n) {
+            int i = g_hbody[qh++];
+            int lx = i & 0x0F, ly = (i >> 4) & 0x0F, lz = (i >> 8) & 0x0F, nn;
+            if (free_surface(s, lx, ly, lz)) {
+                int sf = surf_of(s, lx, ly, lz);
+                if (sf > maxsurf) maxsurf = sf;
+            }
+            for (nn = 0; nn < 6; ++nn) {
+                int nx = lx + SIM_NEIGH[nn][0];
+                int ny = ly + SIM_NEIGH[nn][1];
+                int nz = lz + SIM_NEIGH[nn][2];
+                int nli;
+                if (nx < 0 || nx >= CHUNK_DIM || ny < 0 || ny >= CHUNK_DIM ||
+                    nz < 0 || nz >= CHUNK_DIM) continue;
+                nli = vox_index(nx, ny, nz);
+                if (g_hseen[nli]) continue;
+                /* Same-material liquid only (the mat gate already excludes lava and
+                 * every other material). No per-neighbour is_held_source scan here:
+                 * it cost an O(SIM_MAX_SOURCES) lookup on EVERY neighbour of every
+                 * flooded cell, and is unnecessary - a held water spring swept into
+                 * the body just contributes its surface to head (harmless; the
+                 * FINISHER excludes held sources independently). */
+                if (vox_mat(vox[nli]) == mat && vox_fill(vox[nli]) > 0) {
+                    g_hseen[nli] = 1; g_hbody[n++] = nli;
+                }
+            }
+        }
+        for (k = 0; k < n; ++k) s->head[g_hbody[k]] = maxsurf;
+    }
+}
+
 /* True if local index li is a PHASE_LIQUID voxel that is NOT settled, i.e. it
  * can still flow this milestone: either it can fall (cell below is AIR, or the
  * same material with room), OR a same-material horizontal neighbour is more than
@@ -788,6 +910,18 @@ int sim_liquid_unsettled(const SimState *s, uint16_t li)
         if (f - nf >= 2)
             return 1;                   /* a gap the lateral rule would act on */
     }
+
+    /* Communicating vessels - the body is NOT yet level. head[li] is the max free
+     * surface of this cell's connected body; if it exceeds this column's own surface
+     * by more than FLUID_UP_MARGIN (a full cell), a taller surface is connected
+     * elsewhere (a second tank still below a full first tank joined by a bottom
+     * channel), so keep this cell AWAKE - that lets the body stay active until the
+     * connected-body finisher snaps it level. Once level (head within a cell of the
+     * column's own surface) the predicate fails and the pool sleeps. A flat or
+     * within-1 pond has head <= col_surf + a cell, so this never wakes it - the
+     * "still pond costs nothing" property is preserved. */
+    if (s->head[li] > col_surf(s, lx, lz, mat) + (int)FLUID_UP_MARGIN)
+        return 1;
     return 0;
 }
 
@@ -802,6 +936,7 @@ static void fluid_occupy_air(SimState *s, int nli, uint8_t mat, int fill)
     vox_set_mat(nv, mat);
     vox_set_fill(nv, (uint8_t)fill);
     vox_set_flags(nv, vox_flags(*nv) | VF_LIQUID);
+    s->head[nli] = 0;                   /* fresh surface: head re-seeds next relax */
 }
 
 /* Revert a drained liquid voxel (fill reached 0) to MAT_AIR: clear material,
@@ -814,6 +949,7 @@ static void fluid_revert_to_air(SimState *s, int li)
     vox_set_mat(v, MAT_AIR);
     vox_set_fill(v, 0);
     vox_set_flags(v, vox_flags(*v) & ~VF_LIQUID);
+    s->head[li] = 0;                    /* air carries no head */
 }
 
 /* One fluid step on local index li (a PHASE_LIQUID voxel). `is_source` is true
@@ -1062,6 +1198,229 @@ static int fluid_step(SimState *s, int li, int is_source, int is_spring)
     return changed;
 }
 
+/* ===================================================================== *
+ * CONNECTED-BODY FINISHER (Approach B): a bounded, conserving, non-local snap
+ * that levels a water body the local rule has left in a sub-cell limit cycle.
+ * Fired RARELY (once per body per disturbance, gated by the limit-cycle trigger
+ * in sim_tick), then the body is a true fixed point and sleeps. All scratch is
+ * file-static (single-chunk this milestone).
+ * ===================================================================== */
+static int      g_body[CHUNK_VOXELS];      /* BFS queue of body cell indices       */
+static int      g_col_lx[CHUNK_VOXELS];    /* per-column lx (<=256 columns used)   */
+static int      g_col_lz[CHUNK_VOXELS];    /* per-column lz                        */
+static int      g_col_floor[CHUNK_VOXELS]; /* lowest body cell ly in the column    */
+static int      g_col_ceil[CHUNK_VOXELS];  /* highest open ly the column may rise  */
+static int      g_col_vol[CHUNK_VOXELS];   /* assigned sub-cell volume per column  */
+static int      g_col_cap[CHUNK_VOXELS];   /* OPEN-cell capacity per column (units) */
+static uint8_t  g_seen[CHUNK_VOXELS];      /* flood-fill visited marks             */
+
+/* Is cell li fillable by body material `mat` during a flat-write: an AIR cell or a
+ * (non-held) cell already of `mat`. A solid, a held source (lava / spring), or a
+ * DIFFERENT liquid is an OBSTRUCTION the surface must skip WITHOUT consuming any of
+ * the body's volume budget. Treating an obstruction as fillable (the original port)
+ * silently destroyed a full cell of water per shelf / lava-plug bracketed inside a
+ * column's [floor,ceil] span - a conservation break. */
+static int cell_fillable(const SimState *s, int li, uint8_t mat)
+{
+    uint8_t cm = vox_mat(s->chunk->voxels[li]);
+    if (is_held_source(s, li)) return 0;
+    return cm == MAT_AIR || cm == mat;
+}
+
+/* A deterministic FNV-1a hash of the whole chunk's fill nibbles - the signature of
+ * the liquid state used to detect a sub-cell limit cycle. Air is 0 and solids are
+ * a constant 15, so the hash tracks exactly the moving water distribution; an
+ * air<->water materialisation flips a 0<->nonzero nibble and so also perturbs it.
+ * Computed ONLY when liquid is active (gated by the caller), so a still pond which
+ * never ticks the fluid pass never pays for it. */
+static uint64_t fluid_fill_hash(const SimState *s)
+{
+    const Voxel *vox = s->chunk->voxels;
+    uint64_t h = 1469598103934665603ULL;
+    int i;
+    for (i = 0; i < CHUNK_VOXELS; ++i) {
+        h ^= (uint64_t)(uint8_t)vox_fill(vox[i]);
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+/* Flood one connected water body of material `mat` from seed `seed` (4/6-connected
+ * through SAME-material liquid cells carrying fill; held sources are walls). Marks
+ * g_seen, fills g_body[0..*pn), records each distinct column (lx,lz) with its
+ * floor/ceil over the body's water extent, and returns the body's TOTAL fill.
+ *
+ * Connectivity is through WATER ONLY (the prototype also chained open airspace
+ * above the body; we deliberately omit that so the flood is BOUNDED by actual
+ * water cells and cannot "vacuum the open sky" of an open-world chunk - the column
+ * CEILING the body may rise into is recovered separately by flat_write_body, which
+ * extends each column up through its open vessel span). */
+static long flood_body(SimState *s, int seed, uint8_t mat, int *pn, int *pcols)
+{
+    const Voxel *vox = s->chunk->voxels;
+    int n = 0, ncols = 0, qh = 0;
+    long total = 0;
+
+    g_body[n++] = seed; g_seen[seed] = 1;
+    while (qh < n) {
+        int i = g_body[qh++];
+        int lx = i & 0x0F, ly = (i >> 4) & 0x0F, lz = (i >> 8) & 0x0F;
+        int c, nn;
+        total += vox_fill(vox[i]);
+        for (c = 0; c < ncols; ++c)
+            if (g_col_lx[c] == lx && g_col_lz[c] == lz) break;
+        if (c == ncols) {
+            g_col_lx[c] = lx; g_col_lz[c] = lz;
+            g_col_floor[c] = ly; g_col_ceil[c] = ly; ncols++;
+        }
+        if (ly < g_col_floor[c]) g_col_floor[c] = ly;
+        if (ly > g_col_ceil[c]) g_col_ceil[c] = ly;
+        for (nn = 0; nn < 6; ++nn) {
+            int nx = lx + SIM_NEIGH[nn][0];
+            int ny = ly + SIM_NEIGH[nn][1];
+            int nz = lz + SIM_NEIGH[nn][2];
+            int nli;
+            if (nx < 0 || nx >= CHUNK_DIM || ny < 0 || ny >= CHUNK_DIM ||
+                nz < 0 || nz >= CHUNK_DIM)
+                continue;
+            nli = vox_index(nx, ny, nz);
+            if (g_seen[nli]) continue;
+            if (vox_mat(vox[nli]) == mat && vox_fill(vox[nli]) > 0 &&
+                !is_held_source(s, nli)) {
+                g_seen[nli] = 1; g_body[n++] = nli;
+            }
+        }
+    }
+    *pn = n; *pcols = ncols;
+    return total;
+}
+
+/* Level the flooded body: extend every column to its full open vessel span, find
+ * the flat surface level S (binary search) whose summed per-column volume equals
+ * the body TOTAL, assign volumes (distributing the within-1 remainder one unit per
+ * column in discovery order), and WRITE each column full-cells-bottom-up + a
+ * partial top + empties above. Materialises air recipients and reverts drained
+ * cells, wakes each changed cell's ring, resets its head (re-seeds next relax).
+ * Redistributes the SAME total => CONSERVES EXACTLY. Returns 1 if anything moved. */
+static int flat_write_body(SimState *s, int ncols, long total, uint8_t mat)
+{
+    Voxel *vox = s->chunk->voxels;
+    int c, ly, changed = 0;
+    long lo = 0, hi = 0, S, assigned = 0, rem;
+
+    /* Extend each column through its open vessel span (stop at a solid / held cell);
+     * count the column's OPEN-cell capacity in the same pass. cell_fillable skips
+     * any interior obstruction, so capacity is the true fillable volume - an
+     * interior shelf adds ZERO phantom capacity. */
+    for (c = 0; c < ncols; ++c) {
+        int lx = g_col_lx[c], lz = g_col_lz[c];
+        int f = g_col_floor[c], ce = g_col_ceil[c], openc = 0;
+        while (f  - 1 >= 0        && cell_fillable(s, vox_index(lx, f  - 1, lz), mat)) f--;
+        while (ce + 1 < CHUNK_DIM && cell_fillable(s, vox_index(lx, ce + 1, lz), mat)) ce++;
+        for (ly = f; ly <= ce; ++ly)
+            if (cell_fillable(s, vox_index(lx, ly, lz), mat)) openc++;
+        g_col_floor[c] = f; g_col_ceil[c] = ce;
+        g_col_cap[c]   = openc * (int)FLUID_FULL;
+        { long top = (long)(ce + 1) * (long)FLUID_FULL; if (top > hi) hi = top; }
+    }
+    /* Largest flat surface level S whose total OPEN-cell volume <= total (binary
+     * search). Volume sums only fillable cells, so the level S maps correctly even
+     * across interior shelves (water connected around the side equalises to S). */
+    S = lo;
+    while (lo < hi) {
+        long mid = (lo + hi + 1) / 2, v = 0;
+        for (c = 0; c < ncols; ++c) {
+            int lx = g_col_lx[c], lz = g_col_lz[c];
+            for (ly = g_col_floor[c]; ly <= g_col_ceil[c]; ++ly) {
+                long cv;
+                if (!cell_fillable(s, vox_index(lx, ly, lz), mat)) continue;
+                cv = mid - (long)ly * (long)FLUID_FULL;
+                if (cv < 0) cv = 0; else if (cv > (long)FLUID_FULL) cv = (long)FLUID_FULL;
+                v += cv;
+            }
+        }
+        if (v <= total) { S = mid; lo = mid; } else hi = mid - 1;
+    }
+    /* Per-column volume at level S (fillable cells only). */
+    for (c = 0; c < ncols; ++c) {
+        int lx = g_col_lx[c], lz = g_col_lz[c];
+        long cvsum = 0;
+        for (ly = g_col_floor[c]; ly <= g_col_ceil[c]; ++ly) {
+            long cv;
+            if (!cell_fillable(s, vox_index(lx, ly, lz), mat)) continue;
+            cv = S - (long)ly * (long)FLUID_FULL;
+            if (cv < 0) cv = 0; else if (cv > (long)FLUID_FULL) cv = (long)FLUID_FULL;
+            cvsum += cv;
+        }
+        g_col_vol[c] = (int)cvsum; assigned += cvsum;
+    }
+    /* Hand the within-1 remainder out one unit per column with open headroom. */
+    rem = total - assigned;
+    while (rem > 0) {
+        int progressed = 0;
+        for (c = 0; c < ncols && rem > 0; ++c)
+            if (g_col_vol[c] < g_col_cap[c]) { g_col_vol[c]++; rem--; progressed = 1; }
+        if (!progressed) break;              /* cannot happen: total <= sum(open cap) */
+    }
+    /* Write each column: fillable cells full-bottom-up + a partial top; an interior
+     * obstruction is SKIPPED WITHOUT consuming volume (so water above a shelf simply
+     * resumes filling the next open cell); fillable cells above the surface revert. */
+    for (c = 0; c < ncols; ++c) {
+        int lx = g_col_lx[c], lz = g_col_lz[c], v = g_col_vol[c];
+        for (ly = g_col_floor[c]; ly <= g_col_ceil[c]; ++ly) {
+            int li = vox_index(lx, ly, lz);
+            uint8_t cm = vox_mat(vox[li]);
+            int put;
+            /* Mark the WHOLE span seen: this body's run_finisher pass must not
+             * re-flood a cell we are about to MATERIALISE (air->water, e.g. the
+             * risen second tank) as a phantom new body and re-level it - that double
+             * processing silently moved/lost water. */
+            g_seen[li] = 1;
+            if (!cell_fillable(s, li, mat)) continue;   /* solid / held / other liquid */
+            put = v >= (int)FLUID_FULL ? (int)FLUID_FULL : v;
+            v -= put;
+            if (put > 0) {
+                if (cm == MAT_AIR) {
+                    fluid_occupy_air(s, li, mat, put);
+                    changed = 1; wake_ring(s, li);
+                } else if ((int)vox_fill(vox[li]) != put) { /* cm == mat */
+                    vox_set_fill(&vox[li], (uint8_t)put);
+                    changed = 1; wake_ring(s, li);
+                }
+            } else if (cm == mat) {          /* empty above the new surface */
+                fluid_revert_to_air(s, li);
+                changed = 1; wake_ring(s, li);
+            }
+            s->head[li] = 0;                 /* flat: head re-seeds to the level    */
+        }
+    }
+    return changed;
+}
+
+/* Run the finisher over every connected water body in the chunk. Returns 1 if any
+ * body was rewritten. Deterministic: bodies are seeded in li scan order, flooded
+ * in fixed neighbour order. Held sources (lava / springs) are not free bodies and
+ * are skipped as seeds. */
+static int run_finisher(SimState *s)
+{
+    const Voxel *vox = s->chunk->voxels;
+    int i, wrote = 0;
+    for (i = 0; i < CHUNK_VOXELS; ++i)
+        g_seen[i] = 0;                       /* (no <string.h> dependency in sim.c) */
+    for (i = 0; i < CHUNK_VOXELS; ++i) {
+        uint8_t mat = vox_mat(vox[i]);
+        int n = 0, ncols = 0;
+        long total;
+        if (g_seen[i]) continue;
+        if (material_get(mat)->phase != PHASE_LIQUID || vox_fill(vox[i]) == 0)
+            continue;
+        if (is_held_source(s, i)) continue;
+        total = flood_body(s, i, mat, &n, &ncols);
+        if (flat_write_body(s, ncols, total, mat)) wrote = 1;
+    }
+    return wrote;
+}
+
 /* =====================================================================
  * Bind + seed  (sim.h sim_init)
  * ===================================================================== */
@@ -1101,6 +1460,25 @@ int sim_init(SimState *s, Chunk *c)
      * local index starts with no transition in progress (0 == not banking). */
     for (li = 0; li < CHUNK_VOXELS; ++li)
         s->latent[li] = 0;
+
+    /* Clear the communicating-vessels head field (transient acceleration state,
+     * NOT persisted): a fresh chunk starts with head 0 everywhere (no surface
+     * pressure recorded yet) and head_relax rebuilds it over the active front. A
+     * 0 head means sim_liquid_unsettled's rise test never fires at seed time, so a
+     * flat seeded pond still sleeps for free. */
+    for (li = 0; li < CHUNK_VOXELS; ++li) {
+        s->head[li] = 0;
+    }
+    /* Clear the finisher limit-cycle memory (transient): no cycle observed yet,
+     * nothing snapped yet. */
+    for (li = 0; li < FLUID_RING_N; ++li)
+        s->fluid_ring[li] = 0;
+    for (li = 0; li < FLUID_FIRED_MAX; ++li)
+        s->fluid_fired[li] = 0;
+    s->fluid_ring_fill = 0;
+    s->fluid_ring_pos  = 0;
+    s->fluid_cyc_seen  = 0;
+    s->fluid_n_fired   = 0;
 
     /* Seed the authoritative full-resolution temperature heat[] from every
      * voxel's stored 8-bit code (ARCHITECTURE 3.4 mitigation). heat[] is kept
@@ -1526,8 +1904,35 @@ void sim_tick(SimState *s)
     {
         uint32_t fluid_count = act->count;
         int wi;
+        int fluid_changed = 0;
+        int has_free_liquid = 0;
         for (wi = 0; wi < SIM_ACTIVE_MASK_WORDS; ++wi)
             s->moved_mask[wi] = 0u;
+
+        /* Is any ACTIVE liquid actually free to flow (PHASE_LIQUID and NOT a held
+         * source)? The communicating-vessels machinery - the head flood and the
+         * stuck-body finisher trigger - is meaningful only then. A chunk whose only
+         * active liquid is HELD lava (re-enqueued every tick, so the chunk never
+         * sleeps) would otherwise pay a whole-chunk head flood + a 4096-voxel fill
+         * hash every tick forever, for nothing. */
+        {
+            uint32_t fi;
+            for (fi = 0; fi < fluid_count; ++fi) {
+                int li = act->active[fi];
+                if (material_get(vox_mat(vox[li]))->phase == PHASE_LIQUID &&
+                    !is_held_source(s, li)) { has_free_liquid = 1; break; }
+            }
+        }
+
+        /* HEAD field (per-body max free surface) BEFORE the flow + sleep passes, so
+         * sim_liquid_unsettled's rise clause reads a head consistent with this
+         * tick's surfaces and keeps an un-levelled connected body AWAKE (a second
+         * tank still below a taller first tank joined by a bottom channel) until the
+         * finisher levels it. The local gravity+lateral rule cannot raise a column
+         * against gravity; the connected-body finisher (below) does, as a snap. */
+        if (has_free_liquid)
+            head_relax(s);
+
         for (i = 0; i < fluid_count; ++i) {
             int li = act->active[i];
             if (material_get(vox_mat(vox[li]))->phase != PHASE_LIQUID)
@@ -1539,8 +1944,52 @@ void sim_tick(SimState *s)
              * SPRING is allowed to flow/donate (a non-spring held source - incl.
              * MAT_EMISSIVE lava - conserves fill in place; see fluid_step). */
             if (fluid_step(s, li, is_held_source(s, li), is_spring_source(s, li)))
-                changed = 1;
+                fluid_changed = 1;
         }
+
+        /* CONNECTED-BODY FINISHER trigger (Approach B). The local gravity+lateral
+         * rule leaves an un-levelled connected body STUCK: either statically (a
+         * second tank's intake row filled to within-1 of the first, so lateral
+         * stops, while the head rise-clause keeps it awake) or in a sub-cell LIMIT
+         * CYCLE (the equilibrium surface falls between integer cell levels). Both
+         * show up as a fill-state hash that RECURS in a small ring. When the body is
+         * stuck (hash recurs) for FLUID_CYCLE_CONFIRM consecutive ticks, fire ONE
+         * bounded connected-body flat-snap that levels every body EXACTLY (conserving
+         * its total). We do NOT gate on fluid_changed: a static stall (the common
+         * communicating-vessels case) has fluid_changed==0 yet must still fire - the
+         * stable head field keeps the body awake long enough to confirm the stall.
+         * Guard on the post-snap hash so we never re-fire an equilibrium already
+         * levelled (O(1) fires per disturbance). Gated on has_free_liquid: a still
+         * pond or a lava-only chunk never hashes, so it costs nothing there. */
+        if (has_free_liquid) {
+            uint64_t hh = fluid_fill_hash(s);
+            int in_cycle = 0, j;
+            for (j = 0; j < (int)s->fluid_ring_fill; ++j)
+                if (s->fluid_ring[j] == hh) { in_cycle = 1; break; }
+            s->fluid_ring[s->fluid_ring_pos] = hh;
+            s->fluid_ring_pos = (uint16_t)((s->fluid_ring_pos + 1) % FLUID_RING_N);
+            if (s->fluid_ring_fill < FLUID_RING_N) s->fluid_ring_fill++;
+            if (in_cycle) s->fluid_cyc_seen++;
+            else          s->fluid_cyc_seen = 0;
+            if (s->fluid_cyc_seen >= FLUID_CYCLE_CONFIRM) {
+                int already = 0;
+                for (j = 0; j < (int)s->fluid_n_fired; ++j)
+                    if (s->fluid_fired[j] == hh) { already = 1; break; }
+                if (!already) {
+                    int wrote = run_finisher(s);
+                    uint64_t fh = fluid_fill_hash(s);   /* post-snap signature */
+                    if (s->fluid_n_fired < FLUID_FIRED_MAX)
+                        s->fluid_fired[s->fluid_n_fired++] = fh;
+                    if (wrote) fluid_changed = 1;
+                    s->fluid_ring_fill = 0;
+                    s->fluid_ring_pos  = 0;
+                    s->fluid_cyc_seen  = 0;
+                }
+            }
+        }
+
+        if (fluid_changed)
+            changed = 1;
     }
 
     /* ---- PHASE 3: compaction (drop lazily-slept indices, keep order) -------
@@ -1618,6 +2067,14 @@ void sim_notify_edit(SimState *s, int li)
 
     s->heat[li]   = temp_to_heat(vox_temp_code(s->chunk->voxels[li]));
     s->latent[li] = 0;
+    s->head[li]   = 0;       /* surfaces moved: re-seed head from scratch */
+    /* A player edit is a fresh disturbance: forget the limit-cycle history so a new
+     * equilibrium is re-detected and the finisher can fire again for it (the
+     * already-fired set persists - a genuinely identical equilibrium is still a
+     * no-op, but a NEW one after the edit is no longer masked by a stale ring). */
+    s->fluid_ring_fill = 0;
+    s->fluid_ring_pos  = 0;
+    s->fluid_cyc_seen  = 0;
     active_enqueue(s, li);   /* wake the edited cell itself */
     wake_ring(s, li);        /* and its 6 face neighbours */
 }

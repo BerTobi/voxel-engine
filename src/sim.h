@@ -341,6 +341,48 @@
 #define FLUID_PERIOD_MIN    1u
 #define FLUID_PERIOD_MAX    8u
 
+/* ---- Communicating vessels (fluid milestone 0.2: pressure lift + finisher) ---*
+ * The gravity+lateral rule levels a SINGLE free surface but cannot make a column
+ * RISE against gravity through a bottom channel (water in tank A reaching tank B
+ * from below). Two cooperating pieces fix that (the connected-body finisher is
+ * "Approach B", validated in the 2-D prototype wf_finisher.c; the gradual pressure
+ * lift it was paired with proved unstable in 3-D and was dropped - the finisher
+ * does the lift as a snap):
+ *
+ *  1. A no-mass HEAD field (head[] side array, like heat[]/latent[]): per cell, the
+ *     MAX free-surface level of its connected same-material body, recomputed FROM
+ *     SCRATCH each tick by a per-body flood. sim_liquid_unsettled keeps a cell whose
+ *     body has a taller surface elsewhere (more than FLUID_UP_MARGIN above its own
+ *     column) AWAKE, so an un-levelled communicating body does not sleep before the
+ *     finisher levels it. (An incremental relaxation was tried first; its stored
+ *     standing wave let a drained column's old height circulate as a "ghost" and
+ *     momentarily collapse the field, and the sleep guard latched that dip and slept
+ *     the body permanently un-levelled - hence the from-scratch flood.)
+ *
+ *  2. A connected-body FINISHER: when a body is STUCK (its fill-state hash recurs in
+ *     a small ring - whether a static stall or a sub-cell limit cycle), ONE bounded
+ *     non-local sweep flood-fills each connected body and rewrites every column to
+ *     the SAME flat surface, conserving the body's total EXACTLY (skipping any
+ *     interior solid). This is what raises the second tank, as a snap. Fired rarely
+ *     (once per body per disturbance), then the body is a fixed point and SLEEPS. */
+#define FLUID_UP_MARGIN     FLUID_FULL  /* a FULL cell (matches prototype UP_MARGIN=MAXFILL):
+                                   * lift/keep-awake only toward a surface >= one whole cell
+                                   * higher. A sub-cell margin (e.g. 2) fires the rise/sleep
+                                   * clause on the within-1 roughness of an ordinary flat
+                                   * puddle and pins it awake forever (broke "still pond
+                                   * costs nothing"). */
+#define FLUID_RING_N        16    /* recent-fill-hash ring for stuck-body detection */
+/* Consecutive ticks the fill-state hash must RECUR before the finisher judges a
+ * body stuck and fires. MUST exceed FLUID_PERIOD_MAX: a VISCOUS liquid (molten
+ * metal) spreads on a slow lateral cadence, so its fill state is constant for up to
+ * FLUID_PERIOD_MAX-1 ticks BETWEEN cadence steps while still legitimately flowing.
+ * A smaller confirm window (e.g. 4) mistook those pauses for "stuck" and fired the
+ * snap mid-spread, teleporting a still-spreading ooze and re-waking large rings.
+ * (FLUID_PERIOD_MAX+4) clears the longest legitimate pause with margin; water
+ * (period 1) is unaffected - a genuinely stuck pool recurs every tick. */
+#define FLUID_CYCLE_CONFIRM (FLUID_PERIOD_MAX + 4u)  /* > FLUID_PERIOD_MAX (=12)     */
+#define FLUID_FIRED_MAX     32    /* distinct snapped equilibria remembered (O(1))  */
+
 /* ---- Viz glow ramp (milestone task Section 6) ---------------------------- */
 /* Temperature-code window mapped to a 0..15 glow level the mesher packs into the
  * high nibble of the face light byte. Below GLOW_LO_CODE: no glow (ambient). At/above
@@ -455,6 +497,34 @@ typedef struct {
      * and wake needs no special initialisation. Single-chunk this milestone, so
      * a flat CHUNK_VOXELS array (4096 * 4 = 16 KiB) matches latent[]. */
     int32_t     heat[CHUNK_VOXELS];
+    /* ---- Communicating-vessels HEAD field (fluid milestone 0.2) ------------- *
+     * A no-mass side structure (like latent[]/heat[]): head[li] is the MAX free-
+     * surface level (sub-cell units, ly*FLUID_FULL + fill) anywhere in the connected
+     * same-material liquid body that li belongs to. head_relax() recomputes it FROM
+     * SCRATCH each tick by flooding every body (no stored state, so no stale "ghost"
+     * value can circulate and momentarily collapse the field). sim_liquid_unsettled
+     * reads head to keep a cell whose body has a TALLER surface elsewhere (a second
+     * tank still below a full first tank joined by a bottom channel) AWAKE until the
+     * connected-body finisher levels it. NOT persisted (transient, like the active
+     * front): zeroed by sim_init, rebuilt by the flood, reset on edit. A drained/air
+     * cell, or any held-source cell, carries head 0. Single-chunk this milestone. */
+    int32_t     head[CHUNK_VOXELS];
+    /* ---- Connected-body FINISHER limit-cycle memory (fluid milestone 0.2) --- *
+     * The local rule can enter a short limit cycle (sub-cell slosh) it never
+     * settles out of when the flat equilibrium falls between integer cell levels.
+     * fluid_ring holds the last FLUID_RING_N fill-state hashes; when the current
+     * hash recurs for FLUID_CYCLE_CONFIRM consecutive ticks the body is judged
+     * macroscopically settled with only sub-cell slosh, and ONE connected-body
+     * flat-snap fires. fluid_fired remembers already-snapped equilibria so we never
+     * re-fire for a state we already levelled (keeps it O(1) fires per disturbance).
+     * All transient: zeroed by sim_init, reset by sim_notify_edit and on each fire.
+     * Hashing/trigger run ONLY when liquid is active, so a still pond costs nothing.*/
+    uint64_t    fluid_ring[FLUID_RING_N];
+    uint64_t    fluid_fired[FLUID_FIRED_MAX];
+    uint16_t    fluid_ring_fill;        /* live entries in the ring (<= RING_N)     */
+    uint16_t    fluid_ring_pos;         /* next write slot (mod RING_N)             */
+    uint16_t    fluid_cyc_seen;         /* consecutive in-cycle ticks               */
+    uint16_t    fluid_n_fired;          /* distinct snapped equilibria remembered   */
     /* ---- OPTIONAL progression event sink (ARCHITECTURE Section 9, READ-ONLY) -*
      * A single BORROWED pointer to a ProgressSink (a ProgressRing) the sim only
      * ever PUSHES to, on emergent transitions it ALREADY computes (a melt/freeze

@@ -239,6 +239,11 @@ static Vec3 vec3_cross(Vec3 a, Vec3 b)
     return r;
 }
 
+static float vec3_dot(Vec3 a, Vec3 b)
+{
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
 static Vec3 vec3_normalize(Vec3 a)
 {
     float len = (float)sqrt((double)(a.x * a.x + a.y * a.y + a.z * a.z));
@@ -692,8 +697,16 @@ int main(void)
     Vec3   cam_target;
     Vec3   world_up;       /* 0.3: per-frame RADIAL up (was fixed +Y)            */
     Vec3   planet_center;  /* 0.3: asteroid center of mass (gravity + camera up) */
-    float  yaw;     /* degrees; yaw=0 looks toward -Z (matches today's framing) */
+    float  yaw;     /* degrees; seeds the initial heading from VOXEL_YAW        */
     float  pitch;   /* degrees; <0 looks down, clamped to +/-CAM_PITCH_LIMIT    */
+    Vec3   cam_heading;  /* 0.2.1: persistent UNIT tangent heading (forward on the
+                          * surface). Parallel-transported onto each frame's radial
+                          * tangent plane instead of rebuilt from a global yaw +
+                          * reference vector - the old ref-switch at |up.y|=0.99
+                          * snapped the basis ~180 deg and flickered near the poles.
+                          * Mouse yaw rotates it about the radial up; pitch tilts
+                          * the look toward up. Drifts slightly over a full lap
+                          * (sphere holonomy) - accepted (quaternion fix deferred). */
 
     /* Player embodiment (0.2): a WALKING physics body (player.c) is the default
      * live mode; FLY is the old free-fly translation, toggled with F, and FORCED
@@ -943,6 +956,22 @@ int main(void)
     if (pitch >  CAM_PITCH_LIMIT) pitch =  CAM_PITCH_LIMIT;
     if (pitch < -CAM_PITCH_LIMIT) pitch = -CAM_PITCH_LIMIT;
 
+    /* Seed the persistent tangent heading from init_yaw at the spawn-pose up,
+     * using the same construction the per-frame basis used to use, so the initial
+     * framing is byte-identical to before. From here it is parallel-transported
+     * (no global reference vector), so it never snaps at a pole. */
+    {
+        Vec3 up0 = vec3_normalize(vec3_sub(cam_pos, planet_center));
+        Vec3 ref, east, north;
+        float ry = yaw * (float)(M_PI / 180.0);
+        if (fabsf(up0.y) < 0.99f) { ref.x = 0.0f; ref.y = 1.0f; ref.z = 0.0f; }
+        else                      { ref.x = 1.0f; ref.y = 0.0f; ref.z = 0.0f; }
+        east  = vec3_normalize(vec3_cross(ref, up0));
+        north = vec3_cross(up0, east);
+        cam_heading = vec3_normalize(vec3_add(vec3_scale(east, -sinf(ry)),
+                                              vec3_scale(north, -cosf(ry))));
+    }
+
     /* Derive the initial look point from yaw/pitch so cam_target is consistent
      * before the first frame (the warm-up below builds no view, but keep it
      * coherent). forward: yaw=0 -> -Z, pitch<0 -> looking down. */
@@ -1069,49 +1098,70 @@ int main(void)
          * move. VOXEL_FLY adds a constant +X advance each frame for headless
          * streaming capture (the player roaming so leading/trailing edges show).*/
         {
-            Vec3 fwd;        /* full 3D look direction from yaw/pitch          */
-            Vec3 fwd_flat;   /* fwd flattened to XZ for ground-plane movement  */
+            Vec3 fwd;        /* full 3D look direction (heading tilted by pitch) */
+            Vec3 fwd_flat;   /* tangent forward on the surface (the heading)     */
             Vec3 right;
             float move = CAM_MOVE_PER_SEC * dt_s;   /* fly-mode translate speed */
-            float ry, rp, cp;
+            float rp, cp;
+            float yaw_delta = 0.0f;  /* this frame's mouse yaw, applied to heading */
 
             if (shot_path == NULL) {
                 int mdx = 0, mdy = 0;
                 plat_mouse_delta(&mdx, &mdy);
-                yaw   += (float)mdx * CAM_MOUSE_SENS;
+                yaw_delta = (float)mdx * CAM_MOUSE_SENS; /* rotate heading below  */
                 pitch -= (float)mdy * CAM_MOUSE_SENS;   /* +down -> look down  */
                 if (pitch >  CAM_PITCH_LIMIT) pitch =  CAM_PITCH_LIMIT;
                 if (pitch < -CAM_PITCH_LIMIT) pitch = -CAM_PITCH_LIMIT;
-                /* Keep yaw in [0,360) so it never drifts to a huge magnitude. */
-                if (yaw >= 360.0f) yaw -= 360.0f;
-                if (yaw <    0.0f) yaw += 360.0f;
             }
 
-            /* --- 0.3 RADIAL camera basis ------------------------------------
+            /* --- 0.2.1 RADIAL camera basis (parallel-transported heading) ----
              * "up" is radial (away from the asteroid center) and rotates as the
-             * eye moves; yaw/pitch are taken RELATIVE to a tangent frame, not the
-             * world +Y. A pole guard keeps the basis from degenerating when up is
-             * (anti)parallel to world Y. world_up is set to this radial up, so the
-             * look-at and the WALK eye offset (below) follow the curvature.
-             *   fwd_flat = tangent forward (yaw heading on the surface, full 3D)
+             * eye moves. The heading (tangent forward) is PERSISTENT, not rebuilt
+             * from a global yaw + a reference vector: each frame we transport it
+             * onto the new up's tangent plane (drop its radial component,
+             * renormalize), then apply this frame's mouse yaw as a rotation about
+             * up. The old code picked a reference axis (world +Y, or +X near a
+             * pole) and a hard switch at |up.y|=0.99 snapped the whole frame ~180
+             * deg whenever up.y jittered across it - the pole flicker. With no
+             * global reference there is NO such singularity (only looking straight
+             * along the radius, handled by the degenerate-heading rebuild + the
+             * pitch clamp).
+             *   fwd_flat = tangent forward on the surface (the heading)
              *   fwd      = look direction (fwd_flat tilted toward up by pitch)
              *   right    = tangent right (for strafing) */
             {
                 Vec3 up_l = vec3_normalize(vec3_sub(cam_pos, planet_center));
-                Vec3 ref, east, north;
-                if (fabsf(up_l.y) < 0.99f) { ref.x = 0.0f; ref.y = 1.0f; ref.z = 0.0f; }
-                else                       { ref.x = 1.0f; ref.y = 0.0f; ref.z = 0.0f; }
-                east  = vec3_normalize(vec3_cross(ref, up_l));
-                north = vec3_cross(up_l, east);          /* orthonormal -> unit   */
-                world_up = up_l;
+                float d   = vec3_dot(cam_heading, up_l);
+                Vec3  h   = vec3_sub(cam_heading, vec3_scale(up_l, d)); /* -> tangent */
+                float hl  = (float)sqrt((double)vec3_dot(h, h));
+                world_up  = up_l;
 
-                ry = yaw   * (float)(M_PI / 180.0);
+                if (hl > 1e-4f) {
+                    h = vec3_scale(h, 1.0f / hl);
+                } else {
+                    /* heading became (anti)parallel to up (looking along the
+                     * radius): rebuild ANY tangent direction deterministically. */
+                    Vec3 ref;
+                    if (fabsf(up_l.y) < 0.99f) { ref.x = 0.0f; ref.y = 1.0f; ref.z = 0.0f; }
+                    else                       { ref.x = 1.0f; ref.y = 0.0f; ref.z = 0.0f; }
+                    h = vec3_normalize(vec3_cross(ref, up_l));
+                }
+
+                /* Mouse yaw: rotate h about up_l. h is already perpendicular to
+                 * up_l, so Rodrigues reduces to h*cos + right*sin, where
+                 * right = cross(h, up_l). +yaw_delta turns toward camera-right
+                 * (validated to match the old +yaw sense - no inversion). */
+                if (yaw_delta != 0.0f) {
+                    float a = yaw_delta * (float)(M_PI / 180.0);
+                    Vec3  rr = vec3_cross(h, up_l);
+                    h = vec3_normalize(vec3_add(vec3_scale(h, cosf(a)),
+                                                vec3_scale(rr, sinf(a))));
+                }
+                cam_heading = h;          /* persist for the next frame */
+
                 rp = pitch * (float)(M_PI / 180.0);
                 cp = cosf(rp);
-                /* -sin(yaw) on east: yaw+ (mouse right) must turn toward the camera
-                 * right (cross(fwd,up)); +sin inverted horizontal mouse-look. */
-                fwd_flat = vec3_add(vec3_scale(east, -sinf(ry)),
-                                    vec3_scale(north, -cosf(ry)));   /* unit       */
+                fwd_flat = h;
                 fwd = vec3_normalize(vec3_add(vec3_scale(fwd_flat, cp),
                                               vec3_scale(up_l, sinf(rp))));
                 right = vec3_normalize(vec3_cross(fwd_flat, up_l));
@@ -1432,7 +1482,15 @@ int main(void)
          * the swap), a few frames in so the context is warm, then exit. */
         ++frame_no;
         if (shot_path != NULL && frame_no >= shot_frame) {
-            if (render_screenshot_ppm(shot_path, win_w, win_h) == 0)
+            /* Capture at the LIVE drawable size, not the creation size: a WM that
+             * does not honor the requested 1024x768 (tiling / forced-maximize)
+             * resizes the window on map, and the viewport followed it; reading the
+             * fixed creation size would then grab only a corner crop (or undefined
+             * pixels). Mirror the MVP-aspect path's plat_get_size + fallback. */
+            int cap_w = win_w, cap_h = win_h;
+            plat_get_size(&cap_w, &cap_h);
+            if (cap_w <= 0 || cap_h <= 0) { cap_w = win_w; cap_h = win_h; }
+            if (render_screenshot_ppm(shot_path, cap_w, cap_h) == 0)
                 fprintf(stderr, "main: wrote screenshot %s\n", shot_path);
             else
                 fprintf(stderr, "main: screenshot failed\n");

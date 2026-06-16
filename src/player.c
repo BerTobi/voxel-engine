@@ -87,8 +87,28 @@ static int sphere_resolve(const Player *p, const PlyParams *pp,
                 pen = r - dl;
                 if (pen > best) {
                     best = pen;
-                    if (dl > 1e-6f) *push = pv_scale(d, pen / dl);
-                    else { push->x = 0.0f; push->y = pen; push->z = 0.0f; }
+                    if (dl > 1e-6f) {
+                        *push = pv_scale(d, pen / dl);
+                    } else {
+                        /* The sphere CENTER is fully inside this solid voxel, so
+                         * cube_closest returned the center and the contact normal
+                         * is lost. Push along the RADIAL up (out of the planet),
+                         * NOT world +Y: on the far hemisphere up points toward -Y,
+                         * so a +Y push drives the body DEEPER and it tunnels
+                         * straight through the planet (the velocity-kill + ground
+                         * test below also key off this normal, so they only behave
+                         * when it is the true radial up). Orientation-free push-out
+                         * is the entire point of the sphere collider. */
+                        PlyVec rup;
+                        float  rl;
+                        rup.x = p->pos.x - pp->center_x;
+                        rup.y = p->pos.y - pp->center_y;
+                        rup.z = p->pos.z - pp->center_z;
+                        rl = pv_len(rup);
+                        if (rl > 1e-4f) rup = pv_scale(rup, 1.0f / rl);
+                        else { rup.x = 0.0f; rup.y = 1.0f; rup.z = 0.0f; }
+                        *push = pv_scale(rup, pen);
+                    }
                 }
             }
     return best > 0.0f;

@@ -561,6 +561,65 @@ static void test_null_store_noop(void)
     free(c);
 }
 
+/* Case 9 (0.2.1 regression) - persist_open MUST create missing PARENT dirs.
+ * The default save dir is two levels deep ("saves/<seed>"); a single mkdir of
+ * the leaf fails with ENOENT when the parent does not exist, which on a fresh
+ * checkout silently disabled ALL persistence (the store stayed NULL, so every
+ * edit was ephemeral and the player's builds regenerated from seed the moment a
+ * chunk was evicted + reloaded - "what I build doesn't last, going around the
+ * planet everything disappeared"). persist_open must "mkdir -p" the whole path. */
+#define TEST_NESTED_PARENT "build/persist_test_nested"
+#define TEST_NESTED_DIR    TEST_NESTED_PARENT "/seedsub"
+
+static void test_nested_parent_mkdir(void)
+{
+    Chunk *src = malloc(sizeof(Chunk));
+    Chunk *dst = malloc(sizeof(Chunk));
+    char buf[192]; int ok = 1; buf[0] = '\0';
+    PersistStore *ps;
+
+    if (src == NULL || dst == NULL) {
+        report("nested-parent mkdir", 0, "OOM"); free(src); free(dst); return;
+    }
+
+    /* Force the precondition: the PARENT dir must not exist before the open, so
+     * a single-level mkdir of the leaf would fail (POSIX remove() rmdirs an
+     * empty dir; ENOENT is fine). On a clean build, build/ exists but neither of
+     * these does, which is exactly the live "saves/" case. */
+    remove(TEST_NESTED_DIR "/r.0.0.dat");
+    remove(TEST_NESTED_DIR);
+    remove(TEST_NESTED_PARENT);
+
+    ps = persist_open(TEST_NESTED_DIR, TEST_SEED, WG_GEN_VERSION);
+    if (ps == NULL) {
+        report("persist_open creates missing parent dirs (mkdir -p)", 0,
+               "returned NULL on a 2-level path whose parent did not exist");
+        free(src); free(dst); return;
+    }
+
+    build_mixed_chunk(src, 0, 0, 0);
+    if (persist_save_chunk(ps, src) != 0) {
+        ok = 0; snprintf(buf, sizeof buf, "save into nested dir failed");
+    }
+    if (ok) {
+        memset(dst, 0xAB, sizeof *dst);
+        if (persist_load_chunk(ps, dst, 0, 0, 0) != 1) {
+            ok = 0; snprintf(buf, sizeof buf, "reload MISS from nested dir");
+        } else if (!chunks_equal_canon(src, dst, buf, sizeof buf)) {
+            ok = 0;
+        }
+    }
+    persist_flush(ps);
+    persist_close(ps);
+    report("persist_open creates missing parent dirs (mkdir -p)", ok, buf);
+
+    /* Leave the slate clean for re-runs. */
+    remove(TEST_NESTED_DIR "/r.0.0.dat");
+    remove(TEST_NESTED_DIR);
+    remove(TEST_NESTED_PARENT);
+    free(src); free(dst);
+}
+
 int main(void)
 {
     PersistStore *ps;
@@ -595,6 +654,7 @@ int main(void)
     persist_close(ps);
 
     test_restart_durability();
+    test_nested_parent_mkdir();
 
     printf("=== %d failure(s) ===\n", g_failures);
     return g_failures;

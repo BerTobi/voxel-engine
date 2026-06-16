@@ -26,7 +26,7 @@
 
 #define VOXEL_VERSION_MAJOR 0
 #define VOXEL_VERSION_MINOR 2
-#define VOXEL_VERSION_PATCH 0
+#define VOXEL_VERSION_PATCH 1
 #define VOXEL_VERSION_PRERELEASE ""   /* empty on a final release; -dev in progress */
 
 /* Build the "0.2.0-dev" string from the numbers + suffix (one source of truth). */

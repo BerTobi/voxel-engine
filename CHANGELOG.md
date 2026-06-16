@@ -5,6 +5,43 @@ All notable changes to the Voxel Engine. Versioning is Factorio-style
 `PATCH` = save-compatible fixes, `MINOR` = new gameplay/features, `MAJOR` = 1.0
 or a breaking overhaul.
 
+## 0.2.1 — 2026-06-16 — Bug-fix release
+
+Save-compatible with 0.2.0 (no gen/format change). Four defects fixed: two
+reported from play, two surfaced by a pre-release adversarial bug hunt (parallel
+per-subsystem static review, each finding refuted by two independent lenses, then
+verified against the running code).
+
+### Fixed
+- **Builds now persist.** Persistence was silently disabled at runtime: the save
+  dir is two levels deep (`saves/<seed>`) but `persist_mkdir` did a single `mkdir`
+  of the leaf, which fails with `ENOENT` when the parent `saves/` does not exist
+  yet — so `persist_open` returned NULL, the store stayed off, and **every edit
+  was ephemeral** (regenerated from seed the moment a chunk evicted and reloaded,
+  i.e. as soon as you roamed away and back). `persist_mkdir` now creates every
+  missing parent (`mkdir -p`). Added a regression test (open at a path whose
+  parent is absent). *(persist.c, test_persist.c)*
+- **Player no longer tunnels through the planet.** The sphere collider's
+  deep-penetration fallback (when the body's center is fully buried in a voxel and
+  the contact normal is lost) pushed along world **+Y** — a leftover flat-world
+  assumption. On the far hemisphere the radial up points toward −Y, so the push
+  drove the body **deeper**, the into-surface velocity was never cancelled, and a
+  fast or off-axis fall punched straight through the solid planet and out the far
+  side (`on_ground` never latching). The fallback now pushes along the **radial
+  up**, so it stops at the surface everywhere. *(player.c)*
+- **Camera no longer flickers at the poles.** The tangent-frame basis was rebuilt
+  each frame from a reference axis with a hard switch at `|up.y| = 0.99`; flying
+  near a pole, tiny jitter across that threshold snapped the whole frame ~180°
+  (the view "reversing itself"). The heading is now a persistent vector,
+  **parallel-transported** onto each frame's tangent plane and rotated by mouse
+  yaw about the radial up — no global reference, so no pole singularity. (Heading
+  drifts slightly over a full lap — sphere holonomy — which is accepted.)
+  *(main.c)*
+- **Headless captures use the live framebuffer size.** `VOXEL_SHOT` wrote the
+  fixed 1024×768 creation size; under a window manager that resizes the window on
+  map (tiling / forced-maximize) that captured only a corner crop. It now reads
+  the live drawable size, matching the projection's aspect path. *(main.c)*
+
 ## 0.2.0 — 2026-06-16 — Spherical planet
 
 The world becomes a **small voxel planet**. The cycle opened aiming at water, but

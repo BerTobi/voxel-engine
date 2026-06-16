@@ -46,7 +46,7 @@
  * MinGW's _mkdir takes no mode; POSIX mkdir takes a mode. Returns 0 on success
  * OR when the directory already exists (EEXIST), so re-opening an existing save
  * is not an error; non-zero on any other failure. */
-static int persist_mkdir(const char *path)
+static int persist_mkdir_one(const char *path)
 {
     int rc;
 #ifdef _WIN32
@@ -66,6 +66,41 @@ static int persist_mkdir(const char *path)
             return 0;       /* the path exists - treat as success */
     }
     return -1;
+}
+
+/* Create `path` AND every missing parent component ("mkdir -p"). The default
+ * save dir is two levels deep ("saves/<seed>"); a single mkdir of the leaf
+ * FAILS with ENOENT when the parent "saves/" does not exist yet, which silently
+ * disabled persistence on a fresh checkout (the store stayed NULL and every edit
+ * was ephemeral). We walk the path, creating each prefix at every separator, then
+ * the leaf. Both '/' and (on Windows) '\\' separate; a leading separator (POSIX
+ * absolute path) or "C:" prefix is skipped as an empty/root component. Returns 0
+ * on success (or already-exists), non-zero if any component cannot be created. */
+static int persist_mkdir(const char *path)
+{
+    char buf[1024];
+    size_t i, n = strlen(path);
+
+    if (n == 0)
+        return -1;
+    if (n >= sizeof buf)                 /* too long to build prefixes safely */
+        return persist_mkdir_one(path);  /* best effort: try the leaf as-is   */
+
+    memcpy(buf, path, n + 1);            /* includes the NUL */
+    for (i = 1; i < n; ++i) {           /* i=1: never mkdir "" for a leading / */
+        char ch = buf[i];
+        int sep = (ch == '/');
+#ifdef _WIN32
+        sep = sep || (ch == '\\');
+#endif
+        if (sep) {
+            buf[i] = '\0';
+            if (persist_mkdir_one(buf) != 0)
+                return -1;              /* a parent could not be created */
+            buf[i] = ch;
+        }
+    }
+    return persist_mkdir_one(buf);       /* finally the leaf itself */
 }
 
 /* ======================================================================== *

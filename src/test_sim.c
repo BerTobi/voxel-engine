@@ -1180,15 +1180,16 @@ static void test_column_spreads_to_level_and_sleeps(void)
     int collapsed = (fmax <= 8);
     /* Spread: occupies far more cells than the single seed column (8 cells). */
     int spread    = wetted > 8;
-    /* Roughly level: adjacent same-layer cells are close in fill. The fluid
-     * design's anti-oscillation lateral rule drives the fixed point to within 1
-     * level; the lazy wake/sleep front can quiesce a touch above that, so the
-     * bound here is the achievable "roughly level" (small adjacent gap). See the
-     * agent report: a single continuous run sleeps at adjacent-gap up to 3 before
-     * the front catches the last cells, weaker than the algorithm's within-1
-     * mathematical fixed point - a sim-side wake/sleep observation, not a test
-     * flaw. */
-    int roughly_level = (worst_adj <= 4);
+    /* LEVEL: adjacent same-layer cells are within 1 fill level - the lateral
+     * rule's true fixed point (no cell has a neighbour >= 2 lower, the
+     * sim_liquid_unsettled condition). This used to be a weak `<= 4` bound
+     * because the settling cascade DIED early: a pour woke only the recipient's
+     * ring, never the donor's, so an uphill neighbour the pour just made
+     * unsettled was never re-activated and the pool froze in a multi-level
+     * staircase. fluid_step now wakes the donor's ring on every change, so the
+     * cascade completes and the pool reaches the within-1 level state. A regressed
+     * wake would re-introduce the staircase and trip this bound. */
+    int roughly_level = (worst_adj <= 1);
 
     char buf[280];
     int ok = collapsed && spread && roughly_level && conserved && settled;

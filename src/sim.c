@@ -926,7 +926,7 @@ static int fluid_step(SimState *s, int li, int is_source, int is_spring)
             vox_set_fill(&vox[li], (uint8_t)f);
             changed = 1;
         }
-        if (changed) { moved_set(s, li); }
+        if (changed) { moved_set(s, li); wake_ring(s, li); }
         return changed;
     }
 
@@ -1009,6 +1009,38 @@ static int fluid_step(SimState *s, int li, int is_source, int is_spring)
             moved_set(s, nbr_li[j]);
             wake_ring(s, nbr_li[j]);
         }
+
+        /* PEAK DRAIN: the floor-mean step above cannot drain a local PEAK - a
+         * cell whose strictly-lower neighbours all sit AT the rounded-down mean,
+         * so `want` is 0 for each and nothing moves, yet `here` is still >= 2
+         * above them (e.g. fill L+2 ringed by L: mean = floor((L+2+4L)/5) = L).
+         * Left alone that freezes a 2-level step and, being sim_liquid_unsettled,
+         * never sleeps (perpetual churn - confirmed in a 2-D basin). Shed the
+         * residual ONE level at a time to the LOWEST still-eligible neighbour:
+         * this strictly shrinks the max gap toward the within-1 level fixed point
+         * (here only ever drops to one ABOVE the recipient, so no pair inverts and
+         * the spread is monotone-decreasing -> no oscillation), and once every gap
+         * is <= 1 nothing is unsettled and the pool sleeps. Re-reads current fills
+         * (the mean loop may have raised some); parity order makes ties
+         * deterministic. */
+        while (step_remaining > 0) {
+            int bj = -1, bf = 16, k;
+            for (k = 0; k < nbr_n; ++k) {
+                int cf = (int)vox_fill(s->chunk->voxels[nbr_li[k]]);
+                if (f - cf >= (int)FLUID_SETTLE_GAP && cf < bf) { bj = k; bf = cf; }
+            }
+            if (bj < 0)
+                break;                  /* no neighbour >= 2 below: level, done */
+            if (vox_mat(s->chunk->voxels[nbr_li[bj]]) == MAT_AIR)
+                fluid_occupy_air(s, nbr_li[bj], mat, bf + 1);
+            else
+                vox_set_fill(&s->chunk->voxels[nbr_li[bj]], (uint8_t)(bf + 1));
+            f -= 1;
+            step_remaining -= 1;
+            changed = 1;
+            moved_set(s, nbr_li[bj]);
+            wake_ring(s, nbr_li[bj]);
+        }
     }
 
     /* Write back the residual fill for `here`. (f > 0 here: if it had reached 0
@@ -1017,8 +1049,16 @@ static int fluid_step(SimState *s, int li, int is_source, int is_spring)
         vox_set_fill(&vox[li], (uint8_t)f);
         changed = 1;
     }
-    if (changed)
+    if (changed) {
         moved_set(s, li);
+        /* Wake the DONOR's ring too (not just each recipient's): pouring out of
+         * `here` lowers it, which can make an UPHILL neighbour newly unsettled.
+         * Without this the neighbour is never re-activated, the settling cascade
+         * dies, and the body freezes in a multi-level STAIRCASE instead of
+         * reaching the "within 1 of every other" level state this rule targets.
+         * A flat pond produces no change -> no wake -> still sleeps (cost-free). */
+        wake_ring(s, li);
+    }
     return changed;
 }
 

@@ -395,9 +395,13 @@ static void test_worldgen_determinism(void)
     /* 3d: SPHERICAL asteroid fill (0.3) - each voxel is STONE inside radius
      * R-WG_DIRT_DEPTH, a DIRT crust out to WG_PLANET_R, AIR beyond, keyed on the
      * squared world-distance from the planet center (mirrors worldgen_fill_chunk).
-     * Test a chunk straddling the ball's top cap (cy=3 -> world-Y 48..63). */
+     * Test the chunk straddling the ball's top cap (cy = (CY+R)/CHUNK_DIM): its
+     * top voxels sit at radius R (the surface), the rest below is solid - so the
+     * stone/dirt/air boundary is exercised, not just an all-solid interior chunk. */
     if (1) {
-        int cx = 0, cy = 3, cz = 0;
+        int cx = WG_PLANET_CX / CHUNK_DIM;
+        int cy = (WG_PLANET_CY + WG_PLANET_R) / CHUNK_DIM;
+        int cz = WG_PLANET_CZ / CHUNK_DIM;
         Chunk *c = chunk_alloc(cx, cy, cz);
         long R2  = (long)WG_PLANET_R * (long)WG_PLANET_R;
         long Rd  = (long)WG_PLANET_R - (long)WG_DIRT_DEPTH;
@@ -711,8 +715,11 @@ static void test_long_walk(void)
         uint32_t rc;
         char d2[160]; d2[0] = '\0';
 
-        /* drain until every in-window coord is resident (or a frame cap). */
-        for (drain = 0; drain < 128; ++drain) {
+        /* drain until every in-window coord is resident (or a frame cap). The cap
+         * scales with the window: the budgeted drain loads <= WORLD_GEN_BUDGET
+         * chunks/frame, so a full window needs ~WORLD_WINDOW_CHUNKS/WORLD_GEN_BUDGET
+         * frames (190 for the R=64 ball's 1521-chunk window) + margin. */
+        for (drain = 0; drain < WORLD_WINDOW_CHUNKS / WORLD_GEN_BUDGET + 128; ++drain) {
             int cx, cy, cz, miss = 0;
             world_stream_update(ws, px, pz);
             for (cz = ccz - WORLD_RADIUS; cz <= ccz + WORLD_RADIUS && !miss; ++cz)

@@ -80,13 +80,14 @@
  * (player.c) and the camera (main.c) point at this SAME center, so "down" is
  * radial everywhere. This replaces the rolling heightmap for the prototype; the
  * fill is a pure-integer squared-distance test, so determinism is preserved (and
- * it is independent of `seed` - there is one fixed asteroid). Center is chunk-
- * interior-ish at the HOME column (DEMO_WORLD_X/Z = 8) and lifted to world-Y 28 so
- * the whole ball sits in the resident vertical band (see world.h WORLD_BAND_Y1). */
+ * it is independent of `seed` - there is one fixed asteroid). Center is at the HOME
+ * column X/Z (=8) and lifted to CY so the ball spans world-Y [CY-R .. CY+R] inside
+ * the resident vertical band (world.h WORLD_BAND_Y1 must reach (CY+R)/16). Bigger R
+ * = gentler curvature; the band height + pool slack scale with R (see world.h). */
 #define WG_PLANET_CX     8     /* planet center, world voxels (X)                */
-#define WG_PLANET_CY     28    /* planet center, world voxels (Y)                */
+#define WG_PLANET_CY     64    /* planet center, world voxels (Y)                */
 #define WG_PLANET_CZ     8     /* planet center, world voxels (Z)                */
-#define WG_PLANET_R      28    /* planet radius, world voxels (~40 s lap)        */
+#define WG_PLANET_R      64    /* planet radius (bigger = gentler curvature)     */
 
 /* ---- Value-noise lattice (binding; cheap integer hills) -------------------- *
  * Heights are sampled on a coarse square lattice of period WG_NOISE_PERIOD

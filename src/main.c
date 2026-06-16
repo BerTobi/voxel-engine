@@ -909,9 +909,12 @@ int main(void)
      * (defaults reproduce that old down-tilted framing exactly). The look point
      * cam_target is DERIVED from yaw/pitch below; the EYE XZ is the streaming
      * anchor and starts over HOME. */
+    /* 0.3 asteroid: start the eye just ABOVE the planet's north pole (outside the
+     * ball) so a live WALK session falls radially onto the surface and a headless
+     * fly capture frames the ball. XZ defaults to the planet axis (= cam_look). */
     cam_pos.x    = cam_look_x;
-    cam_pos.y    = DEMO_WORLD_Y + 24.0f;     /* up                              */
-    cam_pos.z    = cam_look_z + 28.0f;       /* back (+Z)                       */
+    cam_pos.y    = (float)(WG_PLANET_CY + WG_PLANET_R) + 6.0f;
+    cam_pos.z    = cam_look_z;
 
     /* Player body: FLY is forced under VOXEL_SHOT (headless captures must not get
      * gravity/collision); a live session walks. Seed the feet so the EYE lands

@@ -175,6 +175,8 @@ typedef struct {
     uint8_t light;   /* packed light byte: lo nibble = baked sky/block 0..15,
                         hi nibble = temp glow 0..15 (non-normalized)         */
     uint8_t ao;      /* per-face ambient occlusion byte = ao_level*17 (0..255)*/
+    uint8_t drop;    /* liquid fill-height TOP-DROP, 1/16 voxel (0 = opaque /
+                        bottom / submerged; 1..15 on a liquid SURFACE cell)  */
     uint8_t present; /* 1 = a visible face here, 0 = none (or consumed)      */
 } FaceKey;
 
@@ -182,7 +184,8 @@ static inline int key_eq(const FaceKey *a, const FaceKey *b) {
     return a->present && b->present
         && a->mat   == b->mat
         && a->light == b->light
-        && a->ao    == b->ao;
+        && a->ao    == b->ao
+        && a->drop  == b->drop;   /* different fill -> different surface height */
 }
 
 /* Expand a 4-bit level (0..15, the voxel light field or the AO level) into the
@@ -302,6 +305,30 @@ static int emit_quad(MeshBuffer *mb, int d, int ua, int va, int plane,
         uvv[i] = (uint8_t)tv[i];
     }
 
+    /* Per-vertex TOP-DROP written into the (shader-dead-as-direction) face byte:
+     * the vertex shader now SUBTRACTS face/16 from world.y to draw a liquid at
+     * its fill height. k->drop is 0 for opaque, the liquid bottom face, and
+     * submerged liquid -> face 0 (no sink). On a liquid SURFACE cell (drop>0):
+     * the +Y top quad lowers all 4 verts to the surface; a SIDE quad lowers only
+     * its 2 HIGHER-Y verts (a trapezoid whose top edge meets the surface); the
+     * -Y bottom never lowers. The higher-Y verts depend on the sweep's in-plane
+     * axes: an X face (NEG/POS_X) carries Y in cu -> verts 1,2; a Z face carries
+     * Y in cv -> verts 2,3. CRITICAL: opaque verts get face 0 (drop 0) so terrain
+     * is NOT sunk by the shader subtraction. */
+    uint8_t vdrop[4] = { 0u, 0u, 0u, 0u };
+    if (k->drop != 0u) {
+        switch (face) {
+        case FACE_POS_Y:
+            vdrop[0] = vdrop[1] = vdrop[2] = vdrop[3] = k->drop; break;
+        case FACE_NEG_Y:
+            break;                              /* bottom: never lowers */
+        case FACE_NEG_X: case FACE_POS_X:
+            vdrop[1] = vdrop[2] = k->drop; break;   /* Y is cu -> higher-Y at 1,2 */
+        default: /* FACE_NEG_Z, FACE_POS_Z */
+            vdrop[2] = vdrop[3] = k->drop; break;   /* Y is cv -> higher-Y at 2,3 */
+        }
+    }
+
     uint32_t base = mb->vert_count;
     for (int i = 0; i < 4; ++i) {
         MeshVert *mv = &mb->verts[base + (uint32_t)i];
@@ -309,7 +336,7 @@ static int emit_quad(MeshBuffer *mb, int d, int ua, int va, int plane,
         mv->py = pos[i][1];
         mv->pz = pos[i][2];
         mv->mat   = k->mat;
-        mv->face  = (uint8_t)face;
+        mv->face  = vdrop[i];
         mv->light = k->light;
         mv->ao    = k->ao;
         mv->u     = uvu[i];
@@ -394,6 +421,7 @@ static uint32_t sweep_axis(const Chunk *c, MeshBuffer *mb, int d, int dir,
 
                 FaceKey *m = &mask[v][u];
                 m->present = 0;
+                m->drop    = 0;             /* default: full-height (see below) */
                 if (is_air(here) || is_drained_liquid(here))
                     continue;               /* air / drained liquid: no faces */
 
@@ -454,6 +482,24 @@ static uint32_t sweep_axis(const Chunk *c, MeshBuffer *mb, int d, int dir,
                 m->light   = (uint8_t)((baked & 0x0Fu) | ((glow & 0x0Fu) << 4));
                 m->ao      = expand_level(face_ao_level(c, nc, ua, va));
                 m->present = 1;
+
+                /* Fill-height: a liquid SURFACE cell - one with AIR directly above,
+                 * i.e. a free top that is actually drawn - renders at the height
+                 * its fill implies, via a per-vertex TOP-DROP of (16-fill)/16 voxel.
+                 * The condition MUST match the +Y top-face visibility rule (a liquid
+                 * top draws only against AIR): if the cell is capped by a solid (or
+                 * a drained/other-liquid), its top is culled, so it must stay FULL
+                 * height (drop 0) - otherwise its side walls would dip below the cap
+                 * with no top quad to close the gap (a seam under an overhang).
+                 * Opaque sweeps keep drop 0. fill is 1..15 here (is_drained_liquid
+                 * culled fill==0 above), so a surface drop is 1..15 - never 0 even
+                 * brim-full (a hair below the cell-top plane, dodging a z-fight),
+                 * and never the opaque sentinel 0. */
+                if (liquid_pass) {
+                    Voxel above = sample(c, cc[0], cc[1] + 1, cc[2]);
+                    if (is_air(above))
+                        m->drop = (uint8_t)(16 - vox_fill(here));
+                }
             }
         }
 

@@ -11,7 +11,9 @@
  *   offset 2 : uint16 py      chunk-local Y, 0..16 inclusive
  *   offset 4 : uint16 pz      chunk-local Z, 0..16 inclusive
  *   offset 6 : uint8  mat     material id -> atlas tile select (0..255)
- *   offset 7 : uint8  face    face direction 0..5 -> normal + UV basis
+ *   offset 7 : uint8  face    liquid fill-height TOP-DROP in 1/16 voxel (0..15);
+ *                             0 for the opaque stream (the shader subtracts it
+ *                             from world.y, so opaque MUST be 0 or terrain sinks)
  *   offset 8 : uint8  light   packed light byte: lo nibble = baked sky/block,
  *                             hi nibble = temp glow (non-normalized; shader splits)
  *   offset 9 : uint8  ao       ambient occlusion 0..255 (separate merge-key byte)
@@ -48,7 +50,7 @@ typedef enum {
 typedef struct {
     uint16_t px, py, pz;   /* 0 : chunk-local position, 0..16 inclusive (6 B) */
     uint8_t  mat;          /* 6 : material id -> atlas tile select       (1 B) */
-    uint8_t  face;         /* 7 : Face direction 0..5 -> normal + UV basis(1 B) */
+    uint8_t  face;         /* 7 : liquid fill-height top-drop, 1/16 voxel; 0 opaque (1 B) */
     uint8_t  light;        /* 8 : packed: lo=baked sky/block, hi=temp glow(1 B) */
     uint8_t  ao;           /* 9 : ambient occlusion                      (1 B) */
     uint8_t  u, v;         /* 10: tile-local UV corner, tiling           (2 B) */

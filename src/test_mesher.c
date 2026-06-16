@@ -71,6 +71,16 @@ static Voxel make_voxel(uint8_t mat)
     return v;
 }
 
+/* A liquid voxel with a given fill 1..15. The mesher's is_liquid is data-driven
+ * by MaterialDef.phase (not the VF_LIQUID flag), so the material id is enough. */
+static Voxel make_liquid(uint8_t mat, uint8_t fill)
+{
+    Voxel v = 0;
+    vox_set_mat(&v, mat);
+    vox_set_fill(&v, fill);
+    return v;
+}
+
 /* =========================================================================
  * Case 1 - sizes are exactly as the binding contracts demand.
  * The headers already carry _Static_assert for these; we re-check at runtime
@@ -256,11 +266,31 @@ static void test_temp_codec(void)
  * direction. Used to prove the SEAM-facing direction emits exactly zero faces. */
 static uint32_t count_faces_in_dir(const MeshBuffer *mb, Face face)
 {
-    uint32_t n = 0;
-    for (uint32_t i = 0; i < mb->vert_count; ++i)
-        if (mb->verts[i].face == (uint8_t)face)
-            ++n;
-    return n / VERTS_PER_QUAD;
+    /* Direction is derived from quad GEOMETRY (not the face byte, which now
+     * carries the liquid fill-height drop): an axis-D quad has all 4 verts
+     * sharing the D coordinate; the outer +D face sits at plane CHUNK_DIM, the
+     * outer -D face at plane 0. For the 16^3 solid-chunk seam test the only X
+     * faces are the outer ones at x=0 and x=CHUNK_DIM, so this uniquely counts
+     * the seam-facing quads. (Positions stay integer voxel units - the fill-
+     * height lowering is applied in the vertex shader, not the mesh data.) */
+    uint32_t n = 0, i;
+    for (i = 0; i + VERTS_PER_QUAD <= mb->vert_count; i += VERTS_PER_QUAD) {
+        const MeshVert *q = &mb->verts[i];
+        int sx = (q[0].px == q[1].px) && (q[1].px == q[2].px) && (q[2].px == q[3].px);
+        int sy = (q[0].py == q[1].py) && (q[1].py == q[2].py) && (q[2].py == q[3].py);
+        int sz = (q[0].pz == q[1].pz) && (q[1].pz == q[2].pz) && (q[2].pz == q[3].pz);
+        int hit = 0;
+        switch (face) {
+        case FACE_NEG_X: hit = sx && q[0].px == 0u;          break;
+        case FACE_POS_X: hit = sx && q[0].px == (uint16_t)CHUNK_DIM; break;
+        case FACE_NEG_Y: hit = sy && q[0].py == 0u;          break;
+        case FACE_POS_Y: hit = sy && q[0].py == (uint16_t)CHUNK_DIM; break;
+        case FACE_NEG_Z: hit = sz && q[0].pz == 0u;          break;
+        case FACE_POS_Z: hit = sz && q[0].pz == (uint16_t)CHUNK_DIM; break;
+        }
+        if (hit) ++n;
+    }
+    return n;
 }
 
 /* =========================================================================
@@ -384,6 +414,138 @@ static void test_cross_chunk_seam(MeshBuffer *mb)
     }
 }
 
+/* Count liquid SURFACE top quads in the LIQUID stream: a +Y face (all 4 py
+ * equal) whose verts carry a nonzero fill-height drop (face>0). Bottom faces
+ * (face==0) and side faces (py varies) are excluded. */
+static uint32_t count_top_quads(const MeshBuffer *mb)
+{
+    uint32_t n = 0, i;
+    for (i = 0; i + VERTS_PER_QUAD <= mb->vert_count; i += VERTS_PER_QUAD) {
+        const MeshVert *q = &mb->verts[i];
+        int sy = (q[0].py == q[1].py) && (q[1].py == q[2].py) && (q[2].py == q[3].py);
+        if (sy && q[0].face > 0) ++n;
+    }
+    return n;
+}
+
+/* =========================================================================
+ * Case 8 (0.2) - liquid FILL-HEIGHT surface. The mesher writes a per-vertex
+ * top-drop (16-fill, in 1/16 voxel) into the face byte; the shader lowers
+ * world.y by it. Asserts: a surface cell's +Y top lowers all 4 verts, its -Y
+ * bottom none, each SIDE lowers exactly its 2 higher-Y verts (the trapezoid);
+ * brim-full drops 1 not 0; a submerged cell (liquid above) emits NO top and the
+ * surface cell above carries the drop; equal-fill cells merge while different-
+ * fill split; and the OPAQUE stream still writes face==0 (no terrain sink).
+ * ========================================================================= */
+static void test_liquid_fill_height(MeshBuffer *mb)
+{
+    Chunk c;
+    char buf[200];
+    uint32_t i;
+
+    memset(&c, 0, sizeof c);   /* NULL neigh[] (out-of-chunk == AIR), like every case */
+
+    /* (a) one fill=8 surface cell at (8,8,8): drop = 16-8 = 8. */
+    chunk_fill(&c, make_voxel(MAT_AIR));
+    chunk_set(&c, 8, 8, 8, make_liquid(MAT_WATER, 8));
+    mesh_buffer_reset(mb);
+    uint32_t qa = greedy_mesh_liquid(&c, mb);
+    int top_ok = 0, bot_ok = 0, sides = 0, good_sides = 0;
+    for (i = 0; i + 4 <= mb->vert_count; i += 4) {
+        const MeshVert *q = &mb->verts[i];
+        int sy = (q[0].py == q[1].py) && (q[1].py == q[2].py) && (q[2].py == q[3].py);
+        if (sy && q[0].py == 9) {                 /* +Y top of the cell */
+            top_ok = (q[0].face==8 && q[1].face==8 && q[2].face==8 && q[3].face==8);
+        } else if (sy && q[0].py == 8) {          /* -Y bottom */
+            bot_ok = (q[0].face==0 && q[1].face==0 && q[2].face==0 && q[3].face==0);
+        } else {                                   /* a side face (py varies) */
+            int k, n8 = 0, n0 = 0;
+            for (k = 0; k < 4; ++k) { if (q[k].face==8) ++n8; else if (q[k].face==0) ++n0; }
+            ++sides;
+            if (n8 == 2 && n0 == 2) ++good_sides;
+        }
+    }
+    snprintf(buf, sizeof buf, "quads=%u top=%d bottom=%d sides=%d good_sides=%d",
+             qa, top_ok, bot_ok, sides, good_sides);
+    report("case8a_liquid_fill8_surface_trapezoid",
+           qa == 6 && top_ok && bot_ok && sides == 4 && good_sides == 4, buf);
+
+    /* (b) brim-full fill=15 surface cell -> drop = 1 (NOT 0; dodges z-fight). */
+    chunk_fill(&c, make_voxel(MAT_AIR));
+    chunk_set(&c, 8, 8, 8, make_liquid(MAT_WATER, 15));
+    mesh_buffer_reset(mb);
+    greedy_mesh_liquid(&c, mb);
+    int brim_ok = 0;
+    for (i = 0; i + 4 <= mb->vert_count; i += 4) {
+        const MeshVert *q = &mb->verts[i];
+        int sy = (q[0].py==q[1].py)&&(q[1].py==q[2].py)&&(q[2].py==q[3].py);
+        if (sy && q[0].py == 9) brim_ok = (q[0].face == 1);
+    }
+    snprintf(buf, sizeof buf, "brim-full top drop=%d (want 1, not 0)", brim_ok);
+    report("case8b_liquid_brimfull_drop1", brim_ok, buf);
+
+    /* (c) 2-tall column: lower fill15 submerged (no top), upper fill4 top drop=12. */
+    chunk_fill(&c, make_voxel(MAT_AIR));
+    chunk_set(&c, 8, 8, 8, make_liquid(MAT_WATER, 15));
+    chunk_set(&c, 8, 9, 8, make_liquid(MAT_WATER, 4));
+    mesh_buffer_reset(mb);
+    greedy_mesh_liquid(&c, mb);
+    uint32_t tops_col = count_top_quads(mb);
+    int upper_ok = 0;
+    for (i = 0; i + 4 <= mb->vert_count; i += 4) {
+        const MeshVert *q = &mb->verts[i];
+        int sy = (q[0].py==q[1].py)&&(q[1].py==q[2].py)&&(q[2].py==q[3].py);
+        if (sy && q[0].py == 10) upper_ok = (q[0].face == 12);
+    }
+    snprintf(buf, sizeof buf, "surface tops=%u (want 1) upper_drop12=%d", tops_col, upper_ok);
+    report("case8c_liquid_submerged_no_top", tops_col == 1 && upper_ok, buf);
+
+    /* (d) greedy merge keyed on fill: uniform row -> 1 top; alternating -> >=2. */
+    chunk_fill(&c, make_voxel(MAT_AIR));
+    for (int z = 5; z <= 8; ++z) chunk_set(&c, 8, 8, z, make_liquid(MAT_WATER, 3));
+    mesh_buffer_reset(mb);
+    greedy_mesh_liquid(&c, mb);
+    uint32_t tops_uni = count_top_quads(mb);
+    chunk_fill(&c, make_voxel(MAT_AIR));
+    for (int z = 5; z <= 8; ++z) chunk_set(&c, 8, 8, z, make_liquid(MAT_WATER, (z & 1) ? 3 : 7));
+    mesh_buffer_reset(mb);
+    greedy_mesh_liquid(&c, mb);
+    uint32_t tops_alt = count_top_quads(mb);
+    snprintf(buf, sizeof buf, "uniform tops=%u (want 1) alternating tops=%u (want >=2)",
+             tops_uni, tops_alt);
+    report("case8d_liquid_merge_by_fill", tops_uni == 1 && tops_alt >= 2, buf);
+
+    /* (e) REGRESSION: the OPAQUE stream is unchanged AND every opaque vert's face
+     * byte is 0 (else the shader's world.y subtraction would SINK terrain). */
+    chunk_fill(&c, make_voxel(MAT_STONE));
+    mesh_buffer_reset(mb);
+    uint32_t qs = greedy_mesh(&c, mb);
+    int all_zero = 1;
+    for (i = 0; i < mb->vert_count; ++i)
+        if (mb->verts[i].face != 0) { all_zero = 0; break; }
+    snprintf(buf, sizeof buf, "opaque quads=%u (want 6) verts=%u (want 24) all_face0=%d",
+             qs, mb->vert_count, all_zero);
+    report("case8e_opaque_facebyte_zero", qs == 6 && mb->vert_count == 24u && all_zero, buf);
+
+    /* (f) REGRESSION: a partial-fill cell CAPPED BY A SOLID stays FULL height
+     * (drop 0). Its +Y top is culled (tops draw only against air), so dropping
+     * its side walls below the cap would open a gap under the overhang. fill=8
+     * water with stone directly above -> no surface top, every liquid vert
+     * face==0 (flush to the cap). */
+    chunk_fill(&c, make_voxel(MAT_AIR));
+    chunk_set(&c, 8, 8, 8, make_liquid(MAT_WATER, 8));
+    chunk_set(&c, 8, 9, 8, make_voxel(MAT_STONE));
+    mesh_buffer_reset(mb);
+    greedy_mesh_liquid(&c, mb);
+    int capped_full = 1;
+    for (i = 0; i < mb->vert_count; ++i)
+        if (mb->verts[i].face != 0) { capped_full = 0; break; }
+    snprintf(buf, sizeof buf, "capped: tops=%u (want 0) all_full_height=%d",
+             count_top_quads(mb), capped_full);
+    report("case8f_liquid_solid_capped_full_height",
+           count_top_quads(mb) == 0 && capped_full, buf);
+}
+
 int main(void)
 {
     printf("== test_mesher: greedy mesher + voxel codec ==\n");
@@ -414,6 +576,9 @@ int main(void)
 
     /* Cross-chunk seam: resets the scratch internally between sub-meshes. */
     test_cross_chunk_seam(&mb);
+
+    /* Liquid fill-height surface (0.2): resets the scratch internally. */
+    test_liquid_fill_height(&mb);
 
     mesh_buffer_free(&mb);
 

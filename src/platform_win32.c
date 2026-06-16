@@ -98,6 +98,7 @@ static int vk_to_plat(WPARAM vk)
     case '3':        return PLAT_KEY_3;
     case '4':        return PLAT_KEY_4;
     case '5':        return PLAT_KEY_5;
+    case 'F':        return PLAT_KEY_F;   /* fly/walk toggle */
     default:         return -1;
     }
 }

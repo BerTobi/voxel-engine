@@ -77,6 +77,7 @@
 #include "persist.h"
 #include "progress.h"
 #include "raycast.h"
+#include "player.h"
 #include "version.h"
 
 /* ---- Frame scheduling constants (binding, ARCHITECTURE.md Section 6) ------ */
@@ -384,6 +385,18 @@ static int ray_solid(void *ctx, int x, int y, int z)
     return (material_get(vox_mat(v))->flags & MAT_OPAQUE) != 0;
 }
 
+/* Player collision/buoyancy solidity (PlySolidFn): 1 = opaque (blocks), 2 =
+ * liquid (passable, buoyant), 0 = passable. The OPAQUE test matches ray_solid,
+ * so physics and break/place agree on what is solid (you never stand on water). */
+static int ply_solid(void *ctx, int x, int y, int z)
+{
+    Voxel v = world_get_voxel((const WorldStore *)ctx, x, y, z);
+    const MaterialDef *m = material_get(vox_mat(v));
+    if (m->flags & MAT_OPAQUE)            return 1;
+    if (m->phase == (uint8_t)PHASE_LIQUID) return 2;
+    return 0;
+}
+
 /* Build the voxel to PLACE for material id m (liquids carry VF_LIQUID + full
  * fill; solids a full opaque cube), reusing the demo voxel makers. */
 static Voxel place_voxel(uint8_t m)
@@ -613,6 +626,14 @@ int main(void)
     float  yaw;     /* degrees; yaw=0 looks toward -Z (matches today's framing) */
     float  pitch;   /* degrees; <0 looks down, clamped to +/-CAM_PITCH_LIMIT    */
 
+    /* Player embodiment (0.2): a WALKING physics body (player.c) is the default
+     * live mode; FLY is the old free-fly translation, toggled with F, and FORCED
+     * under VOXEL_SHOT so headless captures stay byte-identical. In walk mode the
+     * eye (cam_pos) is DERIVED from the body: cam_pos = feet + eye-offset. */
+    Player     player;
+    PlyParams  pp = player_defaults();
+    int        fly_mode = 0;     /* set at init: forced on under VOXEL_SHOT */
+
     /* Headless camera control (the streaming-capture knobs of the design):
      *   VOXEL_CAM_X / VOXEL_CAM_Z : starting world look position (override demo)
      *   VOXEL_FLY                 : voxels/frame, signed, advanced along +X each
@@ -817,6 +838,19 @@ int main(void)
     cam_pos.y    = DEMO_WORLD_Y + 24.0f;     /* up                              */
     cam_pos.z    = cam_look_z + 28.0f;       /* back (+Z)                       */
 
+    /* Player body: FLY is forced under VOXEL_SHOT (headless captures must not get
+     * gravity/collision); a live session walks. Seed the feet so the EYE lands
+     * exactly where cam_pos starts (feet = eye - eye-offset), so fly and walk
+     * begin from the same viewpoint and the first WALK frame just falls onto the
+     * pedestal below. */
+    fly_mode = (shot_path != NULL);
+    player.pos.x   = cam_pos.x;
+    player.pos.y   = cam_pos.y - pp.eye;
+    player.pos.z   = cam_pos.z;
+    player.vel.x   = player.vel.y = player.vel.z = 0.0f;
+    player.on_ground = 0;
+    player.in_water  = 0;
+
     world_up.x = 0.0f;
     world_up.y = 1.0f;
     world_up.z = 0.0f;
@@ -955,9 +989,8 @@ int main(void)
             Vec3 fwd;        /* full 3D look direction from yaw/pitch          */
             Vec3 fwd_flat;   /* fwd flattened to XZ for ground-plane movement  */
             Vec3 right;
-            float move = CAM_MOVE_PER_SEC * dt_s;
+            float move = CAM_MOVE_PER_SEC * dt_s;   /* fly-mode translate speed */
             float ry, rp, cp;
-            Vec3 delta;
 
             if (shot_path == NULL) {
                 int mdx = 0, mdy = 0;
@@ -988,35 +1021,61 @@ int main(void)
 
             right = vec3_normalize(vec3_cross(fwd_flat, world_up));
 
-            delta.x = fly_per_frame;     /* env-driven +X advance (0 when unset)*/
-            delta.y = 0.0f;
-            delta.z = 0.0f;
+            /* F toggles FLY <-> WALK (live only, edge-triggered). Forbidden under
+             * VOXEL_SHOT (fly is forced there). Entering WALK, seed the body from
+             * the current eye so the view does not jump. */
+            if (shot_path == NULL) {
+                static int f_prev = 0;
+                int f_now = plat_key_down(PLAT_KEY_F);
+                if (f_now && !f_prev) {
+                    fly_mode = !fly_mode;
+                    if (!fly_mode) {                 /* entering WALK */
+                        player.pos.x = cam_pos.x;
+                        player.pos.y = cam_pos.y - pp.eye;
+                        player.pos.z = cam_pos.z;
+                        player.vel.x = player.vel.y = player.vel.z = 0.0f;
+                        player.on_ground = 0;
+                    }
+                }
+                f_prev = f_now;
+            }
 
-            if (plat_key_down(PLAT_KEY_W)) {
-                delta.x += fwd_flat.x * move;
-                delta.z += fwd_flat.z * move;
+            if (fly_mode) {
+                /* FLY: the original free-fly translation (byte-identical, and the
+                 * only mode under VOXEL_SHOT). VOXEL_FLY auto-advances +X. */
+                Vec3 delta;
+                delta.x = fly_per_frame;
+                delta.y = 0.0f;
+                delta.z = 0.0f;
+                if (plat_key_down(PLAT_KEY_W)) { delta.x += fwd_flat.x*move; delta.z += fwd_flat.z*move; }
+                if (plat_key_down(PLAT_KEY_S)) { delta.x -= fwd_flat.x*move; delta.z -= fwd_flat.z*move; }
+                if (plat_key_down(PLAT_KEY_D)) { delta.x += right.x*move;    delta.z += right.z*move; }
+                if (plat_key_down(PLAT_KEY_A)) { delta.x -= right.x*move;    delta.z -= right.z*move; }
+                if (plat_key_down(PLAT_KEY_SPACE))  delta.y += move;
+                if (plat_key_down(PLAT_KEY_LSHIFT)) delta.y -= move;
+                cam_pos.x += delta.x;
+                cam_pos.y += delta.y;
+                cam_pos.z += delta.z;
+            } else {
+                /* WALK: yaw-relative wish direction from WASD -> AABB physics ->
+                 * derive the eye from the body. Space jumps/swims up, Shift
+                 * crouches/swims down. Diagonal is normalized (not faster). */
+                PlyVec wish;
+                float wl;
+                wish.x = 0.0f; wish.y = 0.0f; wish.z = 0.0f;
+                if (plat_key_down(PLAT_KEY_W)) { wish.x += fwd_flat.x; wish.z += fwd_flat.z; }
+                if (plat_key_down(PLAT_KEY_S)) { wish.x -= fwd_flat.x; wish.z -= fwd_flat.z; }
+                if (plat_key_down(PLAT_KEY_D)) { wish.x += right.x;    wish.z += right.z; }
+                if (plat_key_down(PLAT_KEY_A)) { wish.x -= right.x;    wish.z -= right.z; }
+                wl = sqrtf(wish.x*wish.x + wish.z*wish.z);
+                if (wl > 1e-4f) { wish.x /= wl; wish.z /= wl; }
+                player_step(&player, &pp, wish,
+                            plat_key_down(PLAT_KEY_SPACE), plat_key_down(PLAT_KEY_LSHIFT),
+                            dt_s, ply_solid, world);
+                cam_pos.x = player.pos.x;
+                cam_pos.y = player.pos.y + pp.eye;
+                cam_pos.z = player.pos.z;
             }
-            if (plat_key_down(PLAT_KEY_S)) {
-                delta.x -= fwd_flat.x * move;
-                delta.z -= fwd_flat.z * move;
-            }
-            if (plat_key_down(PLAT_KEY_D)) {
-                delta.x += right.x * move;
-                delta.z += right.z * move;
-            }
-            if (plat_key_down(PLAT_KEY_A)) {
-                delta.x -= right.x * move;
-                delta.z -= right.z * move;
-            }
-            if (plat_key_down(PLAT_KEY_SPACE))
-                delta.y += move;
-            if (plat_key_down(PLAT_KEY_LSHIFT))
-                delta.y -= move;
-
-            /* Only the eye translates; the look comes from yaw/pitch. */
-            cam_pos.x += delta.x;
-            cam_pos.y += delta.y;
-            cam_pos.z += delta.z;
 
             /* Derive the look point from the (possibly moved) eye + forward. */
             cam_target.x = cam_pos.x + fwd.x;
@@ -1049,11 +1108,26 @@ int main(void)
                 if (ray.hit && lc > 0)
                     edit_and_notify(world, sim, ray.hx, ray.hy, ray.hz, air_voxel());
                 if (ray.hit && rc > 0) {
-                    /* Don't place a block into the voxel the eye occupies. */
-                    int ex = (int)floorf(cam_pos.x);
-                    int ey = (int)floorf(cam_pos.y);
-                    int ez = (int)floorf(cam_pos.z);
-                    if (!(ray.px == ex && ray.py == ey && ray.pz == ez))
+                    /* Don't place a block INTO yourself: in WALK reject any cell
+                     * the body AABB occupies (feet..head), in FLY just the eye
+                     * cell. Otherwise right-click could entomb the player. */
+                    int blocked;
+                    if (fly_mode) {
+                        blocked = (ray.px == (int)floorf(cam_pos.x) &&
+                                   ray.py == (int)floorf(cam_pos.y) &&
+                                   ray.pz == (int)floorf(cam_pos.z));
+                    } else {
+                        int x0 = (int)floorf(player.pos.x - pp.half_xz);
+                        int x1 = (int)floorf(player.pos.x + pp.half_xz - 1e-4f);
+                        int y0 = (int)floorf(player.pos.y);
+                        int y1 = (int)floorf(player.pos.y + pp.height - 1e-4f);
+                        int z0 = (int)floorf(player.pos.z - pp.half_xz);
+                        int z1 = (int)floorf(player.pos.z + pp.half_xz - 1e-4f);
+                        blocked = (ray.px >= x0 && ray.px <= x1 &&
+                                   ray.py >= y0 && ray.py <= y1 &&
+                                   ray.pz >= z0 && ray.pz <= z1);
+                    }
+                    if (!blocked)
                         edit_and_notify(world, sim, ray.px, ray.py, ray.pz,
                                         place_voxel(PLACE_MATS[sel_mat]));
                 }

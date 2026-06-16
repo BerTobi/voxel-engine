@@ -271,7 +271,7 @@ static const char *VS_OPAQUE =
     "uniform float u_sun;\n"
     "attribute vec3  a_pos;\n"        /* px,py,pz : 0..16 chunk-local */
     "attribute float a_mat;\n"        /* atlas tile id 0..255         */
-    "attribute float a_face;\n"       /* face dir 0..5 (reserved)     */
+    "attribute float a_face;\n"       /* liquid fill-height TOP-DROP, 1/16 voxel; 0 for opaque */
     "attribute float a_light;\n"      /* packed byte 0..255: lo nibble sky, hi nibble heat (NOT normalized) */
     "attribute float a_ao;\n"         /* ambient occlusion, 0..1      */
     "attribute vec2  a_uv;\n"         /* tile-local UV corners        */
@@ -280,10 +280,12 @@ static const char *VS_OPAQUE =
     "varying   float v_heat;\n"       /* temperature glow 0..1 -> red-orange emissive in FS */
     "varying   float v_fog;\n"        /* 0 near .. 1 at FOG_END (cheap depth proxy) */
     "void main() {\n"
-    /* a_face is reserved for future face-specific UV; reference it with a zero
-     * weight so the attribute stays active (its bound location 2 stays valid)
-     * without altering the result. */
-    "    vec3 world = a_pos + u_chunk_origin + vec3(0.0 * a_face);\n"
+    /* a_face carries the liquid fill-height TOP-DROP in 1/16-voxel units (the
+     * mesher writes it into the per-vertex 'face' byte): SUBTRACT it from world.y
+     * so a partial-fill liquid surface (and the top edge of its side faces) sits
+     * at the fill height. Opaque geometry uploads face=0, so its world.y is
+     * unchanged - keeping all opaque output byte-identical. */
+    "    vec3 world = a_pos + u_chunk_origin - vec3(0.0, a_face * (1.0/16.0), 0.0);\n"
     "    gl_Position = u_mvp * vec4(world, 1.0);\n"
     /* Distance fog factor from gl_Position.w (perspective depth ~ view distance):
      * 0 inside FOG_START, ramping to 1 by FOG_END. FOG_END is held well below the

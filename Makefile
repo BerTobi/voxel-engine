@@ -68,6 +68,7 @@ CORE    := \
 	$(SRC)/persist.c \
 	$(SRC)/progress.c \
 	$(SRC)/raycast.c \
+	$(SRC)/player.c \
 	$(SRC)/gl_loader.c \
 	$(SRC)/render.c \
 	$(SRC)/main.c
@@ -99,7 +100,7 @@ WIN_LDFLAGS := -static -static-libgcc -Wl,--gc-sections -mwindows
 WIN_LIBS    := -lopengl32 -lgdi32 -luser32
 
 # ---- Targets -----------------------------------------------------------------
-.PHONY: all linux win test testsim testworld testpersist testprogress testraycast testedit version archive clean
+.PHONY: all linux win test testsim testworld testpersist testprogress testraycast testedit testplayer version archive clean
 
 # Default target: native dev build.
 all: linux
@@ -182,6 +183,14 @@ testprogress: | $(BUILD)
 testraycast: | $(BUILD)
 	$(CC) $(CFLAGS) -o $(BUILD)/ray_test $(SRC)/raycast.c $(SRC)/test_raycast.c -lm
 	$(BUILD)/ray_test
+
+# testplayer: the pure-math AABB physics resolver (player.c) against a synthetic
+# grid - landing, head-bonk, wall clamp, corner, anti-tunnel, water, free-fall.
+# No GL, no platform, no world (same isolation as testraycast). -lm for ceilf/fabsf.
+# apt: build-essential
+testplayer: | $(BUILD)
+	$(CC) $(CFLAGS) -o $(BUILD)/player_test $(SRC)/player.c $(SRC)/test_player.c -lm
+	$(BUILD)/player_test
 
 # testedit: world_get_voxel / world_edit_voxel on a headless WorldStore (sets the
 # voxel, flags MODIFIED|DIRTY_MESH, dirties boundary neighbours). No GL/platform.

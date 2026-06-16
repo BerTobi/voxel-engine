@@ -95,6 +95,7 @@ static int keysym_to_plat(KeySym ks)
     case XK_3:           return PLAT_KEY_3;
     case XK_4:           return PLAT_KEY_4;
     case XK_5:           return PLAT_KEY_5;
+    case XK_f: case XK_F: return PLAT_KEY_F;
     default:             return -1;
     }
 }

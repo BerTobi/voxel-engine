@@ -89,6 +89,7 @@ void   plat_mouse_buttons(int *left_clicks, int *right_clicks);
 #define PLAT_KEY_3       9
 #define PLAT_KEY_4      10
 #define PLAT_KEY_5      11
-#define PLAT_KEY_COUNT  12   /* size of the backend's key-state array */
+#define PLAT_KEY_F      12   /* toggle fly / walk mode (debug)                   */
+#define PLAT_KEY_COUNT  13   /* size of the backend's key-state array */
 
 #endif /* PLATFORM_H */

@@ -147,6 +147,7 @@ static GLint      g_overlay_u_origin = -1;
 static GLint      g_overlay_u_color  = -1;
 static GLuint     g_wire_vbo         = 0;   /* unit-cube edges (block highlight) */
 static GLuint     g_cross_vbo        = 0;   /* unit crosshair (2 lines, NDC)     */
+static GLuint     g_avatar_vbo       = 0;   /* filled cube (remote-player avatar) */
 
 /* Per-frame uniform state captured in render_begin so render_end's liquid pass
  * can re-bind the liquid program with the SAME mvp/sun without a second API
@@ -643,6 +644,27 @@ int render_init(void)
             glGenBuffers(1, &g_cross_vbo);
             glBindBuffer(GL_ARRAY_BUFFER, g_cross_vbo);
             glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)sizeof(cross), cross, GL_STATIC_DRAW);
+
+            /* Remote-player avatar: a filled 1.0-unit cube centred at the origin
+             * (the draw translates it by u_origin = the player's world position).
+             * SYMMETRIC so it reads the same regardless of the player's radial
+             * orientation on the sphere (the overlay shader cannot rotate). 36
+             * verts = 6 faces x 2 tris; winding is irrelevant (cull off on draw). */
+            {
+                const GLfloat e = 0.5f, n = -0.5f, p = 0.5f;
+                const GLfloat cube[36 * 3] = {
+                    n,n,n, n,p,n, n,p,p,  n,n,n, n,p,p, n,n,p,   /* -X */
+                    p,n,n, p,p,p, p,p,n,  p,n,n, p,n,p, p,p,p,   /* +X */
+                    n,n,n, p,n,n, p,n,p,  n,n,n, p,n,p, n,n,p,   /* -Y */
+                    n,p,n, p,p,p, p,p,n,  n,p,n, n,p,p, p,p,p,   /* +Y */
+                    n,n,n, p,p,n, p,n,n,  n,n,n, n,p,n, p,p,n,   /* -Z */
+                    n,n,p, p,n,p, p,p,p,  n,n,p, p,p,p, n,p,p    /* +Z */
+                };
+                (void)e;
+                glGenBuffers(1, &g_avatar_vbo);
+                glBindBuffer(GL_ARRAY_BUFFER, g_avatar_vbo);
+                glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)sizeof(cube), cube, GL_STATIC_DRAW);
+            }
             glBindBuffer(GL_ARRAY_BUFFER, 0);
         }
     }
@@ -1069,6 +1091,39 @@ void render_highlight_voxel(int wx, int wy, int wz)
     glUseProgram(g_opaque.program);
 }
 
+void render_avatar(const float pos[3], const float color[3])
+{
+    if (!g_inited || g_overlay_prog == 0 || g_avatar_vbo == 0 || !g_frame_have_mvp || pos == NULL)
+        return;
+
+    glUseProgram(g_overlay_prog);
+    if (g_overlay_u_mvp >= 0)
+        glUniformMatrix4fv(g_overlay_u_mvp, 1, GL_FALSE, g_frame_mvp);
+    if (g_overlay_u_origin >= 0)
+        glUniform3f(g_overlay_u_origin, pos[0], pos[1], pos[2]);
+    if (g_overlay_u_color >= 0)
+        glUniform3f(g_overlay_u_color,
+                    color ? color[0] : 1.0f, color ? color[1] : 1.0f, color ? color[2] : 1.0f);
+
+    /* A solid scene object (unlike the highlight): depth-tested AND depth-written
+     * so terrain occludes it and it occludes terrain. Cull off (winding-agnostic
+     * cube). Drawn after render_end, so it sits in the already-rendered depth. */
+    glDepthMask(GL_TRUE);
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_BLEND);
+
+    glBindBuffer(GL_ARRAY_BUFFER, g_avatar_vbo);
+    glEnableVertexAttribArray(LOC_POS);
+    glVertexAttribPointer(LOC_POS, 3, GL_FLOAT, GL_FALSE,
+                          (GLsizei)(3 * sizeof(GLfloat)), (const void *)0);
+    glDrawArrays(GL_TRIANGLES, 0, 36);
+    glDisableVertexAttribArray(LOC_POS);
+
+    glEnable(GL_CULL_FACE);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glUseProgram(g_opaque.program);
+}
+
 void render_crosshair(float aspect)
 {
     /* A small + at the screen centre, drawn directly in clip space: the overlay
@@ -1148,6 +1203,10 @@ void render_shutdown(void)
     if (g_cross_vbo != 0) {
         glDeleteBuffers(1, &g_cross_vbo);
         g_cross_vbo = 0;
+    }
+    if (g_avatar_vbo != 0) {
+        glDeleteBuffers(1, &g_avatar_vbo);
+        g_avatar_vbo = 0;
     }
     if (g_overlay_prog != 0) {
         glDeleteProgram(g_overlay_prog);

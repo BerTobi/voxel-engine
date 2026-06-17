@@ -85,9 +85,16 @@ TEST_SRC := \
 LINUX_PLATFORM := $(SRC)/platform_linux.c
 WIN_PLATFORM   := $(SRC)/platform_win32.c
 
-# Full source lists per target = engine core + the chosen backend.
-LINUX_SRC := $(CORE) $(LINUX_PLATFORM)
-WIN_SRC   := $(CORE) $(WIN_PLATFORM)
+# 0.3 multiplayer: net.c is portable protocol; net_{linux,win32}.c are the
+# per-backend socket syscalls (exactly one is added per build, like the platform
+# layer). main.c calls net_* unconditionally, so both targets link net.c.
+NET        := $(SRC)/net.c
+NET_LINUX  := $(SRC)/net_linux.c
+NET_WIN    := $(SRC)/net_win32.c
+
+# Full source lists per target = engine core + the chosen backend + networking.
+LINUX_SRC := $(CORE) $(LINUX_PLATFORM) $(NET) $(NET_LINUX)
+WIN_SRC   := $(CORE) $(WIN_PLATFORM) $(NET) $(NET_WIN)
 
 # ---- Link libraries ----------------------------------------------------------
 # Linux/GLX: GL ICD, X11 windowing, libm for the float math (matrices/fog).
@@ -97,10 +104,11 @@ LINUX_LIBS := -lGL -lX11 -lm
 # (no DLL hell on a bare XP install). --gc-sections drops unreferenced code.
 # -mwindows makes a GUI subsystem exe (no console window).
 WIN_LDFLAGS := -static -static-libgcc -Wl,--gc-sections -mwindows
-WIN_LIBS    := -lopengl32 -lgdi32 -luser32
+# ws2_32: Winsock2 (0.3 multiplayer, net_win32.c).
+WIN_LIBS    := -lopengl32 -lgdi32 -luser32 -lws2_32
 
 # ---- Targets -----------------------------------------------------------------
-.PHONY: all linux win test testsim testworld testpersist testprogress testraycast testedit testplayer version archive clean
+.PHONY: all linux win test testsim testworld testpersist testprogress testraycast testedit testplayer testnet version archive clean
 
 # Default target: native dev build.
 all: linux
@@ -198,6 +206,12 @@ testplayer: | $(BUILD)
 testedit: | $(BUILD)
 	$(CC) $(CFLAGS) -o $(BUILD)/edit_test $(SRC)/material.c $(SRC)/chunk.c $(SRC)/worldgen.c $(SRC)/world.c $(SRC)/persist.c $(SRC)/test_edit.c -lm
 	$(BUILD)/edit_test
+
+# 0.3 multiplayer: host+client over loopback in one process (net.c + the Linux
+# socket backend). No GL, no world - pure protocol round-trip.
+testnet: | $(BUILD)
+	$(CC) $(CFLAGS) -o $(BUILD)/net_test $(NET) $(NET_LINUX) $(SRC)/test_net.c -lm
+	$(BUILD)/net_test
 
 # Create the build directory on demand (order-only prerequisite).
 $(BUILD):

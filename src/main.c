@@ -79,6 +79,7 @@
 #include "raycast.h"
 #include "player.h"
 #include "version.h"
+#include "net.h"
 
 /* ---- Frame scheduling constants (binding, ARCHITECTURE.md Section 6) ------ */
 #define FRAME_TARGET_MS   33.333    /* 30 FPS, binding TARGET_FRAMERATE        */
@@ -441,6 +442,15 @@ static void edit_and_notify(WorldStore *w, SimState *s, int wx, int wy, int wz, 
     }
 }
 
+/* net_drain_edits callback: apply a REMOTE edit to the local world exactly like a
+ * local one. Threaded a {world, sim} context so it reaches edit_and_notify. */
+typedef struct { WorldStore *w; SimState *s; } NetApplyCtx;
+static void apply_net_edit(int wx, int wy, int wz, uint32_t voxel, void *user)
+{
+    NetApplyCtx *c = (NetApplyCtx *)user;
+    edit_and_notify(c->w, c->s, wx, wy, wz, (Voxel)voxel);
+}
+
 static void demo_decorate(Chunk *c)
 {
     int x, y, z;
@@ -664,6 +674,12 @@ int main(void)
     char          save_dir_buf[512];
     const char   *save_dir;
 
+    /* 0.3 multiplayer (optional). NULL = single-player (VOXEL_HOST/VOXEL_CONNECT
+     * unset), and every net_* call below is then a no-op, so the single-player
+     * path is byte-for-byte the pre-0.3 behaviour. A CLIENT adopts the host's
+     * seed (below) and does NOT persist (the host's save is canonical). */
+    NetState     *net = NULL;
+
     /* Heat simulation (ARCHITECTURE Section 3). Single-chunk: one SimState bound
      * to the resident HOME chunk that carries the lava block. It is bound when
      * HOME is resident and DETACHED (sim->chunk = NULL) when HOME scrolls out of
@@ -821,6 +837,15 @@ int main(void)
     if (seed_env != NULL && seed_env[0] != '\0')
         seed = (uint64_t)strtoull(seed_env, NULL, 0);
 
+    /* 0.3 multiplayer: open the network BEFORE world_init + persist. A CLIENT
+     * completes the handshake here and ADOPTS the host's seed, so it generates
+     * the byte-identical deterministic planet (no map transfer). The handshake
+     * refuses a host whose build (game/gen version) differs. NULL = single-player
+     * (env unset) or a failed/refused join (logged) -> fall back to local seed. */
+    net = net_init_from_env(seed, (uint32_t)VOXEL_VERSION_PACKED, (uint32_t)WG_GEN_VERSION);
+    if (net != NULL && net_mode(net) == NET_CLIENT)
+        seed = net_seed(net);
+
     cb.gen         = cb_gen;
     cb.mesh_upload = cb_mesh_upload;
     cb.slot_free   = cb_slot_free;
@@ -846,13 +871,20 @@ int main(void)
      * injected BEFORE world_prime so the very first window loads persisted edits
      * in preference to regenerating from seed. A failed open is non-fatal: the
      * store stays persistence-less (ephemeral, the pre-Section-8 behaviour). */
-    save_dir = resolve_save_dir(save_dir_buf, sizeof(save_dir_buf), seed);
-    persist = persist_open(save_dir, seed, WG_GEN_VERSION);
-    if (persist == NULL)
-        fprintf(stderr, "main: persist_open(%s) failed - edits will be "
-                        "ephemeral this run\n", save_dir);
-    else
-        world_set_persist(world, persist);
+    if (net != NULL && net_mode(net) == NET_CLIENT) {
+        /* CLIENT: the world is ephemeral on this machine - the HOST owns the
+         * canonical save. We regenerate from the (shared) seed and apply the
+         * host's relayed edits live; we do not open a local save. */
+        persist = NULL;
+    } else {
+        save_dir = resolve_save_dir(save_dir_buf, sizeof(save_dir_buf), seed);
+        persist = persist_open(save_dir, seed, WG_GEN_VERSION);
+        if (persist == NULL)
+            fprintf(stderr, "main: persist_open(%s) failed - edits will be "
+                            "ephemeral this run\n", save_dir);
+        else
+            world_set_persist(world, persist);
+    }
 
     world_prime(world, cam_look_x, cam_look_z);
 
@@ -867,6 +899,7 @@ int main(void)
         world_shutdown(world);   /* flushes through the borrowed persist store    */
         free(world);
         persist_close(persist);  /* then close it (NULL-safe), the owner's job     */
+        net_shutdown(net);       /* close sockets (NULL-safe)                      */
         return 1;
     }
     sim->chunk = NULL;   /* unbound: nothing to tick until HOME is resident      */
@@ -1081,6 +1114,11 @@ int main(void)
         if (plat_should_close() || plat_key_down(PLAT_KEY_ESC))
             break;
 
+        /* --- 0.3: pump the network (accept, flush, parse) once per frame --- *
+         * Populates the avatar table + inbound-edit queue for this frame. No-op
+         * (NULL) in single-player. A client that lost the host drops to local. */
+        net_poll(net);
+
         /* --- FPS free-look: mouse turns, WASD moves relative to facing ---- *
          * On a LIVE session read the relative mouse motion accumulated since the
          * last poll and fold it into yaw/pitch: +dx (right) yaws right, +dy
@@ -1248,8 +1286,11 @@ int main(void)
                 }
 
                 plat_mouse_buttons(&lc, &rc);
-                if (ray.hit && lc > 0)
-                    edit_and_notify(world, sim, ray.hx, ray.hy, ray.hz, air_voxel());
+                if (ray.hit && lc > 0) {
+                    Voxel v = air_voxel();
+                    edit_and_notify(world, sim, ray.hx, ray.hy, ray.hz, v);
+                    net_send_edit(net, ray.hx, ray.hy, ray.hz, (uint32_t)v); /* tell peers */
+                }
                 if (ray.hit && rc > 0) {
                     /* Don't place a block INTO yourself: reject a place cell the
                      * body overlaps. In WALK the body is the collision SPHERE
@@ -1278,11 +1319,30 @@ int main(void)
                         dxp = player.pos.x - qx; dyp = player.pos.y - qy; dzp = player.pos.z - qz;
                         blocked = (dxp*dxp + dyp*dyp + dzp*dzp) < pp.r_p * pp.r_p;
                     }
-                    if (!blocked)
-                        edit_and_notify(world, sim, ray.px, ray.py, ray.pz,
-                                        place_voxel(PLACE_MATS[sel_mat]));
+                    if (!blocked) {
+                        Voxel v = place_voxel(PLACE_MATS[sel_mat]);
+                        edit_and_notify(world, sim, ray.px, ray.py, ray.pz, v);
+                        net_send_edit(net, ray.px, ray.py, ray.pz, (uint32_t)v); /* tell peers */
+                    }
                 }
             }
+        }
+
+        /* --- 0.3: apply remote edits + broadcast my pose ------------------- *
+         * Apply edits received this frame (host's own + relayed peers') to the
+         * local deterministic world, exactly like a local edit, BEFORE streaming
+         * so a freshly-edited resident chunk re-meshes this same frame. Then send
+         * my eye pose + tangent heading for the others' avatars. Both no-ops in
+         * single-player. */
+        {
+            NetApplyCtx nctx;
+            nctx.w = world; nctx.s = sim;
+            net_drain_edits(net, apply_net_edit, &nctx);
+        }
+        if (net != NULL) {
+            float npos[3] = { cam_pos.x, cam_pos.y, cam_pos.z };
+            float nhd[3]  = { cam_heading.x, cam_heading.y, cam_heading.z };
+            net_send_pose(net, npos, nhd);
         }
 
         /* --- Stream the loaded window around the camera (Section 6/7) ----- *
@@ -1468,6 +1528,19 @@ int main(void)
             }
             render_end();
 
+            /* 0.3: remote-player avatars - drawn after render_end (so they sit in
+             * the frame's depth + reuse its MVP), before the overlays. No-op in
+             * single-player (count 0). */
+            {
+                int ai, acount = net_avatar_count(net);
+                for (ai = 0; ai < acount; ++ai) {
+                    float apos[3], ahd[3], acol[3];
+                    int   aid;
+                    if (net_get_avatar(net, ai, apos, ahd, &aid, acol))
+                        render_avatar(apos, acol);
+                }
+            }
+
             /* Block-target wireframe overlay + centre crosshair. Drawn after
              * render_end so they sit on top of the opaque + liquid scene. hl_have
              * is set by the per-frame raycast (live only); the crosshair is also
@@ -1558,6 +1631,7 @@ int main(void)
         free(world);
     }
     persist_close(persist);      /* close region handles + free the store (last)  */
+    net_shutdown(net);           /* 0.3: close sockets + free NetState (NULL-safe) */
     /* Release mouse capture so the cursor reappears on exit (idempotent; a no-op
      * in VOXEL_SHOT mode where capture was never enabled, and the backends also
      * auto-release on window close - this is the belt-and-braces explicit off). */

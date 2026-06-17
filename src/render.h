@@ -72,6 +72,13 @@ void render_end(void);
  * before plat_swap_buffers; a no-op if the overlay program failed to build. */
 void render_highlight_voxel(int wx, int wy, int wz);
 
+/* Draw a remote player's avatar: a filled 1.0-unit cube of `color` (RGB 0..1)
+ * centred at world position `pos` (3 floats). A solid scene object - depth-tested
+ * AND depth-written (occludes / is occluded by terrain). Uses the MVP captured in
+ * render_begin; call AFTER render_end, before plat_swap_buffers. No-op if the
+ * overlay program failed to build or pos is NULL. (0.3 multiplayer.) */
+void render_avatar(const float pos[3], const float color[3]);
+
 /* Draw a small crosshair (+) at the screen centre. `aspect` (width/height) keeps
  * it square on non-square windows. Screen-space, always on top (no depth test).
  * Call after render_end and before plat_swap_buffers; a no-op if the overlay

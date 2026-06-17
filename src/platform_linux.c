@@ -79,6 +79,11 @@ static int    g_win_w = 0, g_win_h = 0; /* cached client size so the centre is k
 /* Engine-portable key state, indexed by PLAT_KEY_* (0..PLAT_KEY_COUNT-1). */
 static unsigned char g_keys[PLAT_KEY_COUNT];
 
+/* Typed-text ring (UI text entry, e.g. a server IP). Filled in KeyPress, drained
+ * read-and-clear by plat_text_poll. Printable ASCII + backspace (0x08). */
+static char g_text[64];
+static int  g_text_len = 0;
+
 /* Monotonic clock origin, captured at window creation, so plat_time_ms() is
  * "milliseconds since startup" rather than an absolute epoch. */
 static int          g_clock_inited = 0;
@@ -329,8 +334,19 @@ void plat_poll(void)
              * both map to the same PLAT_KEY_*. */
             KeySym ks = XLookupKeysym(&ev.xkey, 0);
             int    k  = keysym_to_plat(ks);
+            char   tb[8];
+            int    tn, i;
             if (k >= 0)
                 g_keys[k] = 1;
+            /* Also capture the TYPED character(s) for UI text fields (server IP):
+             * XLookupString honours shift/layout. Keep printable ASCII + backspace
+             * (0x08); Enter (0x0D) is dropped here (handled as PLAT_KEY_ENTER). */
+            tn = XLookupString(&ev.xkey, tb, (int)sizeof tb, NULL, NULL);
+            for (i = 0; i < tn; ++i) {
+                unsigned char ch = (unsigned char)tb[i];
+                if (((ch >= 0x20 && ch <= 0x7E) || ch == 0x08) && g_text_len < (int)sizeof g_text)
+                    g_text[g_text_len++] = (char)ch;
+            }
             break;
         }
         case KeyRelease: {
@@ -452,6 +468,15 @@ void plat_mouse_buttons(int *left_clicks, int *right_clicks)
     if (right_clicks) *right_clicks = g_mb_right;
     g_mb_left = 0;
     g_mb_right = 0;
+}
+
+int plat_text_poll(char *out, int max)
+{
+    int n = (g_text_len < max) ? g_text_len : max;
+    int i;
+    for (i = 0; i < n; ++i) out[i] = g_text[i];
+    g_text_len = 0;                  /* read-and-clear (caller buffer should be >= 64) */
+    return n;
 }
 
 void plat_mouse_delta(int *dx, int *dy)

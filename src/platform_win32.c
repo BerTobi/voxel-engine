@@ -55,6 +55,10 @@ static int           g_class_inited = 0;
 /* Engine-portable key state, indexed by PLAT_KEY_* (0..PLAT_KEY_COUNT-1). */
 static unsigned char g_keys[PLAT_KEY_COUNT];
 
+/* Typed-text ring (UI text entry); filled in WM_CHAR, drained by plat_text_poll. */
+static char g_text[64];
+static int  g_text_len = 0;
+
 /* ---- Relative mouse-look state ------------------------------------------- *
  * Mirrors the X11 backend's recenter-and-hide scheme so both behave identically.
  * While captured we hide the cursor, pin it to the client centre every poll, and
@@ -265,6 +269,16 @@ static LRESULT CALLBACK plat_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM 
         if (msg == WM_KEYUP)
             return 0;
         break;
+    }
+
+    case WM_CHAR: {
+        /* Typed character for UI text fields (TranslateMessage in plat_poll
+         * generates this). Keep printable ASCII + backspace (0x08); Enter (0x0D)
+         * is dropped here (handled as PLAT_KEY_ENTER). */
+        unsigned char ch = (unsigned char)wparam;
+        if (((ch >= 0x20 && ch <= 0x7E) || ch == 0x08) && g_text_len < (int)sizeof g_text)
+            g_text[g_text_len++] = (char)ch;
+        return 0;
     }
 
     case WM_LBUTTONDOWN:
@@ -590,6 +604,15 @@ void plat_mouse_buttons(int *left_clicks, int *right_clicks)
     if (right_clicks) *right_clicks = g_mb_right;
     g_mb_left = 0;
     g_mb_right = 0;
+}
+
+int plat_text_poll(char *out, int max)
+{
+    int n = (g_text_len < max) ? g_text_len : max;
+    int i;
+    for (i = 0; i < n; ++i) out[i] = g_text[i];
+    g_text_len = 0;
+    return n;
 }
 
 void plat_set_fullscreen(int on)

@@ -669,6 +669,39 @@ static void parse_hostport(const char *s, char *ip, size_t ipcap, unsigned short
     }
 }
 
+NetState *net_join(const char *ip, unsigned short port,
+                   uint32_t game_version, uint32_t gen_version)
+{
+    int waited;
+    NetState *n;
+    if (ip == NULL || ip[0] == '\0') { fprintf(stderr, "net: join needs an IP\n"); return NULL; }
+    n = net_client(ip, port, game_version, gen_version);
+    if (!n) { fprintf(stderr, "net: connect to %s:%u failed\n", ip, (unsigned)port); return NULL; }
+    fprintf(stderr, "net: connecting to %s:%u ...\n", ip, (unsigned)port);
+    for (waited = 0; waited < NET_HANDSHAKE_TIMEOUT_MS; waited += 5) {
+        net_poll(n);
+        if (net_ready(n) || net_failed(n)) break;
+        net_sys_sleep_ms(5);
+    }
+    if (net_failed(n) || !net_ready(n)) {
+        fprintf(stderr, "net: handshake with %s:%u %s\n", ip, (unsigned)port,
+                net_failed(n) ? "refused/dropped" : "timed out");
+        net_shutdown(n);
+        return NULL;
+    }
+    fprintf(stderr, "net: joined %s:%u as player %d (seed %016llx)\n",
+            ip, (unsigned)port, net_local_id(n), (unsigned long long)net_seed(n));
+    return n;
+}
+
+NetState *net_join_str(const char *ipport, uint32_t game_version, uint32_t gen_version)
+{
+    char ip[64];
+    unsigned short port;
+    parse_hostport(ipport, ip, sizeof ip, &port);   /* "ip" or "ip:port" (default port) */
+    return net_join(ip, port, game_version, gen_version);
+}
+
 NetState *net_init_from_env(uint64_t local_seed,
                             uint32_t game_version, uint32_t gen_version)
 {
@@ -687,27 +720,8 @@ NetState *net_init_from_env(uint64_t local_seed,
         }
     }
     if (conn && conn[0]) {
-        int waited;
-        NetState *n;
         parse_hostport(conn, ip, sizeof ip, &port);
-        if (ip[0] == '\0') { fprintf(stderr, "net: VOXEL_CONNECT needs an IP (got '%s')\n", conn); return NULL; }
-        n = net_client(ip, port, game_version, gen_version);
-        if (!n) { fprintf(stderr, "net: connect to %s:%u failed\n", ip, (unsigned)port); return NULL; }
-        fprintf(stderr, "net: connecting to %s:%u ...\n", ip, (unsigned)port);
-        for (waited = 0; waited < NET_HANDSHAKE_TIMEOUT_MS; waited += 5) {
-            net_poll(n);
-            if (net_ready(n) || net_failed(n)) break;
-            net_sys_sleep_ms(5);
-        }
-        if (net_failed(n) || !net_ready(n)) {
-            fprintf(stderr, "net: handshake with %s:%u %s\n", ip, (unsigned)port,
-                    net_failed(n) ? "refused/dropped" : "timed out");
-            net_shutdown(n);
-            return NULL;
-        }
-        fprintf(stderr, "net: joined %s:%u as player %d (seed %016llx)\n",
-                ip, (unsigned)port, net_local_id(n), (unsigned long long)net_seed(n));
-        return n;
+        return net_join(ip, port, game_version, gen_version);   /* connect + handshake */
     }
     (void)local_seed;
     return NULL;   /* NET_OFF: single-player */

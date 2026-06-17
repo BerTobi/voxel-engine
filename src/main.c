@@ -672,24 +672,139 @@ static void mark_home_modified(Chunk *c)
  * coordinates are tuned by eye against the headless VOXEL_MENU screenshot. */
 static void draw_pause_menu(float aspect, int sel, int fullscreen_on)
 {
-    const char *labels[3];
-    const float iy[3] = { 0.20f, 0.02f, -0.16f };   /* item baselines (text tops) */
+    const char *labels[4];
+    const float iy[4] = { 0.26f, 0.10f, -0.06f, -0.22f };   /* item baselines (text tops) */
     int i;
 
     render_ui_rect(-1.0f, -1.0f, 1.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.55f);      /* dim scene  */
-    render_ui_rect(-0.46f, -0.46f, 0.46f, 0.56f, 0.10f, 0.11f, 0.15f, 0.92f); /* panel    */
+    render_ui_rect(-0.46f, -0.52f, 0.46f, 0.56f, 0.10f, 0.11f, 0.15f, 0.92f); /* panel    */
     render_text(-0.20f, 0.50f, 0.11f, aspect, 1.0f, 0.85f, 0.20f, 1.0f, "PAUSED");
 
     labels[0] = "Resume";
     labels[1] = fullscreen_on ? "Fullscreen: On" : "Fullscreen: Off";
-    labels[2] = "Quit";
-    for (i = 0; i < 3; ++i) {
+    labels[2] = "Main Menu";
+    labels[3] = "Quit";
+    for (i = 0; i < 4; ++i) {
         if (i == sel)                                                       /* selection bar */
-            render_ui_rect(-0.40f, iy[i] - 0.085f, 0.40f, iy[i] + 0.035f, 0.22f, 0.42f, 0.80f, 0.85f);
-        render_text(-0.34f, iy[i], 0.075f, aspect, 1.0f, 1.0f, 1.0f, 1.0f, labels[i]);
+            render_ui_rect(-0.40f, iy[i] - 0.075f, 0.40f, iy[i] + 0.035f, 0.22f, 0.42f, 0.80f, 0.85f);
+        render_text(-0.34f, iy[i], 0.07f, aspect, 1.0f, 1.0f, 1.0f, 1.0f, labels[i]);
     }
-    render_text(-0.40f, -0.30f, 0.04f, aspect, 0.65f, 0.65f, 0.70f, 1.0f,
+    render_text(-0.40f, -0.36f, 0.04f, aspect, 0.65f, 0.65f, 0.70f, 1.0f,
                 "Up/Down + Enter    Esc resumes");
+}
+
+/* ---- 0.3 connect screen (startup + quit-to-menu): Single / Host / Join / Quit *
+ * Reuses the UI primitives; runs before any world exists. */
+typedef enum { CHOICE_SINGLE = 0, CHOICE_HOST, CHOICE_JOIN, CHOICE_QUIT, CHOICE_ENV } ChoiceMode;
+typedef struct { ChoiceMode mode; char ip[64]; } ConnectChoice;
+
+static void draw_connect_screen(float aspect, int sel, const char *ip)
+{
+    const float iy[4] = { 0.28f, 0.12f, -0.04f, -0.30f };   /* Single, Host, Join, Quit */
+    char joinline[80];
+    const char *jp;
+    int i;
+
+    render_ui_rect(-1.0f, -1.0f, 1.0f, 1.0f, 0.04f, 0.05f, 0.08f, 1.0f);     /* solid bg  */
+    render_text(-0.57f, 0.62f, 0.085f, aspect, 1.0f, 0.85f, 0.20f, 1.0f, "VOXEL ENGINE 0.3");
+
+    /* Single Player + Host Game: plain items. */
+    if (sel == 0) render_ui_rect(-0.42f, iy[0]-0.075f, 0.42f, iy[0]+0.035f, 0.22f,0.42f,0.80f,0.85f);
+    render_text(-0.36f, iy[0], 0.07f, aspect, 1,1,1,1, "Single Player");
+    if (sel == 1) render_ui_rect(-0.42f, iy[1]-0.075f, 0.42f, iy[1]+0.035f, 0.22f,0.42f,0.80f,0.85f);
+    render_text(-0.36f, iy[1], 0.07f, aspect, 1,1,1,1, "Host Game");
+
+    /* Join: shows the editable IP field (a cursor '_' when Join is selected). */
+    if (sel == 2) render_ui_rect(-0.42f, iy[2]-0.075f, 0.42f, iy[2]+0.035f, 0.22f,0.42f,0.80f,0.85f);
+    {
+        int n = 0; const char *src = "Join: "; const char *p;
+        for (p = src; *p && n < (int)sizeof joinline - 1; ++p) joinline[n++] = *p;
+        jp = (ip && ip[0]) ? ip : "";
+        for (p = jp; *p && n < (int)sizeof joinline - 1; ++p) joinline[n++] = *p;
+        if (sel == 2 && n < (int)sizeof joinline - 1) joinline[n++] = '_';   /* cursor */
+        joinline[n] = '\0';
+    }
+    render_text(-0.36f, iy[2], 0.07f, aspect, 1,1,1,1, joinline);
+
+    if (sel == 3) render_ui_rect(-0.42f, iy[3]-0.075f, 0.42f, iy[3]+0.035f, 0.22f,0.42f,0.80f,0.85f);
+    render_text(-0.36f, iy[3], 0.07f, aspect, 1,1,1,1, "Quit");
+
+    render_text(-0.48f, -0.46f, 0.034f, aspect, 0.6f,0.6f,0.65f,1.0f,
+                "Up/Down + Enter    type an IP to Join");
+    (void)i;
+}
+
+/* Run the connect screen until the user picks. win_w/win_h are the fallback size. */
+static ConnectChoice connect_screen(int win_w, int win_h)
+{
+    ConnectChoice c;
+    int sel = 0, ip_len = 0;
+    int up_prev = 0, dn_prev = 0, en_prev = 0;
+    char ip[64];
+    float mvp[16];
+
+    ip[0] = '\0';
+    c.mode = CHOICE_SINGLE; c.ip[0] = '\0';
+    mat4_identity(mvp);
+
+    /* Prime the edge-detect prevs from the CURRENT key state: the only way in is
+     * the pause-menu "Main Menu" (chosen with Enter), and key state persists across
+     * screens - without this, a still-held Enter would fire on frame 1 and auto-pick
+     * Single Player. Also drain any stale typed text. */
+    plat_poll();
+    up_prev = plat_key_down(PLAT_KEY_UP);
+    dn_prev = plat_key_down(PLAT_KEY_DOWN);
+    en_prev = plat_key_down(PLAT_KEY_ENTER);
+    { char drain[64]; plat_text_poll(drain, (int)sizeof drain); }
+
+    for (;;) {
+        int cw = win_w, ch = win_h, up_now, dn_now, en_now, tn, i;
+        char tb[64];
+        float aspect;
+        double t0 = plat_time_ms();
+
+        plat_poll();
+        if (plat_should_close()) { c.mode = CHOICE_QUIT; return c; }
+
+        plat_get_size(&cw, &ch);
+        if (cw <= 0 || ch <= 0) { cw = win_w; ch = win_h; }
+        aspect = (float)cw / (float)ch;
+
+        up_now = plat_key_down(PLAT_KEY_UP);
+        dn_now = plat_key_down(PLAT_KEY_DOWN);
+        en_now = plat_key_down(PLAT_KEY_ENTER);
+        if (up_now && !up_prev) sel = (sel + 3) % 4;
+        if (dn_now && !dn_prev) sel = (sel + 1) % 4;
+
+        tn = plat_text_poll(tb, (int)sizeof tb);     /* read-and-clear typed chars */
+        if (sel == 2) {                              /* edit the IP only on Join */
+            for (i = 0; i < tn; ++i) {
+                char k = tb[i];
+                if (k == 0x08) { if (ip_len > 0) ip[--ip_len] = '\0'; }
+                else if (ip_len < (int)sizeof ip - 1) { ip[ip_len++] = k; ip[ip_len] = '\0'; }
+            }
+        }
+
+        if (en_now && !en_prev) {
+            if (sel == 0) { c.mode = CHOICE_SINGLE; return c; }
+            if (sel == 1) { c.mode = CHOICE_HOST;   return c; }
+            if (sel == 2 && ip_len > 0) {
+                int j; c.mode = CHOICE_JOIN;
+                for (j = 0; j <= ip_len; ++j) c.ip[j] = ip[j];
+                return c;
+            }
+            if (sel == 3) { c.mode = CHOICE_QUIT;   return c; }
+        }
+        up_prev = up_now; dn_prev = dn_now; en_prev = en_now;
+
+        render_begin(mvp, 1.0f);                     /* clear */
+        render_end();
+        draw_connect_screen(aspect, sel, ip);
+        plat_swap_buffers();
+
+        { double used = plat_time_ms() - t0;         /* ~30 fps cap (no busy spin) */
+          if (used < FRAME_TARGET_MS) { double dl = t0 + FRAME_TARGET_MS; while (plat_time_ms() < dl) {} } }
+    }
 }
 
 int main(void)
@@ -726,6 +841,12 @@ int main(void)
      * seed (below) and does NOT persist (the host's save is canonical). */
     NetState     *net = NULL;
     ChunkSyncCtx  csctx;          /* 0.3: context for the net chunk-sync callbacks */
+
+    /* 0.3 session/connect-menu loop control (see the outer for(;;) below). */
+    int           quit_program  = 0;   /* set by window-close / pause-Quit / screenshot */
+    int           session_test  = 0;   /* VOXEL_SESSIONS leak-test mode                  */
+    long          sessions_left = 0;
+    int           fullscreen_on = 0;   /* persists across sessions (tracks the window)   */
 
     /* Heat simulation (ARCHITECTURE Section 3). Single-chunk: one SimState bound
      * to the resident HOME chunk that carries the lava block. It is bound when
@@ -879,17 +1000,76 @@ int main(void)
      * static grid did - generating, neighbour-wiring, lighting, meshing and
      * uploading every in-range chunk now (the per-frame budget governs only the
      * live loop). */
+    /* Headless connect-screen capture (verification): VOXEL_CONNECT_SHOT=1 with
+     * VOXEL_SHOT renders one connect-screen frame (Join selected, sample IP) to the
+     * PPM and exits, so the menu layout/font is eyeballable without an interactive run. */
+    if (shot_path != NULL && getenv("VOXEL_CONNECT_SHOT")) {
+        float mvp[16];
+        int cw = win_w, ch = win_h;
+        mat4_identity(mvp);
+        plat_poll();
+        plat_get_size(&cw, &ch);
+        if (cw <= 0 || ch <= 0) { cw = win_w; ch = win_h; }
+        render_begin(mvp, 1.0f);
+        render_end();
+        draw_connect_screen((float)cw / (float)ch, 2, "127.0.0.1");
+        if (render_screenshot_ppm(shot_path, cw, ch) == 0)
+            fprintf(stderr, "main: wrote connect-screen screenshot %s\n", shot_path);
+        mesh_buffer_free(&scratch);
+        mesh_buffer_free(&liq_scratch);
+        render_shutdown();
+        return 0;
+    }
+
+    /* ===== 0.3: outer SESSION / connect-menu loop ===================== *
+     * Each iteration sets up a session (world/sim/persist/net), runs the frame
+     * loop, then tears it down; "Main Menu" returns here. Headless / scripted runs
+     * (VOXEL_SHOT, or VOXEL_HOST/VOXEL_CONNECT) bypass the menu and run exactly ONE
+     * session from the env (pre-0.3 behaviour). VOXEL_SESSIONS=N runs N single-
+     * player sessions back-to-back (a leak/double-free check for the loop). */
+    {
+        const char *sess_env = getenv("VOXEL_SESSIONS");
+        session_test  = (sess_env && sess_env[0]) ? 1 : 0;
+        sessions_left = session_test ? strtol(sess_env, NULL, 10) : 0;
+        if (session_test && sessions_left < 1) sessions_left = 1;
+    }
+    quit_program = 0;
+    for (;;) {
+        ConnectChoice choice;
+        int env_single = (shot_path != NULL)
+                       || (getenv("VOXEL_HOST")    && getenv("VOXEL_HOST")[0])
+                       || (getenv("VOXEL_CONNECT") && getenv("VOXEL_CONNECT")[0]);
+        int sframes = 0;
+        if (session_test)    { choice.mode = CHOICE_SINGLE; choice.ip[0] = '\0'; }
+        else if (env_single) { choice.mode = CHOICE_ENV;    choice.ip[0] = '\0'; }
+        else {
+            choice = connect_screen(win_w, win_h);
+            if (choice.mode == CHOICE_QUIT) break;        /* exit program from the menu */
+        }
+
     seed = WORLD_SEED_DEFAULT;
     seed_env = getenv("VOXEL_SEED");
     if (seed_env != NULL && seed_env[0] != '\0')
         seed = (uint64_t)strtoull(seed_env, NULL, 0);
 
     /* 0.3 multiplayer: open the network BEFORE world_init + persist. A CLIENT
-     * completes the handshake here and ADOPTS the host's seed, so it generates
-     * the byte-identical deterministic planet (no map transfer). The handshake
-     * refuses a host whose build (game/gen version) differs. NULL = single-player
-     * (env unset) or a failed/refused join (logged) -> fall back to local seed. */
-    net = net_init_from_env(seed, (uint32_t)VOXEL_VERSION_PACKED, (uint32_t)WG_GEN_VERSION);
+     * completes the handshake here and ADOPTS the host's seed, so it generates the
+     * byte-identical deterministic planet (no map transfer). The source is the
+     * connect-screen choice (Host/Join) or, on the headless/scripted path, the env
+     * (net_init_from_env). A failed Join returns to the menu (continue). */
+    if (choice.mode == CHOICE_ENV) {
+        net = net_init_from_env(seed, (uint32_t)VOXEL_VERSION_PACKED, (uint32_t)WG_GEN_VERSION);
+    } else if (choice.mode == CHOICE_HOST) {
+        net = net_host((unsigned short)NET_DEFAULT_PORT, seed,
+                       (uint32_t)VOXEL_VERSION_PACKED, (uint32_t)WG_GEN_VERSION);
+        if (net) fprintf(stderr, "net: hosting on port %d (seed %016llx)\n",
+                         NET_DEFAULT_PORT, (unsigned long long)seed);
+    } else if (choice.mode == CHOICE_JOIN) {
+        net = net_join_str(choice.ip, (uint32_t)VOXEL_VERSION_PACKED, (uint32_t)WG_GEN_VERSION);
+        if (net == NULL) continue;                        /* connect failed -> back to menu */
+    } else {
+        net = NULL;                                       /* CHOICE_SINGLE */
+    }
     if (net != NULL && net_mode(net) == NET_CLIENT)
         seed = net_seed(net);
     /* cb_gen (on a client) enqueues chunk-sync requests here; init before world_prime. */
@@ -1156,11 +1336,13 @@ int main(void)
     /* 0.3 pause menu. ESC toggles `paused`: the scene freezes + the cursor is
      * freed + the menu draws over the frozen frame. VOXEL_MENU=1 starts paused so
      * a headless VOXEL_SHOT can capture the menu. menu_sel: 0=Resume 1=Fullscreen
-     * 2=Quit. The *_prev flags edge-trigger ESC + the nav keys. */
+     * 2=Main Menu 3=Quit. The *_prev flags edge-trigger ESC + the nav keys.
+     * (fullscreen_on is hoisted to main scope so it tracks the persistent window
+     * state across a Main-Menu round-trip.) */
     int paused        = (getenv("VOXEL_MENU") != NULL);
     int menu_sel      = 0;
-    int fullscreen_on = 0;
     int esc_prev = 0, up_prev = 0, down_prev = 0, enter_prev = 0;
+    sim_accum_ms = 0.0;            /* per-session: don't inherit the prior session's accumulator */
 
     /* The live-session capture-enable above ran unconditionally; if we start
      * paused (VOXEL_MENU), free the cursor to honour the menu's contract. */
@@ -1185,8 +1367,12 @@ int main(void)
 
         /* --- Input: pump the OS queue once per frame, then sample keys --- */
         plat_poll();
-        if (plat_should_close())
-            break;                       /* the window close button always quits */
+        if (plat_should_close()) {
+            quit_program = 1;            /* the window close button quits the program */
+            break;
+        }
+        if (session_test && ++sframes >= 8)
+            break;                       /* VOXEL_SESSIONS leak test: end this session */
 
         /* --- 0.3: pump the network (accept, flush, parse) once per frame --- *
          * ALWAYS (even while paused) so the connection stays alive + peers' edits
@@ -1209,8 +1395,8 @@ int main(void)
                 plat_set_mouse_capture(paused ? 0 : 1);
             }
             if (paused) {
-                if (up_now   && !up_prev)    menu_sel = (menu_sel + 2) % 3;  /* up   */
-                if (down_now && !down_prev)  menu_sel = (menu_sel + 1) % 3;  /* down */
+                if (up_now   && !up_prev)    menu_sel = (menu_sel + 3) % 4;  /* up   */
+                if (down_now && !down_prev)  menu_sel = (menu_sel + 1) % 4;  /* down */
                 if (enter_now && !enter_prev) {
                     if (menu_sel == 0) {                 /* Resume */
                         paused = 0;
@@ -1218,7 +1404,10 @@ int main(void)
                     } else if (menu_sel == 1) {          /* Fullscreen */
                         fullscreen_on = !fullscreen_on;
                         plat_set_fullscreen(fullscreen_on);
-                    } else {                             /* Quit */
+                    } else if (menu_sel == 2) {          /* Main Menu: leave session -> connect screen */
+                        break;                           /* quit_program stays 0 */
+                    } else {                             /* Quit: exit the program */
+                        quit_program = 1;
                         break;
                     }
                 }
@@ -1695,6 +1884,7 @@ int main(void)
                 fprintf(stderr, "main: wrote screenshot %s\n", shot_path);
             else
                 fprintf(stderr, "main: screenshot failed\n");
+            quit_program = 1;            /* headless one-shot: exit after the capture */
             break;
         }
 
@@ -1760,6 +1950,19 @@ int main(void)
     }
     persist_close(persist);      /* close region handles + free the store (last)  */
     net_shutdown(net);           /* 0.3: close sockets + free NetState (NULL-safe) */
+
+    /* ===== end of one session: NULL the per-session pointers so the next loop
+     * iteration starts clean (no stale / double-free), then decide whether to go
+     * back to the connect menu or exit the program. ================================ */
+    world = NULL; sim = NULL; persist = NULL; net = NULL;
+    prog_ring = NULL; prog_state = NULL;
+    stream_ctx.net = NULL;
+    if (quit_program || env_single)
+        break;                                  /* program quit, or one-shot env run */
+    if (session_test && --sessions_left <= 0)
+        break;                                  /* leak test: N sessions done */
+    }   /* ===== outer session / connect-menu loop ===== */
+
     /* Release mouse capture so the cursor reappears on exit (idempotent; a no-op
      * in VOXEL_SHOT mode where capture was never enabled, and the backends also
      * auto-release on window close - this is the belt-and-braces explicit off). */

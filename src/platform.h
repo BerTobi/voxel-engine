@@ -76,6 +76,12 @@ void   plat_set_mouse_capture(int on);
  * (left) and place (right). Returns (0,0) when capture is off / no clicks. */
 void   plat_mouse_buttons(int *left_clicks, int *right_clicks);
 
+/* Read-and-clear typed text since the last call (for UI text fields like a server
+ * IP): printable ASCII (0x20-0x7E) + backspace (0x08); Enter arrives via
+ * PLAT_KEY_ENTER, not here. Copies up to `max` chars into `out` (no NUL), returns
+ * the count. Same read-and-clear idiom as plat_mouse_delta/buttons. */
+int    plat_text_poll(char *out, int max);
+
 /* Toggle borderless fullscreen on (non-zero) / off (0). Idempotent; safe before
  * the window exists (no-op). The backend resizes the drawable to the monitor (and
  * back), and the existing resize handling (ConfigureNotify / WM_SIZE) re-points the

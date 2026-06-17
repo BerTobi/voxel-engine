@@ -58,6 +58,14 @@ typedef struct NetState NetState;
 NetState *net_init_from_env(uint64_t local_seed,
                             uint32_t game_version, uint32_t gen_version);
 
+/* Connect to a host + drive the handshake to completion (bounded wait), so on a
+ * non-NULL return net_seed() is the host's seed. net_join_str accepts "ip" or
+ * "ip:port" (default port). Used by the in-game connect screen. NULL (logged) on
+ * connect/handshake failure -> caller falls back to single-player / the menu. */
+NetState *net_join(const char *ip, unsigned short port,
+                   uint32_t game_version, uint32_t gen_version);
+NetState *net_join_str(const char *ipport, uint32_t game_version, uint32_t gen_version);
+
 /* Explicit constructors (used by net_init_from_env and by tests). Both return
  * immediately with a NON-BLOCKING socket; a client's handshake completes later
  * during net_poll() (poll until net_ready()). NULL on socket-setup failure. */

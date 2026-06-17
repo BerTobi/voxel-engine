@@ -5,6 +5,50 @@ All notable changes to the Voxel Engine. Versioning is Factorio-style
 `PATCH` = save-compatible fixes, `MINOR` = new gameplay/features, `MAJOR` = 1.0
 or a breaking overhaul.
 
+## 0.3.0 — 2026-06-17 — Multiplayer
+
+Play the planet together. 0.3 turns the single-player sandbox into host-authoritative
+**co-op for up to 4 players**, and — to make hosting/joining usable in-game — adds the
+engine's first **text rendering + menus**. Save-compatible with 0.2.x single-player
+worlds (the generator is unchanged); multiplayer requires every peer on the same build
+(the join handshake refuses a game/generator-version mismatch).
+
+The world is a deterministic function of its seed, so joining transfers **nothing but
+the seed** — each machine regenerates the identical planet locally, and only player
+poses and block edits cross the wire. Every feature shipped with an adversarial review
+pass + headless tests; 8 socket/lifecycle defects were found and fixed before release.
+
+### Added
+- **Host-authoritative multiplayer (up to 4).** One player hosts and plays; others join.
+  A version-gated handshake shares the seed (no map download); player **avatars** are
+  relayed and interpolated to hide internet jitter; **block edits** are relayed live;
+  and **on-demand chunk-delta sync** sends a chunk's voxels-that-differ-from-seed when a
+  client streams it in, so a joiner sees the host's *existing* build, not pristine
+  terrain. Single-threaded, non-blocking **TCP**; XP-safe (Winsock2) and Linux (BSD
+  sockets) behind a tiny `net_*` layer. Movement is client-authoritative (trusted
+  friends; no anti-cheat). *(net.c, net_linux.c, net_win32.c, chunksync.c)*
+- **In-game connect screen** — Single Player / Host / **Join (type a server IP)** / Quit
+  — and an in-game **pause menu** (Resume / Fullscreen / **Main Menu** / Quit). ESC opens
+  the pause menu (the window-X still quits) and frees the cursor; **Main Menu** leaves a
+  session and returns to the connect screen so you can host/join/switch without
+  relaunching. *(main.c)*
+- **The engine's first text rendering**: an embedded 8×8 bitmap font + `render_text` /
+  `render_ui_rect` (screen-space, via the overlay shader — no new shader/texture), plus
+  platform **text input** (`plat_text_poll`). The reusable basis for future HUD/UI.
+  *(render.c, platform_linux.c, platform_win32.c)*
+- **In-engine fullscreen toggle** (X11 EWMH / Win32 borderless) + arrow-key/Enter menu
+  navigation. *(platform_*.c)*
+- **Reachability docs + launch wrappers**: `MULTIPLAYER.md` (same-LAN IP / mesh tunnel /
+  port-forward) and `scripts/{host,join}.{sh,bat}` — though hosting/joining is now
+  in-game. All `VOXEL_*` env vars + the scripts remain for headless/CI.
+
+### Changed
+- `main()` is restructured into a **session loop** (connect screen → set up a session →
+  play → Main Menu → tear down → repeat), so a session's world/sim/persist/net are built
+  and freed cleanly each time (verified leak/double-free-free with AddressSanitizer over
+  repeated cycles). Headless/scripted runs (`VOXEL_SHOT`, `VOXEL_HOST`/`VOXEL_CONNECT`)
+  bypass the menu and run exactly one session, preserving the 0.2 behaviour.
+
 ## 0.2.1 — 2026-06-16 — Bug-fix release
 
 Save-compatible with 0.2.0 (no gen/format change). Four defects fixed: two

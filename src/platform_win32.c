@@ -43,6 +43,11 @@ static HGLRC     g_hglrc        = NULL;     /* the GL render context            
 static HMODULE   g_opengl32     = NULL;     /* opengl32.dll, for GL1.1 getproc  */
 static int       g_should_close = 0;
 
+/* Fullscreen: save the windowed style + rect to restore on toggle-off. */
+static int       g_fullscreen   = 0;
+static DWORD     g_saved_style  = 0;
+static RECT      g_saved_rect   = {0, 0, 0, 0};
+
 /* The window class is registered exactly once per process. */
 static const char  *g_class_name   = "VoxelEngineWindow";
 static int           g_class_inited = 0;
@@ -99,6 +104,9 @@ static int vk_to_plat(WPARAM vk)
     case '4':        return PLAT_KEY_4;
     case '5':        return PLAT_KEY_5;
     case 'F':        return PLAT_KEY_F;   /* fly/walk toggle */
+    case VK_UP:      return PLAT_KEY_UP;     /* pause-menu navigation */
+    case VK_DOWN:    return PLAT_KEY_DOWN;
+    case VK_RETURN:  return PLAT_KEY_ENTER;
     default:         return -1;
     }
 }
@@ -582,6 +590,40 @@ void plat_mouse_buttons(int *left_clicks, int *right_clicks)
     if (right_clicks) *right_clicks = g_mb_right;
     g_mb_left = 0;
     g_mb_right = 0;
+}
+
+void plat_set_fullscreen(int on)
+{
+    on = on ? 1 : 0;
+    if (!g_hwnd) return;
+    if (on == g_fullscreen) return;                 /* idempotent */
+
+    if (on) {
+        /* Save the windowed style + outer rect, then switch to a borderless popup
+         * covering the window's monitor. WM_SIZE re-points glViewport. */
+        HMONITOR mon = MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTOPRIMARY);
+        MONITORINFO mi;
+        mi.cbSize = sizeof mi;
+        if (!GetMonitorInfo(mon, &mi)) return;       /* leave windowed on failure */
+        g_saved_style = (DWORD)GetWindowLongA(g_hwnd, GWL_STYLE);
+        GetWindowRect(g_hwnd, &g_saved_rect);
+        SetWindowLongA(g_hwnd, GWL_STYLE, (LONG)(WS_POPUP | WS_VISIBLE));
+        SetWindowPos(g_hwnd, HWND_TOP,
+                     mi.rcMonitor.left, mi.rcMonitor.top,
+                     mi.rcMonitor.right - mi.rcMonitor.left,
+                     mi.rcMonitor.bottom - mi.rcMonitor.top,
+                     SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+        g_fullscreen = 1;
+    } else {
+        /* Restore the saved windowed style + rect. */
+        SetWindowLongA(g_hwnd, GWL_STYLE, (LONG)g_saved_style);
+        SetWindowPos(g_hwnd, HWND_TOP,
+                     g_saved_rect.left, g_saved_rect.top,
+                     g_saved_rect.right - g_saved_rect.left,
+                     g_saved_rect.bottom - g_saved_rect.top,
+                     SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+        g_fullscreen = 0;
+    }
 }
 
 #endif /* _WIN32 */

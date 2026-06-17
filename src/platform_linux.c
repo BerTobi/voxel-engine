@@ -57,6 +57,11 @@ static GLXContext g_ctx        = NULL;
 static Atom       g_wm_delete  = 0;
 static int        g_should_close = 0;
 
+/* Fullscreen (EWMH): toggled via a _NET_WM_STATE client message to the root. */
+static Atom       g_net_wm_state = 0;
+static Atom       g_net_wm_state_fullscreen = 0;
+static int        g_fullscreen   = 0;
+
 /* ---- Mouse-look (relative pointer) state --------------------------------- *
  * Recenter-and-hide scheme, pure Xlib (no XFixes / XInput2): while captured we
  * hide the pointer with an invisible 1x1 cursor and warp it back to the window
@@ -96,6 +101,9 @@ static int keysym_to_plat(KeySym ks)
     case XK_4:           return PLAT_KEY_4;
     case XK_5:           return PLAT_KEY_5;
     case XK_f: case XK_F: return PLAT_KEY_F;
+    case XK_Up:          return PLAT_KEY_UP;
+    case XK_Down:        return PLAT_KEY_DOWN;
+    case XK_Return: case XK_KP_Enter: return PLAT_KEY_ENTER;
     default:             return -1;
     }
 }
@@ -216,6 +224,10 @@ int plat_create_window(int w, int h, const char *title)
     /* Subscribe to the window-manager close button. */
     g_wm_delete = XInternAtom(g_dpy, "WM_DELETE_WINDOW", False);
     XSetWMProtocols(g_dpy, g_win, &g_wm_delete, 1);
+
+    /* EWMH fullscreen atoms (for plat_set_fullscreen). */
+    g_net_wm_state            = XInternAtom(g_dpy, "_NET_WM_STATE", False);
+    g_net_wm_state_fullscreen = XInternAtom(g_dpy, "_NET_WM_STATE_FULLSCREEN", False);
 
     /* Try the ARB path for an explicit >=2.1 compatibility context; fall back
      * to the legacy glXCreateContext (already a compatibility context). */
@@ -487,6 +499,30 @@ void plat_set_mouse_capture(int on)
         XUngrabPointer(g_dpy, CurrentTime);
         XFlush(g_dpy);
     }
+}
+
+void plat_set_fullscreen(int on)
+{
+    XEvent ev;
+    on = on ? 1 : 0;
+    if (!g_dpy || !g_win || !g_net_wm_state || !g_net_wm_state_fullscreen) return;
+    if (on == g_fullscreen) return;                 /* idempotent */
+    g_fullscreen = on;
+
+    /* Ask the window manager to add/remove _NET_WM_STATE_FULLSCREEN (EWMH). The
+     * WM resizes the drawable; our ConfigureNotify handler re-points glViewport. */
+    memset(&ev, 0, sizeof ev);
+    ev.xclient.type         = ClientMessage;
+    ev.xclient.window       = g_win;
+    ev.xclient.message_type = g_net_wm_state;
+    ev.xclient.format       = 32;
+    ev.xclient.data.l[0]    = on ? 1 : 0;           /* 1 = _NET_WM_STATE_ADD, 0 = REMOVE */
+    ev.xclient.data.l[1]    = (long)g_net_wm_state_fullscreen;
+    ev.xclient.data.l[2]    = 0;
+    ev.xclient.data.l[3]    = 1;                     /* source: normal application */
+    XSendEvent(g_dpy, RootWindow(g_dpy, DefaultScreen(g_dpy)), False,
+               SubstructureRedirectMask | SubstructureNotifyMask, &ev);
+    XFlush(g_dpy);
 }
 
 #endif /* _WIN32 */

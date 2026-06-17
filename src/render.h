@@ -85,6 +85,23 @@ void render_avatar(const float pos[3], const float color[3]);
  * program failed to build. */
 void render_crosshair(float aspect);
 
+/* ---- 2D UI primitives (0.3 pause menu; screen-space, NDC coords) --------- *
+ * Drawn AFTER render_end, before plat_swap_buffers (over the scene), via the
+ * overlay program. Coordinates are NDC: x,y in [-1,1] (y up), the screen centre
+ * is (0,0). Colour is RGBA 0..1 (a<1 blends over the scene). No-ops if the
+ * overlay program failed to build. */
+
+/* A filled rectangle from (x0,y0) to (x1,y1). Use a full-screen (-1,-1)..(1,1)
+ * low-alpha rect to dim the scene behind a menu. */
+void render_ui_rect(float x0, float y0, float x1, float y1,
+                    float r, float g, float b, float a);
+
+/* Draw `s` (printable ASCII) with an 8x8 bitmap font, top-left at NDC (x,y).
+ * `cell` is the glyph HEIGHT in NDC; `aspect` (width/height) keeps glyphs square.
+ * Advances left-to-right; '\n' starts a new line. */
+void render_text(float x, float y, float cell, float aspect,
+                 float r, float g, float b, float a, const char *s);
+
 /* Release GL resources (programs, atlas texture, all pooled VBOs/IBOs). */
 void render_shutdown(void);
 

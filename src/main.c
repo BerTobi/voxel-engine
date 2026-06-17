@@ -667,6 +667,31 @@ static void mark_home_modified(Chunk *c)
         c->flags |= CHUNK_MODIFIED;
 }
 
+/* ---- 0.3 pause menu (screen-space, drawn over the frozen frame) ---------- *
+ * NDC: x,y in [-1,1], centre (0,0), y up. `aspect` keeps the font square. The
+ * coordinates are tuned by eye against the headless VOXEL_MENU screenshot. */
+static void draw_pause_menu(float aspect, int sel, int fullscreen_on)
+{
+    const char *labels[3];
+    const float iy[3] = { 0.20f, 0.02f, -0.16f };   /* item baselines (text tops) */
+    int i;
+
+    render_ui_rect(-1.0f, -1.0f, 1.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.55f);      /* dim scene  */
+    render_ui_rect(-0.46f, -0.46f, 0.46f, 0.56f, 0.10f, 0.11f, 0.15f, 0.92f); /* panel    */
+    render_text(-0.20f, 0.50f, 0.11f, aspect, 1.0f, 0.85f, 0.20f, 1.0f, "PAUSED");
+
+    labels[0] = "Resume";
+    labels[1] = fullscreen_on ? "Fullscreen: On" : "Fullscreen: Off";
+    labels[2] = "Quit";
+    for (i = 0; i < 3; ++i) {
+        if (i == sel)                                                       /* selection bar */
+            render_ui_rect(-0.40f, iy[i] - 0.085f, 0.40f, iy[i] + 0.035f, 0.22f, 0.42f, 0.80f, 0.85f);
+        render_text(-0.34f, iy[i], 0.075f, aspect, 1.0f, 1.0f, 1.0f, 1.0f, labels[i]);
+    }
+    render_text(-0.40f, -0.30f, 0.04f, aspect, 0.65f, 0.65f, 0.70f, 1.0f,
+                "Up/Down + Enter    Esc resumes");
+}
+
 int main(void)
 {
     const int win_w = 1024;
@@ -1128,6 +1153,20 @@ int main(void)
 
     int sel_mat = 0;   /* placement-material index into PLACE_MATS (0 = stone) */
 
+    /* 0.3 pause menu. ESC toggles `paused`: the scene freezes + the cursor is
+     * freed + the menu draws over the frozen frame. VOXEL_MENU=1 starts paused so
+     * a headless VOXEL_SHOT can capture the menu. menu_sel: 0=Resume 1=Fullscreen
+     * 2=Quit. The *_prev flags edge-trigger ESC + the nav keys. */
+    int paused        = (getenv("VOXEL_MENU") != NULL);
+    int menu_sel      = 0;
+    int fullscreen_on = 0;
+    int esc_prev = 0, up_prev = 0, down_prev = 0, enter_prev = 0;
+
+    /* The live-session capture-enable above ran unconditionally; if we start
+     * paused (VOXEL_MENU), free the cursor to honour the menu's contract. */
+    if (shot_path == NULL && paused)
+        plat_set_mouse_capture(0);
+
     for (;;) {
         double frame_start = plat_time_ms();
         double real_dt_ms  = frame_start - frame_prev_ms;
@@ -1146,13 +1185,46 @@ int main(void)
 
         /* --- Input: pump the OS queue once per frame, then sample keys --- */
         plat_poll();
-        if (plat_should_close() || plat_key_down(PLAT_KEY_ESC))
-            break;
+        if (plat_should_close())
+            break;                       /* the window close button always quits */
 
         /* --- 0.3: pump the network (accept, flush, parse) once per frame --- *
-         * Populates the avatar table + inbound-edit queue for this frame. No-op
-         * (NULL) in single-player. A client that lost the host drops to local. */
+         * ALWAYS (even while paused) so the connection stays alive + peers' edits
+         * keep applying; a silent client would otherwise be dropped by the host.
+         * No-op (NULL) in single-player. A client that lost the host drops to local. */
         net_poll(net);
+
+        /* --- 0.3 pause menu: ESC toggles it (no longer quits); arrow keys + Enter
+         * navigate while paused. Live only (VOXEL_SHOT has no input). ESC opening
+         * the menu frees the cursor so you can drag-resize / use the WM; resuming
+         * re-grabs it (which also zeroes the mouse delta -> no camera snap). */
+        if (shot_path == NULL) {
+            int esc_now   = plat_key_down(PLAT_KEY_ESC);
+            int up_now    = plat_key_down(PLAT_KEY_UP);
+            int down_now  = plat_key_down(PLAT_KEY_DOWN);
+            int enter_now = plat_key_down(PLAT_KEY_ENTER);
+            if (esc_now && !esc_prev) {
+                paused = !paused;
+                menu_sel = 0;
+                plat_set_mouse_capture(paused ? 0 : 1);
+            }
+            if (paused) {
+                if (up_now   && !up_prev)    menu_sel = (menu_sel + 2) % 3;  /* up   */
+                if (down_now && !down_prev)  menu_sel = (menu_sel + 1) % 3;  /* down */
+                if (enter_now && !enter_prev) {
+                    if (menu_sel == 0) {                 /* Resume */
+                        paused = 0;
+                        plat_set_mouse_capture(1);
+                    } else if (menu_sel == 1) {          /* Fullscreen */
+                        fullscreen_on = !fullscreen_on;
+                        plat_set_fullscreen(fullscreen_on);
+                    } else {                             /* Quit */
+                        break;
+                    }
+                }
+            }
+            esc_prev = esc_now; up_prev = up_now; down_prev = down_now; enter_prev = enter_now;
+        }
 
         /* --- FPS free-look: mouse turns, WASD moves relative to facing ---- *
          * On a LIVE session read the relative mouse motion accumulated since the
@@ -1169,8 +1241,11 @@ int main(void)
          * Only the EYE (cam_pos) translates - the look direction comes from
          * yaw/pitch, so cam_target is recomputed as cam_pos + forward AFTER the
          * move. VOXEL_FLY adds a constant +X advance each frame for headless
-         * streaming capture (the player roaming so leading/trailing edges show).*/
-        {
+         * streaming capture (the player roaming so leading/trailing edges show).
+         * 0.3: the ENTIRE input/camera/movement/edit block is gated on !paused, so
+         * the menu freezes the view (cam_pos/target/world_up keep last frame's
+         * values) and ignores look/move/break/place while open. */
+        if (!paused) {
             Vec3 fwd;        /* full 3D look direction (heading tilted by pitch) */
             Vec3 fwd_flat;   /* tangent forward on the surface (the heading)     */
             Vec3 right;
@@ -1374,7 +1449,7 @@ int main(void)
             nctx.w = world; nctx.s = sim;
             net_drain_edits(net, apply_net_edit, &nctx);
         }
-        if (net != NULL) {
+        if (net != NULL && !paused) {        /* don't broadcast a pose while in the menu */
             float npos[3] = { cam_pos.x, cam_pos.y, cam_pos.z };
             float nhd[3]  = { cam_heading.x, cam_heading.y, cam_heading.z };
             net_send_pose(net, npos, nhd);
@@ -1398,7 +1473,7 @@ int main(void)
          * was just filled by cb_gen for any chunks this stream step generated; the
          * host replies and net_poll patches them in over the next frames. Bounded
          * so the join-time prime burst (~window size) paces out smoothly. */
-        if (net != NULL && net_mode(net) == NET_CLIENT) {
+        if (net != NULL && net_mode(net) == NET_CLIENT && !paused) {
             int sent = 0;
             while (stream_ctx.req_count > 0 && sent < 64) {
                 net_request_chunk(net, stream_ctx.req_cx[stream_ctx.req_head],
@@ -1460,7 +1535,7 @@ int main(void)
          * slices (one sim_tick each) up to SIM_MAX_TICKS_PER_FRAME. The cap stops
          * a catch-up spiral. Guarded by the sim being BOUND to the still-resident
          * HOME chunk (the crash-avoidance rule: never tick a recycled slab). */
-        if (sim->chunk != NULL
+        if (!paused && sim->chunk != NULL
             && world_get(world, HOME_CX, HOME_CY, HOME_CZ) == sim->chunk) {
             sim_accum_ms += real_dt_ms;
             {
@@ -1600,6 +1675,8 @@ int main(void)
                 render_highlight_voxel(hl_x, hl_y, hl_z);
             if (shot_path == NULL)
                 render_crosshair(aspect);
+            if (paused)                          /* 0.3: pause menu over the frozen scene */
+                draw_pause_menu(aspect, menu_sel, fullscreen_on);
         }
 
         /* Headless one-shot capture: grab the back buffer GL just drew (before

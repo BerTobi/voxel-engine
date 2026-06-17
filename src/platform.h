@@ -76,6 +76,12 @@ void   plat_set_mouse_capture(int on);
  * (left) and place (right). Returns (0,0) when capture is off / no clicks. */
 void   plat_mouse_buttons(int *left_clicks, int *right_clicks);
 
+/* Toggle borderless fullscreen on (non-zero) / off (0). Idempotent; safe before
+ * the window exists (no-op). The backend resizes the drawable to the monitor (and
+ * back), and the existing resize handling (ConfigureNotify / WM_SIZE) re-points the
+ * GL viewport, so the view follows automatically. (0.3: pause-menu fullscreen.) */
+void   plat_set_fullscreen(int on);
+
 /* ---- Keycodes (engine-portable; the backend maps OS scancodes to these) -- */
 #define PLAT_KEY_ESC     0
 #define PLAT_KEY_W       1
@@ -90,6 +96,9 @@ void   plat_mouse_buttons(int *left_clicks, int *right_clicks);
 #define PLAT_KEY_4      10
 #define PLAT_KEY_5      11
 #define PLAT_KEY_F      12   /* toggle fly / walk mode (debug)                   */
-#define PLAT_KEY_COUNT  13   /* size of the backend's key-state array */
+#define PLAT_KEY_UP     13   /* pause-menu navigation (0.3)                      */
+#define PLAT_KEY_DOWN   14
+#define PLAT_KEY_ENTER  15
+#define PLAT_KEY_COUNT  16   /* size of the backend's key-state array */
 
 #endif /* PLATFORM_H */

@@ -36,6 +36,13 @@
 #define NET_HDR       3             /* u8 type + u16 len                           */
 #define NET_HANDSHAKE_TIMEOUT_MS 6000
 
+/* Pose interpolation (hide internet jitter): keep a short ring of timestamped
+ * samples per remote player and render them slightly in the PAST so there is
+ * always a pair to interpolate between. On a LAN the delay is imperceptible. */
+#define NET_POSE_HIST            8      /* timestamped samples kept per player        */
+#define NET_INTERP_DELAY_MS      100.0  /* render remote players this far in the past */
+#define NET_POSE_MIN_INTERVAL_MS 30.0   /* outbound pose cap (~33 Hz)                  */
+
 typedef struct { int wx, wy, wz; uint32_t voxel; } NetEdit;
 
 typedef struct {
@@ -51,12 +58,14 @@ typedef struct {
     unsigned char sbuf[NET_SEND_CAP];
 } Conn;
 
+typedef struct { double t; float pos[3], hd[3]; } PoseSample;
+
 typedef struct {
-    int   active;
-    int   id;
-    float pos[3];
-    float heading[3];
-    float color[3];
+    int        active;
+    int        id;
+    float      color[3];
+    PoseSample hist[NET_POSE_HIST];   /* hist[0] = oldest .. hist[hcount-1] = newest */
+    int        hcount;
 } Player;
 
 struct NetState {
@@ -75,6 +84,7 @@ struct NetState {
 
     NetEdit  edits[NET_EDIT_CAP];
     int      ehead, ecount;
+    double   last_pose_ms;                    /* outbound pose throttle */
 };
 
 /* Stable per-id avatar colour (id 0 = host). */
@@ -132,13 +142,21 @@ static void broadcast(NetState *n, uint8_t type, const unsigned char *payload, i
 static void player_update(NetState *n, int id, const float pos[3], const float hd[3])
 {
     Player *pl;
+    PoseSample *s;
     if (id < 0 || id >= (int)NET_MAX_PLAYERS) return;
     pl = &n->players[id];
     pl->active = 1;
     pl->id     = id;
-    memcpy(pl->pos, pos, sizeof pl->pos);
-    memcpy(pl->heading, hd, sizeof pl->heading);
     memcpy(pl->color, PLAYER_COLORS[id], sizeof pl->color);
+
+    if (pl->hcount == NET_POSE_HIST) {                 /* ring full: drop oldest */
+        memmove(&pl->hist[0], &pl->hist[1], sizeof(PoseSample) * (NET_POSE_HIST - 1));
+        pl->hcount = NET_POSE_HIST - 1;
+    }
+    s = &pl->hist[pl->hcount++];
+    s->t = net_sys_now_ms();
+    memcpy(s->pos, pos, sizeof s->pos);
+    memcpy(s->hd,  hd,  sizeof s->hd);
 }
 
 static void edit_push(NetState *n, int wx, int wy, int wz, uint32_t voxel)
@@ -211,7 +229,7 @@ static void on_message(NetState *n, Conn *c, uint8_t type, const unsigned char *
         if (len != LEN_LEAVE) { c->dead = 1; return; }
         id = get_u8(&p);
         if (id >= 0 && id < (int)NET_MAX_PLAYERS && id != n->local_id)
-            n->players[id].active = 0;
+            memset(&n->players[id], 0, sizeof n->players[id]);  /* clear ring too (id reuse) */
         break;
     }
     default:
@@ -322,8 +340,11 @@ static void reap(NetState *n)
         if (!c->used || !c->dead) continue;
         if (n->mode == NET_HOST) {
             unsigned char idb = (unsigned char)c->id;
-            n->id_used[c->id]      = 0;
-            n->players[c->id].active = 0;
+            n->id_used[c->id] = 0;
+            /* Clear the WHOLE Player (incl. the pose-sample ring), not just
+             * active: ids are reused (alloc_id), and a leftover ring would make a
+             * rejoining occupant interpolate in from the previous one's position. */
+            memset(&n->players[c->id], 0, sizeof n->players[c->id]);
             net_sys_close(c->sock);
             c->used = 0;
             broadcast(n, MSG_LEAVE, &idb, LEN_LEAVE, NULL);  /* tell remaining clients */
@@ -429,12 +450,17 @@ void net_send_pose(NetState *n, const float pos[3], const float hd[3])
 {
     unsigned char buf[LEN_POSE], *q = buf;
     int k;
+    double now;
     if (n == NULL || n->mode == NET_OFF) return;
     if (n->local_id < 0) return;                         /* not handshaked yet */
+    now = net_sys_now_ms();
+    if (now - n->last_pose_ms < NET_POSE_MIN_INTERVAL_MS) return;   /* ~33 Hz cap */
+    n->last_pose_ms = now;
     put_u8(&q, (uint8_t)n->local_id);
     for (k = 0; k < 3; ++k) put_f32(&q, pos[k]);
     for (k = 0; k < 3; ++k) put_f32(&q, hd[k]);
-    if (n->mode == NET_HOST) player_update(n, 0, pos, hd);   /* keep own entry current */
+    /* The host's own entry (players[0]) is never rendered (avatar iteration skips
+     * local_id), so there is no self-update here. */
     broadcast(n, MSG_POSE, buf, LEN_POSE, NULL);             /* host->clients, client->host */
 }
 
@@ -469,6 +495,54 @@ int net_avatar_count(const NetState *n)
     return count;
 }
 
+static void lerp3(float out[3], const float a[3], const float b[3], float t)
+{
+    int k;
+    for (k = 0; k < 3; ++k) out[k] = a[k] + (b[k] - a[k]) * t;
+}
+
+/* Fill pos/hd for a remote player by snapshot interpolation: sample the ring at
+ * (now - NET_INTERP_DELAY_MS), lerping the two bracketing samples. Behind the
+ * buffer -> oldest; ahead of it (peer went quiet) -> hold newest (no
+ * extrapolation). One sample -> that sample. */
+static void avatar_interp(const Player *pl, float pos[3], float hd[3])
+{
+    int last = pl->hcount - 1, i;
+    double target;
+    if (pl->hcount <= 0) {
+        if (pos) { pos[0] = pos[1] = pos[2] = 0.0f; }
+        if (hd)  { hd[0] = hd[1] = hd[2] = 0.0f; }
+        return;
+    }
+    if (pl->hcount == 1) {
+        if (pos) memcpy(pos, pl->hist[0].pos, sizeof pl->hist[0].pos);
+        if (hd)  memcpy(hd,  pl->hist[0].hd,  sizeof pl->hist[0].hd);
+        return;
+    }
+    target = net_sys_now_ms() - NET_INTERP_DELAY_MS;
+    if (target <= pl->hist[0].t) {                 /* behind the buffer -> oldest */
+        if (pos) memcpy(pos, pl->hist[0].pos, sizeof pl->hist[0].pos);
+        if (hd)  memcpy(hd,  pl->hist[0].hd,  sizeof pl->hist[0].hd);
+        return;
+    }
+    if (target >= pl->hist[last].t) {              /* ahead -> hold newest */
+        if (pos) memcpy(pos, pl->hist[last].pos, sizeof pl->hist[last].pos);
+        if (hd)  memcpy(hd,  pl->hist[last].hd,  sizeof pl->hist[last].hd);
+        return;
+    }
+    for (i = 0; i < last; ++i) {
+        if (target >= pl->hist[i].t && target < pl->hist[i + 1].t) {
+            double span = pl->hist[i + 1].t - pl->hist[i].t;
+            float  a    = span > 0.0 ? (float)((target - pl->hist[i].t) / span) : 0.0f;
+            if (pos) lerp3(pos, pl->hist[i].pos, pl->hist[i + 1].pos, a);
+            if (hd)  lerp3(hd,  pl->hist[i].hd,  pl->hist[i + 1].hd,  a);
+            return;
+        }
+    }
+    if (pos) memcpy(pos, pl->hist[last].pos, sizeof pl->hist[last].pos);  /* unreachable guard */
+    if (hd)  memcpy(hd,  pl->hist[last].hd,  sizeof pl->hist[last].hd);
+}
+
 int net_get_avatar(const NetState *n, int idx,
                    float pos[3], float hd[3], int *id, float color[3])
 {
@@ -478,10 +552,9 @@ int net_get_avatar(const NetState *n, int idx,
         const Player *pl = &n->players[i];
         if (!pl->active || i == n->local_id) continue;
         if (seen == idx) {
-            if (pos)   memcpy(pos, pl->pos, sizeof pl->pos);
-            if (hd)    memcpy(hd,  pl->heading, sizeof pl->heading);
-            if (color) memcpy(color, pl->color, sizeof pl->color);
             if (id)    *id = pl->id;
+            if (color) memcpy(color, pl->color, sizeof pl->color);
+            avatar_interp(pl, pos, hd);
             return 1;
         }
         seen++;

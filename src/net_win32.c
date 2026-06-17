@@ -135,9 +135,19 @@ void net_sys_sleep_ms(int ms)
 
 double net_sys_now_ms(void)
 {
-    /* GetTickCount: ms since boot, 32-bit (wraps ~49.7 days). Fine for the small
-     * RELATIVE idle windows we measure; XP-safe (GetTickCount64 is Vista+). */
-    return (double)GetTickCount();
+    /* GetTickCount is 32-bit ms-since-boot and wraps every ~49.7 days. Cast to
+     * double naively it would jump BACKWARD at the wrap, which would wedge the
+     * pose throttle (now - last < 30 forever -> a frozen avatar for ~49.7 days)
+     * and misorder the interpolation ring. Accumulate each wrap so the returned
+     * value is MONOTONIC. XP-safe (GetTickCount64 is Vista+); the engine is
+     * single-threaded and polls every frame, so these statics are fine and a full
+     * wrap can never be missed between calls. */
+    static DWORD  last = 0;
+    static double base = 0.0;
+    DWORD now = GetTickCount();
+    if (now < last) base += 4294967296.0;   /* 2^32 ms: the counter wrapped */
+    last = now;
+    return base + (double)now;
 }
 
 #endif /* _WIN32 */

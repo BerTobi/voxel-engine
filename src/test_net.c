@@ -29,6 +29,13 @@ static void capture_edit(int wx, int wy, int wz, uint32_t v, void *u)
     g_dcount++; g_dwx = wx; g_dwy = wy; g_dwz = wz; g_dvox = v;
 }
 
+static int g_burst_n;
+static void count_edit(int wx, int wy, int wz, uint32_t v, void *u)
+{
+    (void)wx; (void)wy; (void)wz; (void)v; (void)u;
+    g_burst_n++;
+}
+
 static void pump(NetState *a, NetState *b, int iters)
 {
     int i;
@@ -131,24 +138,122 @@ int main(void)
         check("empty drain is a no-op", g_dcount == 0, NULL);
     }
 
-    /* BACKPRESSURE regression: a burst of many valid poses arriving in one read
+    /* BACKPRESSURE regression: a burst of many valid frames arriving in one read
      * must NOT drop the link. (conn_recv used to kill a peer the instant rbuf
      * filled to NET_RECV_CAP, before parse_messages ran - so ~8 KB of perfectly
-     * good frames disconnected an honest peer.) 500 poses = 14000 B > the 8192 B
-     * recv buffer, so this fills + overruns it in one flush. */
+     * good frames disconnected an honest peer.) EDITs are unthrottled (poses are
+     * now ~33 Hz-capped), so 600 edits = 600*19 = 11400 B > the 8192 B recv
+     * buffer, overrunning it in one flush. */
     {
-        float bp[3], bh[3] = { 0.0f, 1.0f, 0.0f };
-        float ap[3], ah[3], ac[3]; int aid, k;
-        for (k = 0; k < 500; ++k) { bp[0] = (float)k; bp[1] = 64.0f; bp[2] = 8.5f; net_send_pose(client, bp, bh); }
-        pump(host, client, 12);
-        check("host survived a 14 KB valid-pose burst (link alive)", net_avatar_count(host) == 1, NULL);
-        if (net_get_avatar(host, 0, ap, ah, &aid, ac))
-            check("host parsed the whole burst (last pose applied)", ap[0] == 499.0f, NULL);
-        else check("host avatar after burst", 0, "client was dropped (backpressure kill)");
+        int k;
+        { float bp[3] = { 1.0f, 64.0f, 8.5f }, bh[3] = { 0.0f, 1.0f, 0.0f };  /* one pose -> host has our avatar */
+          net_send_pose(client, bp, bh); pump(host, client, 4); }
+        for (k = 0; k < 600; ++k) net_send_edit(client, k, 64, 8, 0xAB000000u | (uint32_t)k);
+        pump(host, client, 20);
+        check("host survived an 11 KB valid-edit burst (link alive)", net_avatar_count(host) == 1, NULL);
+        g_burst_n = 0;
+        net_drain_edits(host, count_edit, NULL);
+        check("host drained the entire burst (no frames lost)", g_burst_n == 600, NULL);
     }
 
     net_shutdown(client);
     net_shutdown(host);
+
+    /* MULTI-CLIENT (4-player): 1 host + 3 clients - distinct ids, everyone sees
+     * everyone (relay), an edit reaches all peers EXCEPT its sender, 4th refused. */
+    {
+        NetState *mh = NULL, *mc[3];
+        unsigned short mp;
+        int j, q;
+        mc[0] = mc[1] = mc[2] = NULL;
+        mp = host_on_free_port(&mh, SEED, GV, GEN, 28810);
+        if (mh) {
+            int ready, ids_ok, seen[NET_MAX_PLAYERS];
+            for (j = 0; j < 3; ++j) mc[j] = net_client("127.0.0.1", mp, GV, GEN);
+            for (q = 0; q < 900; ++q) {
+                ready = 0; net_poll(mh);
+                for (j = 0; j < 3; ++j) { net_poll(mc[j]); if (net_ready(mc[j])) ready++; }
+                if (ready == 3) break;
+                net_sys_sleep_ms(1);
+            }
+            ready = 0; for (j = 0; j < 3; ++j) ready += net_ready(mc[j]) ? 1 : 0;
+            check("all 3 clients handshaked", ready == 3, NULL);
+
+            for (j = 0; j < (int)NET_MAX_PLAYERS; ++j) seen[j] = 0;
+            ids_ok = 1;
+            for (j = 0; j < 3; ++j) {
+                int id = net_local_id(mc[j]);
+                if (id >= 1 && id < (int)NET_MAX_PLAYERS && !seen[id]) seen[id] = 1;
+                else ids_ok = 0;
+            }
+            check("clients got distinct ids in 1..3", ids_ok, NULL);
+
+            /* one pose each (throttle lets the first through), let it propagate */
+            { float p[3] = { 0.0f, 64.0f, 8.0f }, h[3] = { 0.0f, 1.0f, 0.0f }; net_send_pose(mh, p, h); }
+            for (j = 0; j < 3; ++j) { float p[3] = { (float)(j + 1), 64.0f, 8.0f }, h[3] = { 0.0f, 1.0f, 0.0f }; net_send_pose(mc[j], p, h); }
+            for (q = 0; q < 40; ++q) { net_poll(mh); for (j = 0; j < 3; ++j) net_poll(mc[j]); net_sys_sleep_ms(1); }
+            check("host sees 3 client avatars", net_avatar_count(mh) == 3, NULL);
+            { int allsee = 1; for (j = 0; j < 3; ++j) if (net_avatar_count(mc[j]) != 3) allsee = 0;
+              check("each client sees 3 avatars (host + 2 peers)", allsee, NULL); }
+
+            /* edit from client 0 -> host + clients 1,2 receive it; client 0 does NOT */
+            net_send_edit(mc[0], 7, 7, 7, 0x77u);
+            for (q = 0; q < 25; ++q) { net_poll(mh); for (j = 0; j < 3; ++j) net_poll(mc[j]); net_sys_sleep_ms(1); }
+            { int a, b, c;
+              g_burst_n = 0; net_drain_edits(mh,    count_edit, NULL); a = g_burst_n;
+              g_burst_n = 0; net_drain_edits(mc[1], count_edit, NULL); b = g_burst_n;
+              g_burst_n = 0; net_drain_edits(mc[2], count_edit, NULL); c = g_burst_n;
+              check("host + the 2 non-sender clients each got the edit", a == 1 && b == 1 && c == 1, NULL);
+              g_burst_n = 0; net_drain_edits(mc[0], count_edit, NULL);
+              check("the sender did NOT get its own edit echoed back", g_burst_n == 0, NULL); }
+
+            /* a 4th client is refused: only 3 client slots exist */
+            { NetState *c4 = net_client("127.0.0.1", mp, GV, GEN);
+              for (q = 0; q < 400 && !(net_ready(c4) || net_failed(c4)); ++q) { net_poll(mh); net_poll(c4); net_sys_sleep_ms(1); }
+              check("a 4th client is refused (slots full)", !net_ready(c4), NULL);
+              net_shutdown(c4); }
+
+            for (j = 0; j < 3; ++j) net_shutdown(mc[j]);
+            net_shutdown(mh);
+        } else printf("SKIP: 4-player test (no free port)\n");
+    }
+
+    /* RING-RESET regression: when a player leaves and its id is reused, the new
+     * occupant must NOT interpolate in from the previous occupant's stale samples.
+     * A joins far away + fills its ring, leaves; B reuses the id and sends one
+     * pose nearby - B's avatar must read exactly B's position, not a blend. */
+    {
+        NetState *rh = NULL;
+        unsigned short rp = host_on_free_port(&rh, SEED, GV, GEN, 28840);
+        if (rh) {
+            NetState *a = net_client("127.0.0.1", rp, GV, GEN);
+            int q, z, idA;
+            for (q = 0; q < 600 && !(net_ready(a) || net_failed(a)); ++q) { net_poll(rh); net_poll(a); net_sys_sleep_ms(1); }
+            idA = net_local_id(a);
+            check("ring-reset: client A joined", net_ready(a), NULL);
+            for (z = 0; z < 4; ++z) {                       /* fill A's ring far away */
+                float p[3] = { 1000.0f, 1000.0f, 1000.0f }, h[3] = { 0.0f, 1.0f, 0.0f };
+                net_send_pose(a, p, h);
+                for (q = 0; q < 3; ++q) { net_poll(rh); net_poll(a); }
+                net_sys_sleep_ms(35);                       /* > throttle interval */
+            }
+            net_shutdown(a);                                /* A leaves -> host reaps idA */
+            for (q = 0; q < 60; ++q) { net_poll(rh); net_sys_sleep_ms(2); }
+            {
+                NetState *b = net_client("127.0.0.1", rp, GV, GEN);
+                float ap[3], ah[3], ac[3]; int aid;
+                for (q = 0; q < 600 && !(net_ready(b) || net_failed(b)); ++q) { net_poll(rh); net_poll(b); net_sys_sleep_ms(1); }
+                check("ring-reset: B reused A's freed id", net_local_id(b) == idA, NULL);
+                { float p[3] = { 5.0f, 64.0f, 8.0f }, h[3] = { 0.0f, 1.0f, 0.0f }; net_send_pose(b, p, h); }
+                for (q = 0; q < 8; ++q) { net_poll(rh); net_poll(b); net_sys_sleep_ms(1); }
+                if (net_get_avatar(rh, 0, ap, ah, &aid, ac))
+                    check("reused-id avatar reads B's pos, no ghost from A", ap[0] == 5.0f && ap[1] == 64.0f, NULL);
+                else check("host has B's avatar after rejoin", 0, "no avatar present");
+                net_shutdown(b);
+            }
+            net_shutdown(rh);
+        } else printf("SKIP: ring-reset test (no free port)\n");
+    }
 
     /* version-mismatch: a client built against a different game version is refused */
     {

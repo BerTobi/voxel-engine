@@ -69,6 +69,7 @@ CORE    := \
 	$(SRC)/progress.c \
 	$(SRC)/raycast.c \
 	$(SRC)/player.c \
+	$(SRC)/chunksync.c \
 	$(SRC)/gl_loader.c \
 	$(SRC)/render.c \
 	$(SRC)/main.c
@@ -108,7 +109,7 @@ WIN_LDFLAGS := -static -static-libgcc -Wl,--gc-sections -mwindows
 WIN_LIBS    := -lopengl32 -lgdi32 -luser32 -lws2_32
 
 # ---- Targets -----------------------------------------------------------------
-.PHONY: all linux win test testsim testworld testpersist testprogress testraycast testedit testplayer testnet version archive clean
+.PHONY: all linux win test testsim testworld testpersist testprogress testraycast testedit testplayer testnet testchunksync version archive clean
 
 # Default target: native dev build.
 all: linux
@@ -212,6 +213,14 @@ testedit: | $(BUILD)
 testnet: | $(BUILD)
 	$(CC) $(CFLAGS) -o $(BUILD)/net_test $(NET) $(NET_LINUX) $(SRC)/test_net.c -lm
 	$(BUILD)/net_test
+
+# 0.3 chunk-delta sync: serialize a host's edited chunk + apply onto a second
+# (seed-regenerated) world; assert they match. No GL, no sockets.
+testchunksync: | $(BUILD)
+	$(CC) $(CFLAGS) -o $(BUILD)/chunksync_test \
+		$(SRC)/material.c $(SRC)/chunk.c $(SRC)/worldgen.c $(SRC)/world.c \
+		$(SRC)/persist.c $(SRC)/chunksync.c $(SRC)/test_chunksync.c -lm
+	$(BUILD)/chunksync_test
 
 # Create the build directory on demand (order-only prerequisite).
 $(BUILD):

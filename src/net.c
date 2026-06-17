@@ -24,14 +24,18 @@
 #define MSG_POSE  2u
 #define MSG_EDIT  3u
 #define MSG_LEAVE 4u
+#define MSG_CREQ  5u   /* client -> host: "send chunk (cx,cy,cz)"          */
+#define MSG_CDATA 6u   /* host -> client: chunk delta (opaque to net.c)    */
 
 #define LEN_HELLO 23
 #define LEN_POSE  25
 #define LEN_EDIT  16
 #define LEN_LEAVE 1
+#define LEN_CREQ  12   /* i32 cx,cy,cz */
 
-#define NET_RECV_CAP  8192
-#define NET_SEND_CAP  16384
+/* Buffers must hold one full chunk-delta frame (NET_HDR + up to NET_CHUNK_MAX). */
+#define NET_RECV_CAP  65536
+#define NET_SEND_CAP  65536
 #define NET_EDIT_CAP  1024          /* inbound edits between drains (ring)         */
 #define NET_HDR       3             /* u8 type + u16 len                           */
 #define NET_HANDSHAKE_TIMEOUT_MS 6000
@@ -85,6 +89,13 @@ struct NetState {
     NetEdit  edits[NET_EDIT_CAP];
     int      ehead, ecount;
     double   last_pose_ms;                    /* outbound pose throttle */
+
+    /* chunk-delta sync (Milestone C); net.c stays world-agnostic - main.c serves
+     * (host) and applies (client) opaque delta bytes through these callbacks. */
+    int    (*chunk_serve)(int cx, int cy, int cz, unsigned char *out, int cap, void *user);
+    void    *chunk_serve_user;
+    void   (*chunk_apply)(const unsigned char *data, int len, void *user);
+    void    *chunk_apply_user;
 };
 
 /* Stable per-id avatar colour (id 0 = host). */
@@ -232,6 +243,25 @@ static void on_message(NetState *n, Conn *c, uint8_t type, const unsigned char *
             memset(&n->players[id], 0, sizeof n->players[id]);  /* clear ring too (id reuse) */
         break;
     }
+    case MSG_CREQ: {
+        const unsigned char *p = pl;
+        int cx, cy, cz;
+        if (n->mode != NET_HOST || len != LEN_CREQ) { c->dead = 1; return; }
+        cx = get_i32(&p); cy = get_i32(&p); cz = get_i32(&p);
+        c->live = 1;                                     /* valid participant traffic */
+        if (n->chunk_serve) {
+            static unsigned char out[NET_CHUNK_MAX];     /* single-threaded: static ok */
+            int olen = n->chunk_serve(cx, cy, cz, out, (int)NET_CHUNK_MAX, n->chunk_serve_user);
+            if (olen > 0 && olen <= (int)NET_CHUNK_MAX)
+                conn_queue(c, MSG_CDATA, out, olen);     /* reply to the requester */
+        }
+        break;
+    }
+    case MSG_CDATA: {
+        if (n->mode != NET_CLIENT || (unsigned)len > NET_CHUNK_MAX) { c->dead = 1; return; }
+        if (n->chunk_apply) n->chunk_apply(pl, len, n->chunk_apply_user);
+        break;
+    }
     default:
         c->dead = 1;                                     /* unknown type -> drop */
     }
@@ -246,6 +276,15 @@ static void parse_messages(NetState *n, Conn *c)
         int len = h[1] | (h[2] << 8);
         if (len < 0 || NET_HDR + len > NET_RECV_CAP) { c->dead = 1; return; }  /* malformed */
         if (c->rlen - off < NET_HDR + len) break;        /* incomplete - wait for more */
+        /* A chunk request can produce a reply up to NET_CHUNK_MAX into THIS conn's
+         * send buffer. If it can't currently hold one, STOP consuming input here
+         * and resume next poll (after conn_flush drains sbuf) - leaving this CREQ
+         * + the rest in rbuf. Otherwise a batch (or a malicious flood) of CREQs
+         * would pile replies past NET_SEND_CAP and conn_queue would drop the peer.
+         * A truly stuck peer (sbuf never drains) eventually fills rbuf and is
+         * dropped by conn_recv's room==0 guard - which is the correct outcome. */
+        if (h[0] == MSG_CREQ && c->slen + NET_HDR + (int)NET_CHUNK_MAX > NET_SEND_CAP)
+            break;
         on_message(n, c, h[0], h + NET_HDR, len);
         if (c->dead) return;
         off += NET_HDR + len;
@@ -269,6 +308,11 @@ static void conn_flush(Conn *c)
 
 static void conn_recv(NetState *n, Conn *c)
 {
+    /* First drain any frames DEFERRED on a previous poll (a CREQ left in rbuf
+     * because the send buffer was full): the prior poll's flush has since made
+     * room, so parse now makes progress even with no new bytes arriving. */
+    parse_messages(n, c);
+    if (c->dead) return;
     for (;;) {
         long got, room = (long)NET_RECV_CAP - c->rlen;
         /* A single frame larger than the whole buffer is impossible for a valid
@@ -387,6 +431,7 @@ void net_poll(NetState *n)
         }
         conn_flush(c);
         if (!c->dead) conn_recv(n, c);
+        if (!c->dead) conn_flush(c);     /* drain replies produced during recv (chunk data) */
     }
     reap(n);
 }
@@ -482,6 +527,29 @@ void net_drain_edits(NetState *n,
         n->ecount--;
         apply(e.wx, e.wy, e.wz, e.voxel, user);
     }
+}
+
+/* ---- chunk-delta sync ---------------------------------------------------- */
+
+void net_request_chunk(NetState *n, int cx, int cy, int cz)
+{
+    unsigned char buf[LEN_CREQ], *q = buf;
+    if (n == NULL || n->mode != NET_CLIENT) return;
+    if (n->local_id < 0) return;                         /* not handshaked yet */
+    put_i32(&q, cx); put_i32(&q, cy); put_i32(&q, cz);
+    broadcast(n, MSG_CREQ, buf, LEN_CREQ, NULL);         /* client -> its host link */
+}
+
+void net_set_chunk_server(NetState *n,
+    int (*serve)(int, int, int, unsigned char *, int, void *), void *user)
+{
+    if (n) { n->chunk_serve = serve; n->chunk_serve_user = user; }
+}
+
+void net_set_chunk_apply(NetState *n,
+    void (*apply)(const unsigned char *, int, void *), void *user)
+{
+    if (n) { n->chunk_apply = apply; n->chunk_apply_user = user; }
 }
 
 /* ---- avatars ------------------------------------------------------------- */

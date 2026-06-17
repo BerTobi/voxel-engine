@@ -36,6 +36,31 @@ static void count_edit(int wx, int wy, int wz, uint32_t v, void *u)
     g_burst_n++;
 }
 
+/* chunk-sync plumbing: synthetic serve (a large, verifiable payload) + apply. */
+#define CHUNK_TEST_LEN 20000
+static int g_serve_calls, g_serve_cx;
+static int test_serve(int cx, int cy, int cz, unsigned char *out, int cap, void *user)
+{
+    int i, n = CHUNK_TEST_LEN;
+    (void)cy; (void)cz; (void)user;
+    g_serve_calls++; g_serve_cx = cx;
+    if (n > cap) n = cap;
+    out[0]=(unsigned char)cx; out[1]=(unsigned char)(cx>>8); out[2]=(unsigned char)(cx>>16); out[3]=(unsigned char)(cx>>24);
+    for (i = 4; i < n; ++i) out[i] = (unsigned char)(i * 7 + cx);
+    return n;
+}
+static int g_apply_len, g_apply_ok, g_apply_cx, g_apply_calls;
+static void test_apply(const unsigned char *data, int len, void *user)
+{
+    int i, ok = 1;
+    (void)user;
+    g_apply_calls++;
+    g_apply_len = len;
+    g_apply_cx = (int)((uint32_t)data[0] | ((uint32_t)data[1]<<8) | ((uint32_t)data[2]<<16) | ((uint32_t)data[3]<<24));
+    for (i = 4; i < len; ++i) if (data[i] != (unsigned char)(i * 7 + g_apply_cx)) { ok = 0; break; }
+    g_apply_ok = ok;
+}
+
 static void pump(NetState *a, NetState *b, int iters)
 {
     int i;
@@ -154,6 +179,36 @@ int main(void)
         g_burst_n = 0;
         net_drain_edits(host, count_edit, NULL);
         check("host drained the entire burst (no frames lost)", g_burst_n == 600, NULL);
+    }
+
+    /* CHUNK-SYNC plumbing: a request routes to the host's serve callback, and its
+     * large (~20 KB) reply reaches the client's apply callback byte-identical -
+     * exercising MSG_CREQ/CDATA routing + variable-length framing of a frame far
+     * bigger than one recv. */
+    {
+        net_set_chunk_server(host, test_serve, NULL);
+        net_set_chunk_apply(client, test_apply, NULL);
+        g_serve_calls = 0; g_apply_len = 0; g_apply_ok = 0;
+        net_request_chunk(client, 4242, 7, 9);
+        pump(host, client, 16);
+        check("chunk request reached the host serve cb (right cx)", g_serve_calls == 1 && g_serve_cx == 4242, NULL);
+        check("client got the 20 KB chunk frame byte-intact",
+              g_apply_len == CHUNK_TEST_LEN && g_apply_cx == 4242 && g_apply_ok, NULL);
+    }
+
+    /* CHUNK-SYNC backpressure regression: a request batch whose replies (10 x
+     * ~20 KB = 200 KB) far exceed the 64 KB send buffer must THROTTLE (serve over
+     * several polls), never overflow + drop the client. (Pre-fix the host queued
+     * them all in one poll and conn_queue killed the link.) */
+    {
+        int k;
+        g_apply_calls = 0;
+        for (k = 0; k < 10; ++k) net_request_chunk(client, 5000 + k, 0, 0);
+        pump(host, client, 80);
+        check("host did NOT drop the client under a 200 KB reply batch",
+              net_ready(client) && !net_failed(client), NULL);
+        check("all 10 oversized chunk replies were delivered (throttled, not dropped)",
+              g_apply_calls == 10, NULL);
     }
 
     net_shutdown(client);

@@ -29,7 +29,12 @@
 #define NET_MAX_PLAYERS      4u           /* host (id 0) + up to 3 clients      */
 #define NET_DEFAULT_PORT     9001         /* used when host/connect omits :port */
 #define NET_MAGIC            0x314E5856u   /* 'V''X''N''1' LE - handshake sentinel */
-#define NET_PROTOCOL_VERSION 1u           /* bump on ANY wire-format change      */
+#define NET_PROTOCOL_VERSION 2u           /* bump on ANY wire-format change (2: chunk sync) */
+
+/* Max bytes of a serialized chunk delta (the MSG_CDATA payload main.c builds).
+ * Worst case is a fully-rewritten 16^3 chunk: 4096 * (u16 index + u32 voxel) +
+ * a small header. net.c sizes its frame buffers to hold one of these. */
+#define NET_CHUNK_MAX        28672u
 
 /* ======================================================================== *
  *  PUBLIC API  (consumed by main.c and test_net.c)                          *
@@ -87,6 +92,28 @@ void net_send_edit(NetState *n, int wx, int wy, int wz, uint32_t voxel);
 void net_drain_edits(NetState *n,
                      void (*apply)(int wx, int wy, int wz, uint32_t voxel, void *user),
                      void *user);
+
+/* ---- Chunk-delta sync (Milestone C) -------------------------------------- *
+ * The base terrain is regenerated from the shared seed on each machine; only the
+ * EDITS (deltas from the seed) need transferring. As a client streams a chunk in
+ * it asks the host for that chunk's authoritative state; the host answers with
+ * the voxels that differ from the seed (or nothing, the common case). net.c only
+ * moves opaque bytes - main.c does the (de)serialization through these hooks. */
+
+/* CLIENT: request chunk (cx,cy,cz) from the host. No-op unless NET_CLIENT. */
+void net_request_chunk(NetState *n, int cx, int cy, int cz);
+
+/* HOST: install the server. On a request net.c calls serve(cx,cy,cz,out,cap,user);
+ * write the MSG_CDATA payload into out (cap == NET_CHUNK_MAX) and return its length
+ * (0 = decline / nothing to send). Invoked inline during net_poll. */
+void net_set_chunk_server(NetState *n,
+    int (*serve)(int cx, int cy, int cz, unsigned char *out, int cap, void *user),
+    void *user);
+
+/* CLIENT: install the apply hook. net.c calls apply(data,len,user) inline during
+ * net_poll when chunk data arrives; data is the host's MSG_CDATA payload. */
+void net_set_chunk_apply(NetState *n,
+    void (*apply)(const unsigned char *data, int len, void *user), void *user);
 
 /* Remote players to draw as avatars (excludes this peer). Iterate i in
  * [0, net_avatar_count). net_get_avatar fills the latest known pose + a stable

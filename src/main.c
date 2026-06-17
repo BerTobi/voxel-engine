@@ -80,6 +80,7 @@
 #include "player.h"
 #include "version.h"
 #include "net.h"
+#include "chunksync.h"
 
 /* ---- Frame scheduling constants (binding, ARCHITECTURE.md Section 6) ------ */
 #define FRAME_TARGET_MS   33.333    /* 30 FPS, binding TARGET_FRAMERATE        */
@@ -287,9 +288,17 @@ static void mat4_lookat(float *m, Vec3 eye, Vec3 center, Vec3 up)
  * mesh a chunk without allocating per call. Single-threaded, so one shared pair
  * of scratch buffers serves every callback, the HOME decorate-remesh, and the
  * per-frame dirty-mesh drain. */
+#define NET_REQ_RING 2048   /* pending chunk-sync requests (holds a prime burst)  */
+
 typedef struct {
     MeshBuffer *opaque;   /* greedy_mesh scratch (non-liquid stream)            */
     MeshBuffer *liquid;   /* greedy_mesh_liquid scratch (PHASE_LIQUID stream)   */
+    /* 0.3 chunk sync: on a CLIENT, cb_gen enqueues each freshly-generated chunk
+     * here; the main loop drains the ring into net_request_chunk so the host's
+     * edits to that chunk (if any) are fetched + patched in. NULL net = no-op. */
+    NetState   *net;
+    int         req_cx[NET_REQ_RING], req_cy[NET_REQ_RING], req_cz[NET_REQ_RING];
+    int         req_head, req_count;
 } StreamCtx;
 
 /* Light + mesh (both streams) + upload one chunk into its render slot. This is
@@ -330,8 +339,18 @@ static void cb_slot_free(int slot, void *user)
  * exact signature; it sets c->cx/cy/cz and raises CHUNK_DIRTY_MESH|CHUNK_GEN. */
 static void cb_gen(Chunk *c, int cx, int cy, int cz, uint64_t seed, void *user)
 {
-    (void)user;
+    StreamCtx *ctx = (StreamCtx *)user;
     worldgen_fill_chunk(c, cx, cy, cz, seed);
+    /* CLIENT: this chunk was just regenerated from the (shared) seed - ask the
+     * host whether it has been edited, so any delta gets patched in. Enqueue;
+     * the main loop sends a bounded number per frame. Drop if the ring is full
+     * (re-requested when the chunk is next regenerated). */
+    if (ctx != NULL && ctx->net != NULL && net_mode(ctx->net) == NET_CLIENT &&
+        ctx->req_count < NET_REQ_RING) {
+        int t = (ctx->req_head + ctx->req_count) % NET_REQ_RING;
+        ctx->req_cx[t] = cx; ctx->req_cy[t] = cy; ctx->req_cz[t] = cz;
+        ctx->req_count++;
+    }
 }
 
 /* ---- Demo decoration (M2 lighting + M3/M4 heat + M6 fluid) --------------- *
@@ -450,6 +469,8 @@ static void apply_net_edit(int wx, int wy, int wz, uint32_t voxel, void *user)
     NetApplyCtx *c = (NetApplyCtx *)user;
     edit_and_notify(c->w, c->s, wx, wy, wz, (Voxel)voxel);
 }
+/* The chunk-delta serialize/apply live in chunksync.c (world-coupled, unit-tested);
+ * main.c just wires chunksync_serve/chunksync_apply into the net callbacks. */
 
 static void demo_decorate(Chunk *c)
 {
@@ -679,6 +700,7 @@ int main(void)
      * path is byte-for-byte the pre-0.3 behaviour. A CLIENT adopts the host's
      * seed (below) and does NOT persist (the host's save is canonical). */
     NetState     *net = NULL;
+    ChunkSyncCtx  csctx;          /* 0.3: context for the net chunk-sync callbacks */
 
     /* Heat simulation (ARCHITECTURE Section 3). Single-chunk: one SimState bound
      * to the resident HOME chunk that carries the lava block. It is bound when
@@ -845,6 +867,10 @@ int main(void)
     net = net_init_from_env(seed, (uint32_t)VOXEL_VERSION_PACKED, (uint32_t)WG_GEN_VERSION);
     if (net != NULL && net_mode(net) == NET_CLIENT)
         seed = net_seed(net);
+    /* cb_gen (on a client) enqueues chunk-sync requests here; init before world_prime. */
+    stream_ctx.net       = net;
+    stream_ctx.req_head  = 0;
+    stream_ctx.req_count = 0;
 
     cb.gen         = cb_gen;
     cb.mesh_upload = cb_mesh_upload;
@@ -903,6 +929,15 @@ int main(void)
         return 1;
     }
     sim->chunk = NULL;   /* unbound: nothing to tick until HOME is resident      */
+
+    /* 0.3 chunk-delta sync: install the net callbacks now that world/sim/persist
+     * all exist. Host SERVES chunk deltas (current-vs-seed); client APPLIES them
+     * to its seed-regenerated chunks. csctx must outlive the loop (it does). */
+    csctx.world = world; csctx.persist = persist; csctx.seed = seed;
+    if (net != NULL) {
+        if (net_mode(net) == NET_HOST)   net_set_chunk_server(net, chunksync_serve, &csctx);
+        if (net_mode(net) == NET_CLIENT) net_set_chunk_apply(net, chunksync_apply, &csctx);
+    }
 
     /* Build the conductance LUT once up front (sim_init would do this lazily,
      * but doing it here keeps the first attach cheap). Idempotent. */
@@ -1358,6 +1393,22 @@ int main(void)
          * window off the player. A stationary player with no pending work costs
          * nothing. */
         world_stream_update(world, cam_pos.x, cam_pos.z);
+
+        /* 0.3: send a bounded batch of chunk-sync requests (client only). The ring
+         * was just filled by cb_gen for any chunks this stream step generated; the
+         * host replies and net_poll patches them in over the next frames. Bounded
+         * so the join-time prime burst (~window size) paces out smoothly. */
+        if (net != NULL && net_mode(net) == NET_CLIENT) {
+            int sent = 0;
+            while (stream_ctx.req_count > 0 && sent < 64) {
+                net_request_chunk(net, stream_ctx.req_cx[stream_ctx.req_head],
+                                       stream_ctx.req_cy[stream_ctx.req_head],
+                                       stream_ctx.req_cz[stream_ctx.req_head]);
+                stream_ctx.req_head = (stream_ctx.req_head + 1) % NET_REQ_RING;
+                stream_ctx.req_count--;
+                ++sent;
+            }
+        }
 
         /* --- HOME sim attach / detach (crash-avoidance rule) -------------- *
          * The sim binds to the FIXED HOME chunk only while it is resident. After

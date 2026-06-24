@@ -830,7 +830,7 @@ static void draw_connect_screen(float aspect, int sel, const char *ip)
     int i;
 
     render_ui_rect(-1.0f, -1.0f, 1.0f, 1.0f, 0.04f, 0.05f, 0.08f, 1.0f);     /* solid bg  */
-    render_text(-0.57f, 0.62f, 0.085f, aspect, 1.0f, 0.85f, 0.20f, 1.0f, "VOXEL ENGINE 0.3");
+    render_text(-0.57f, 0.62f, 0.085f, aspect, 1.0f, 0.85f, 0.20f, 1.0f, VOXEL_TITLE);
 
     /* Single Player + Host Game: plain items. */
     if (sel == 0) render_ui_rect(-0.42f, iy[0]-0.075f, 0.42f, iy[0]+0.035f, 0.22f,0.42f,0.80f,0.85f);

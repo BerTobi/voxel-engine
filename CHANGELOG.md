@@ -51,6 +51,12 @@ milestone behind a `make check` regression gate; see `PLAN-0.4.md`.
   no cross-peer divergence. `NET_PROTOCOL_VERSION` 2→3, so 0.3 and 0.4 peers refuse each other
   at the handshake. Verified by a GL-free push test + a two-process loopback (client joins and
   renders the host's melting forge).
+- _(M6)_ Release hardening: the connect-screen title derives from `version.h` (no hardcoded
+  "0.3"); a **0.3.0 save loads in 0.4** (verified via the archived 0.3.0 binary round-trip);
+  the determinism hash is absent from release binaries; both targets stay `-Wall -Wextra`
+  clean with the full `make check` green. _(Win-target runtime-determinism + a Pentium-M
+  frame-budget probe await on-target testing — Wine was unavailable on the dev box; the sim
+  hot loop is integer-only, so cross-toolchain bit-exactness is high-confidence.)_
 
 ## 0.3.0 — 2026-06-17 — Multiplayer
 

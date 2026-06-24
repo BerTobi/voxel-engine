@@ -34,9 +34,11 @@
 #include <sys/stat.h>
 
 #ifdef _WIN32
-#  include <direct.h>     /* _mkdir */
+#  include <direct.h>     /* _mkdir, _rmdir */
+#  include <windows.h>    /* FindFirstFile/FindNextFile/DeleteFile (world listing) */
 #else
-#  include <unistd.h>
+#  include <unistd.h>     /* rmdir */
+#  include <dirent.h>     /* opendir/readdir (world listing) */
 #endif
 
 /* ======================================================================== *
@@ -791,4 +793,214 @@ int persist_compact_region(PersistStore *ps, int32_t rx, int32_t rz)
      * No-op success keeps callers correct. */
     (void)ps; (void)rx; (void)rz;
     return 0;
+}
+
+/* ======================================================================== *
+ *  WORLD MANAGEMENT  (0.4 named worlds + save/load UI)                      *
+ * ======================================================================== */
+
+int persist_world_meta_write(const char *dir, const char *name, uint64_t seed)
+{
+    char path[512];
+    FILE *f;
+    if (dir == NULL || persist_mkdir(dir) != 0)
+        return -1;
+    snprintf(path, sizeof path, "%s/world.meta", dir);
+    f = fopen(path, "wb");
+    if (f == NULL)
+        return -1;
+    fprintf(f, "VOXELWORLD 1\n%016llx\n%s\n",
+            (unsigned long long)seed, (name != NULL && name[0]) ? name : "world");
+    fclose(f);
+    return 0;
+}
+
+int persist_world_meta_read(const char *dir, char *name_out, int name_cap, uint64_t *seed_out)
+{
+    char path[512], line[256];
+    FILE *f;
+    unsigned long long s = 0;
+    if (dir == NULL)
+        return -1;
+    snprintf(path, sizeof path, "%s/world.meta", dir);
+    f = fopen(path, "rb");
+    if (f == NULL)
+        return -1;
+    if (fgets(line, sizeof line, f) == NULL || strncmp(line, "VOXELWORLD", 10) != 0) {
+        fclose(f);
+        return -1;
+    }
+    if (fgets(line, sizeof line, f) == NULL || sscanf(line, "%llx", &s) != 1) {
+        fclose(f);
+        return -1;
+    }
+    if (name_out != NULL && name_cap > 0) {
+        int i = 0;
+        if (fgets(line, sizeof line, f) != NULL) {
+            int n = (int)strlen(line);
+            while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r'))
+                line[--n] = '\0';
+            for (; i < n && i < name_cap - 1; ++i)
+                name_out[i] = line[i];
+        }
+        name_out[i] = '\0';
+        if (name_out[0] == '\0')
+            snprintf(name_out, (size_t)name_cap, "world");
+    }
+    fclose(f);
+    if (seed_out != NULL)
+        *seed_out = (uint64_t)s;
+    return 0;
+}
+
+/* Insertion-sort the world list by display name (n is small). */
+static void world_sort(WorldInfo *w, int n)
+{
+    int i, j;
+    for (i = 1; i < n; ++i) {
+        WorldInfo k = w[i];
+        for (j = i - 1; j >= 0 && strcmp(w[j].name, k.name) > 0; --j)
+            w[j + 1] = w[j];
+        w[j + 1] = k;
+    }
+}
+
+/* Record one candidate subdir if it carries a valid world.meta. The path is
+ * built with length-checked memcpy (not snprintf) so the bounded-but-large
+ * dirent name can never trip -Wformat-truncation; an over-long path (longer than
+ * any slug we create) is simply skipped - it cannot be one of our worlds. */
+static void world_try_add(const char *root, const char *leaf,
+                          WorldInfo *out, int max, int *pn)
+{
+    char d[WORLD_DIR_MAX];
+    char nm[WORLD_NAME_MAX];
+    uint64_t sd;
+    size_t rl, ll;
+    if (*pn >= max || leaf[0] == '.')
+        return;
+    rl = strlen(root);
+    ll = strlen(leaf);
+    if (rl + 1u + ll >= sizeof d)                   /* too long to be ours */
+        return;
+    memcpy(d, root, rl);
+    d[rl] = '/';
+    memcpy(d + rl + 1, leaf, ll + 1);               /* + NUL */
+    if (persist_world_meta_read(d, nm, WORLD_NAME_MAX, &sd) != 0)
+        return;                                     /* not a world (skip) */
+    memcpy(out[*pn].dir, d, rl + 1 + ll + 1);       /* fits (checked above) */
+    snprintf(out[*pn].name, WORLD_NAME_MAX, "%s", nm);
+    out[*pn].seed = sd;
+    ++(*pn);
+}
+
+int persist_list_worlds(const char *root, WorldInfo *out, int max)
+{
+    int n = 0;
+    if (root == NULL || out == NULL || max <= 0)
+        return 0;
+#ifdef _WIN32
+    {
+        WIN32_FIND_DATA fd;
+        char pat[512];
+        HANDLE h;
+        snprintf(pat, sizeof pat, "%s\\*", root);
+        h = FindFirstFile(pat, &fd);
+        if (h != INVALID_HANDLE_VALUE) {
+            do {
+                if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+                    world_try_add(root, fd.cFileName, out, max, &n);
+            } while (n < max && FindNextFile(h, &fd));
+            FindClose(h);
+        }
+    }
+#else
+    {
+        DIR *dp = opendir(root);
+        struct dirent *de;
+        if (dp != NULL) {
+            while (n < max && (de = readdir(dp)) != NULL)
+                world_try_add(root, de->d_name, out, max, &n);  /* meta-read filters non-dirs */
+            closedir(dp);
+        }
+    }
+#endif
+    world_sort(out, n);
+    return n;
+}
+
+int persist_world_create(const char *root, const char *name, uint64_t seed,
+                          char *dir_out, int dir_cap)
+{
+    char slug[WORLD_NAME_MAX];
+    char dir[WORLD_DIR_MAX];
+    int i, k = 0, suffix;
+    if (root == NULL)
+        return -1;
+    /* Slug: lowercased [a-z0-9], any run of other chars collapses to one '-'. */
+    for (i = 0; name != NULL && name[i] && k < (int)sizeof slug - 1; ++i) {
+        char ch = name[i];
+        if (ch >= 'A' && ch <= 'Z') ch = (char)(ch - 'A' + 'a');
+        if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9'))
+            slug[k++] = ch;
+        else if (k > 0 && slug[k - 1] != '-')
+            slug[k++] = '-';
+    }
+    while (k > 0 && slug[k - 1] == '-') --k;        /* trim trailing '-' */
+    slug[k] = '\0';
+    if (k == 0)
+        snprintf(slug, sizeof slug, "world");
+    /* First free dir: root/slug, root/slug-2, ... (skip any with a world.meta). */
+    for (suffix = 1; suffix < 1000; ++suffix) {
+        char nm[WORLD_NAME_MAX];
+        uint64_t sd;
+        if (suffix == 1) snprintf(dir, sizeof dir, "%s/%s", root, slug);
+        else             snprintf(dir, sizeof dir, "%s/%s-%d", root, slug, suffix);
+        if (persist_world_meta_read(dir, nm, WORLD_NAME_MAX, &sd) != 0)
+            break;                                  /* free */
+    }
+    if (persist_world_meta_write(dir, (name != NULL && name[0]) ? name : "world", seed) != 0)
+        return -1;
+    if (dir_out != NULL && dir_cap > 0)
+        snprintf(dir_out, (size_t)dir_cap, "%s", dir);
+    return 0;
+}
+
+int persist_world_delete(const char *dir)
+{
+    if (dir == NULL)
+        return -1;
+#ifdef _WIN32
+    {
+        WIN32_FIND_DATA fd;
+        char pat[512];
+        HANDLE h;
+        snprintf(pat, sizeof pat, "%s\\*", dir);
+        h = FindFirstFile(pat, &fd);
+        if (h != INVALID_HANDLE_VALUE) {
+            do {
+                char p[640];
+                if (fd.cFileName[0] == '.') continue;
+                snprintf(p, sizeof p, "%s/%s", dir, fd.cFileName);
+                DeleteFile(p);
+            } while (FindNextFile(h, &fd));
+            FindClose(h);
+        }
+        return _rmdir(dir) == 0 ? 0 : -1;
+    }
+#else
+    {
+        DIR *dp = opendir(dir);
+        struct dirent *de;
+        if (dp != NULL) {
+            while ((de = readdir(dp)) != NULL) {
+                char p[640];
+                if (de->d_name[0] == '.') continue;
+                snprintf(p, sizeof p, "%s/%s", dir, de->d_name);
+                remove(p);
+            }
+            closedir(dp);
+        }
+        return rmdir(dir) == 0 ? 0 : -1;
+    }
+#endif
 }

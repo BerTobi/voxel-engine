@@ -430,4 +430,41 @@ int persist_flush(PersistStore *ps);
  * is complete; world.c need not call it this milestone. */
 int persist_compact_region(PersistStore *ps, int32_t rx, int32_t rz);
 
+/* ======================================================================== *
+ *  WORLD MANAGEMENT  (0.4: named worlds + a Minecraft-style save/load UI)   *
+ * ======================================================================== *
+ * A "world" is a save directory under a root (default "saves/") that holds the
+ * region files PLUS a small text "world.meta" naming it and recording its seed.
+ * The menu lists / creates / deletes worlds through these calls without knowing
+ * the directory layout. Pure C99 stdio, plus ONE #ifdef for directory scanning
+ * (opendir / FindFirstFile) - the only OS-specific addition, like persist_mkdir. */
+#define WORLD_NAME_MAX  48
+#define WORLD_DIR_MAX   96
+
+typedef struct {
+    char     dir[WORLD_DIR_MAX];    /* save directory, e.g. "saves/new-world"      */
+    char     name[WORLD_NAME_MAX];  /* display name (from world.meta)              */
+    uint64_t seed;                  /* the world's seed                            */
+} WorldInfo;
+
+/* Write <dir>/world.meta (creating <dir>); returns 0 on success. */
+int  persist_world_meta_write(const char *dir, const char *name, uint64_t seed);
+
+/* Read <dir>/world.meta into name_out[cap] + *seed_out; 0 on success, non-zero if
+ * the dir has no readable/valid world.meta (so a non-world dir is skipped). */
+int  persist_world_meta_read(const char *dir, char *name_out, int name_cap,
+                             uint64_t *seed_out);
+
+/* List worlds under `root` (subdirs with a valid world.meta) into out[max], sorted
+ * by name; returns the count (<= max). */
+int  persist_list_worlds(const char *root, WorldInfo *out, int max);
+
+/* Create a new world under `root`: derive a unique directory from `name`, write
+ * its world.meta(name, seed), and copy the directory into dir_out[cap]. 0 on ok. */
+int  persist_world_create(const char *root, const char *name, uint64_t seed,
+                          char *dir_out, int dir_cap);
+
+/* Delete a world directory and the files in it (region files + world.meta). */
+int  persist_world_delete(const char *dir);
+
 #endif /* PERSIST_H */

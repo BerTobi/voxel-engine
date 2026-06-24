@@ -55,6 +55,8 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>   /* getenv - optional headless screenshot + camera control */
+#include <string.h>   /* world-management UI: name/seed field editing */
+#include <time.h>     /* world-create: a varied default seed */
 #include <math.h>
 
 /* <math.h> M_PI is a POSIX/GNU extension, not ISO C99; define it ourselves so
@@ -820,7 +822,39 @@ static void draw_pause_menu(float aspect, int sel, int fullscreen_on)
 /* ---- 0.3 connect screen (startup + quit-to-menu): Single / Host / Join / Quit *
  * Reuses the UI primitives; runs before any world exists. */
 typedef enum { CHOICE_SINGLE = 0, CHOICE_HOST, CHOICE_JOIN, CHOICE_QUIT, CHOICE_ENV } ChoiceMode;
-typedef struct { ChoiceMode mode; char ip[64]; } ConnectChoice;
+typedef struct {
+    ChoiceMode mode;
+    char       ip[64];
+    uint64_t   seed;                /* 0.4: chosen world's seed (SINGLE/HOST via menu) */
+    char       dir[WORLD_DIR_MAX];  /* 0.4: chosen world's save dir ('' => env/default) */
+} ConnectChoice;
+
+/* 0.4 world management: worlds live under this root as saves/<slug>/ with a
+ * world.meta (persist.c). The headless VOXEL_SAVE path stays separate. */
+#define WORLD_SAVE_ROOT "saves"
+#define MENU_MAX_WORLDS 64
+
+static unsigned g_create_salt = 0;   /* varies the default seed across worlds this run */
+
+/* Resolve a create-screen seed field: empty => a varied random seed; all-digits =>
+ * that number; otherwise FNV-hash the string (Minecraft-style typed seeds). */
+static uint64_t menu_parse_seed(const char *s)
+{
+    const char *p;
+    if (s == NULL || s[0] == '\0')
+        return ((uint64_t)time(NULL) * 2654435761ULL)
+             ^ ((uint64_t)(g_create_salt++) * 0x9E3779B97F4A7C15ULL)
+             ^ 0xABCDEF0123456789ULL;
+    for (p = s; *p; ++p)
+        if (*p < '0' || *p > '9') break;
+    if (*p == '\0')                              /* all digits => numeric */
+        return (uint64_t)strtoull(s, NULL, 10);
+    {                                            /* otherwise FNV-1a of the string */
+        uint64_t h = 1469598103934665603ULL;
+        for (p = s; *p; ++p) { h ^= (unsigned char)*p; h *= 1099511628211ULL; }
+        return h;
+    }
+}
 
 static void draw_connect_screen(float aspect, int sel, const char *ip)
 {
@@ -858,72 +892,226 @@ static void draw_connect_screen(float aspect, int sel, const char *ip)
     (void)i;
 }
 
-/* Run the connect screen until the user picks. win_w/win_h are the fallback size. */
+/* 0.4 world-select screen: the saved worlds + a "Create New World" entry. */
+static void draw_world_list(float aspect, const WorldInfo *worlds, int n, int sel, int want_host)
+{
+    int i;
+    float y = 0.46f;
+    render_ui_rect(-1.0f, -1.0f, 1.0f, 1.0f, 0.04f, 0.05f, 0.08f, 1.0f);
+    render_text(-0.80f, 0.66f, 0.075f, aspect, 1.0f, 0.85f, 0.20f, 1.0f,
+                want_host ? "Host: Select World" : "Select World");
+    if (n == 0)
+        render_text(-0.58f, 0.30f, 0.04f, aspect, 0.6f, 0.6f, 0.65f, 1.0f,
+                    "(no worlds yet - create one below)");
+    {   /* Show a 7-row window that keeps the selected world visible (scrolls). */
+        int first = 0, last;
+        if (n > 7) {
+            int s = (sel < n) ? sel : n - 1;        /* "Create" (sel==n) -> pin to the tail */
+            first = s - 3;
+            if (first < 0) first = 0;
+            if (first > n - 7) first = n - 7;
+        }
+        last = (first + 7 < n) ? first + 7 : n;
+        if (first > 0)                              /* more-above indicator */
+            render_text(-0.60f, 0.55f, 0.03f, aspect, 0.5f, 0.5f, 0.55f, 1.0f, "^ more");
+        for (i = first; i < last; ++i) {
+            if (i == sel)
+                render_ui_rect(-0.66f, y - 0.06f, 0.66f, y + 0.035f, 0.22f, 0.42f, 0.80f, 0.85f);
+            render_text(-0.60f, y, 0.052f, aspect, 1, 1, 1, 1, worlds[i].name);
+            y -= 0.105f;
+        }
+        if (last < n)                               /* more-below indicator */
+            render_text(-0.60f, y, 0.03f, aspect, 0.5f, 0.5f, 0.55f, 1.0f, "v more");
+    }
+    {                                                  /* "Create New World" = item index n */
+        float cy = -0.46f;
+        if (sel == n)
+            render_ui_rect(-0.66f, cy - 0.06f, 0.66f, cy + 0.035f, 0.25f, 0.55f, 0.30f, 0.85f);
+        render_text(-0.60f, cy, 0.052f, aspect, 0.7f, 1.0f, 0.75f, 1.0f, "+ Create New World");
+    }
+    render_text(-0.80f, -0.64f, 0.03f, aspect, 0.6f, 0.6f, 0.65f, 1.0f,
+                "Up/Down + Enter    [D] delete    [Esc] back");
+}
+
+/* 0.4 create-world screen: a Name field + an optional Seed field (focus 0/1). */
+static void draw_create_world(float aspect, const char *name, const char *seed, int focus)
+{
+    char line[96];
+    int k;
+    const char *p;
+    render_ui_rect(-1.0f, -1.0f, 1.0f, 1.0f, 0.04f, 0.05f, 0.08f, 1.0f);
+    render_text(-0.62f, 0.62f, 0.075f, aspect, 1.0f, 0.85f, 0.20f, 1.0f, "Create New World");
+
+    if (focus == 0) render_ui_rect(-0.80f, 0.18f, 0.80f, 0.31f, 0.22f, 0.42f, 0.80f, 0.85f);
+    k = 0;
+    for (p = "Name: ";  *p && k < (int)sizeof line - 2; ++p) line[k++] = *p;
+    for (p = name;      *p && k < (int)sizeof line - 2; ++p) line[k++] = *p;
+    if (focus == 0 && k < (int)sizeof line - 1) line[k++] = '_';
+    line[k] = '\0';
+    render_text(-0.76f, 0.255f, 0.055f, aspect, 1, 1, 1, 1, line);
+
+    if (focus == 1) render_ui_rect(-0.80f, -0.02f, 0.80f, 0.11f, 0.22f, 0.42f, 0.80f, 0.85f);
+    k = 0;
+    for (p = "Seed (optional): "; *p && k < (int)sizeof line - 2; ++p) line[k++] = *p;
+    for (p = seed;                *p && k < (int)sizeof line - 2; ++p) line[k++] = *p;
+    if (focus == 1 && k < (int)sizeof line - 1) line[k++] = '_';
+    line[k] = '\0';
+    render_text(-0.76f, 0.055f, 0.05f, aspect, 1, 1, 1, 1, line);
+
+    render_text(-0.78f, -0.42f, 0.032f, aspect, 0.6f, 0.6f, 0.65f, 1.0f,
+                "type to edit   Up/Down switch field   Enter create   Esc back");
+}
+
+/* 0.4 confirm-delete overlay. */
+static void draw_confirm_delete(float aspect, const char *name)
+{
+    char line[96];
+    int k;
+    const char *p;
+    render_ui_rect(-1.0f, -1.0f, 1.0f, 1.0f, 0.04f, 0.05f, 0.08f, 1.0f);
+    render_text(-0.42f, 0.30f, 0.07f, aspect, 1.0f, 0.5f, 0.3f, 1.0f, "Delete World?");
+    k = 0;
+    line[k++] = '"';
+    for (p = name; *p && k < (int)sizeof line - 2; ++p) line[k++] = *p;
+    line[k++] = '"';
+    line[k] = '\0';
+    render_text(-0.52f, 0.08f, 0.05f, aspect, 1, 1, 1, 1, line);
+    render_text(-0.54f, -0.20f, 0.04f, aspect, 0.7f, 0.7f, 0.75f, 1.0f,
+                "[Enter] delete forever    [Esc] cancel");
+}
+
+/* Run the menu until the user picks a world to play/host or an IP to join. A
+ * state machine: MENU (Single/Host/Join/Quit) -> WORLDS (select/create/delete)
+ * -> CREATE (name + optional seed), Minecraft-style. win_w/win_h are fallbacks. */
 static ConnectChoice connect_screen(int win_w, int win_h)
 {
+    enum { SCR_MENU, SCR_WORLDS, SCR_CREATE, SCR_CONFIRM_DEL };
     ConnectChoice c;
-    int sel = 0, ip_len = 0;
-    int up_prev = 0, dn_prev = 0, en_prev = 0;
+    int screen = SCR_MENU, sel = 0, want_host = 0;
+    int ip_len = 0;
     char ip[64];
+    WorldInfo worlds[MENU_MAX_WORLDS];
+    int n_worlds = 0, wsel = 0;
+    char cname[WORLD_NAME_MAX], cseed[24];
+    int cname_len = 0, cseed_len = 0, cfocus = 0;
+    int up_prev = 0, dn_prev = 0, en_prev = 0, esc_prev = 0, del_prev = 0;
     float mvp[16];
 
-    ip[0] = '\0';
-    c.mode = CHOICE_SINGLE; c.ip[0] = '\0';
+    ip[0] = cname[0] = cseed[0] = '\0';
+    c.mode = CHOICE_QUIT; c.ip[0] = '\0'; c.dir[0] = '\0'; c.seed = 0;
     mat4_identity(mvp);
 
-    /* Prime the edge-detect prevs from the CURRENT key state: the only way in is
-     * the pause-menu "Main Menu" (chosen with Enter), and key state persists across
-     * screens - without this, a still-held Enter would fire on frame 1 and auto-pick
-     * Single Player. Also drain any stale typed text. */
+    /* Prime edge-detect prevs from the CURRENT key state (a still-held Enter from
+     * the pause-menu "Main Menu" must not fire on frame 1). Drain stale text. */
     plat_poll();
-    up_prev = plat_key_down(PLAT_KEY_UP);
-    dn_prev = plat_key_down(PLAT_KEY_DOWN);
-    en_prev = plat_key_down(PLAT_KEY_ENTER);
+    up_prev  = plat_key_down(PLAT_KEY_UP);
+    dn_prev  = plat_key_down(PLAT_KEY_DOWN);
+    en_prev  = plat_key_down(PLAT_KEY_ENTER);
+    esc_prev = plat_key_down(PLAT_KEY_ESC);
+    del_prev = plat_key_down(PLAT_KEY_D);
     { char drain[64]; plat_text_poll(drain, (int)sizeof drain); }
 
     for (;;) {
-        int cw = win_w, ch = win_h, up_now, dn_now, en_now, tn, i;
+        int cw = win_w, ch = win_h, up_now, dn_now, en_now, esc_now, del_now, tn, i;
         char tb[64];
         float aspect;
         double t0 = plat_time_ms();
 
         plat_poll();
         if (plat_should_close()) { c.mode = CHOICE_QUIT; return c; }
-
         plat_get_size(&cw, &ch);
         if (cw <= 0 || ch <= 0) { cw = win_w; ch = win_h; }
         aspect = (float)cw / (float)ch;
 
-        up_now = plat_key_down(PLAT_KEY_UP);
-        dn_now = plat_key_down(PLAT_KEY_DOWN);
-        en_now = plat_key_down(PLAT_KEY_ENTER);
-        if (up_now && !up_prev) sel = (sel + 3) % 4;
-        if (dn_now && !dn_prev) sel = (sel + 1) % 4;
+        up_now  = plat_key_down(PLAT_KEY_UP);
+        dn_now  = plat_key_down(PLAT_KEY_DOWN);
+        en_now  = plat_key_down(PLAT_KEY_ENTER);
+        esc_now = plat_key_down(PLAT_KEY_ESC);
+        del_now = plat_key_down(PLAT_KEY_D);
+        tn = plat_text_poll(tb, (int)sizeof tb);
 
-        tn = plat_text_poll(tb, (int)sizeof tb);     /* read-and-clear typed chars */
-        if (sel == 2) {                              /* edit the IP only on Join */
+        if (screen == SCR_MENU) {
+            if (up_now && !up_prev) sel = (sel + 3) % 4;
+            if (dn_now && !dn_prev) sel = (sel + 1) % 4;
+            if (sel == 2)                            /* edit the IP only on Join */
+                for (i = 0; i < tn; ++i) {
+                    char k = tb[i];
+                    if (k == 0x08) { if (ip_len > 0) ip[--ip_len] = '\0'; }
+                    else if (ip_len < (int)sizeof ip - 1) { ip[ip_len++] = k; ip[ip_len] = '\0'; }
+                }
+            if (en_now && !en_prev) {
+                if (sel == 0 || sel == 1) {          /* Single / Host -> world list */
+                    want_host = (sel == 1);
+                    n_worlds = persist_list_worlds(WORLD_SAVE_ROOT, worlds, MENU_MAX_WORLDS);
+                    wsel = 0; screen = SCR_WORLDS;
+                } else if (sel == 2 && ip_len > 0) {
+                    int j; c.mode = CHOICE_JOIN;
+                    for (j = 0; j <= ip_len; ++j) c.ip[j] = ip[j];
+                    return c;
+                } else if (sel == 3) { c.mode = CHOICE_QUIT; return c; }
+            }
+        } else if (screen == SCR_WORLDS) {
+            int nitems = n_worlds + 1;               /* + "Create New World" */
+            if (up_now && !up_prev) wsel = (wsel + nitems - 1) % nitems;
+            if (dn_now && !dn_prev) wsel = (wsel + 1) % nitems;
+            if (del_now && !del_prev && wsel < n_worlds) screen = SCR_CONFIRM_DEL;
+            if (en_now && !en_prev) {
+                if (wsel < n_worlds) {               /* play / host this world */
+                    int j;
+                    c.mode = want_host ? CHOICE_HOST : CHOICE_SINGLE;
+                    c.seed = worlds[wsel].seed;
+                    for (j = 0; j < WORLD_DIR_MAX - 1 && worlds[wsel].dir[j]; ++j) c.dir[j] = worlds[wsel].dir[j];
+                    c.dir[j] = '\0';
+                    return c;
+                }
+                cname[0] = cseed[0] = '\0';          /* -> Create New World */
+                cname_len = cseed_len = cfocus = 0;
+                screen = SCR_CREATE;
+            }
+            if (esc_now && !esc_prev) screen = SCR_MENU;
+        } else if (screen == SCR_CREATE) {
+            if ((up_now && !up_prev) || (dn_now && !dn_prev)) cfocus ^= 1;
             for (i = 0; i < tn; ++i) {
                 char k = tb[i];
-                if (k == 0x08) { if (ip_len > 0) ip[--ip_len] = '\0'; }
-                else if (ip_len < (int)sizeof ip - 1) { ip[ip_len++] = k; ip[ip_len] = '\0'; }
+                if (cfocus == 0) {
+                    if (k == 0x08) { if (cname_len > 0) cname[--cname_len] = '\0'; }
+                    else if (cname_len < (int)sizeof cname - 1) { cname[cname_len++] = k; cname[cname_len] = '\0'; }
+                } else {
+                    if (k == 0x08) { if (cseed_len > 0) cseed[--cseed_len] = '\0'; }
+                    else if (cseed_len < (int)sizeof cseed - 1) { cseed[cseed_len++] = k; cseed[cseed_len] = '\0'; }
+                }
             }
-        }
-
-        if (en_now && !en_prev) {
-            if (sel == 0) { c.mode = CHOICE_SINGLE; return c; }
-            if (sel == 1) { c.mode = CHOICE_HOST;   return c; }
-            if (sel == 2 && ip_len > 0) {
-                int j; c.mode = CHOICE_JOIN;
-                for (j = 0; j <= ip_len; ++j) c.ip[j] = ip[j];
-                return c;
+            if (en_now && !en_prev && cname_len > 0) {
+                uint64_t seed = menu_parse_seed(cseed);
+                char dir[WORLD_DIR_MAX];
+                if (persist_world_create(WORLD_SAVE_ROOT, cname, seed, dir, (int)sizeof dir) == 0) {
+                    int j;
+                    c.mode = want_host ? CHOICE_HOST : CHOICE_SINGLE;
+                    c.seed = seed;
+                    for (j = 0; j < WORLD_DIR_MAX - 1 && dir[j]; ++j) c.dir[j] = dir[j];
+                    c.dir[j] = '\0';
+                    return c;
+                }                                    /* create failed: stay on the screen */
             }
-            if (sel == 3) { c.mode = CHOICE_QUIT;   return c; }
+            if (esc_now && !esc_prev) screen = SCR_WORLDS;
+        } else {                                     /* SCR_CONFIRM_DEL */
+            if (en_now && !en_prev) {
+                if (wsel < n_worlds) persist_world_delete(worlds[wsel].dir);
+                n_worlds = persist_list_worlds(WORLD_SAVE_ROOT, worlds, MENU_MAX_WORLDS);
+                if (wsel > n_worlds) wsel = n_worlds;
+                screen = SCR_WORLDS;
+            }
+            if (esc_now && !esc_prev) screen = SCR_WORLDS;
         }
         up_prev = up_now; dn_prev = dn_now; en_prev = en_now;
+        esc_prev = esc_now; del_prev = del_now;
 
-        render_begin(mvp, 1.0f);                     /* clear */
+        render_begin(mvp, 1.0f);
         render_end();
-        draw_connect_screen(aspect, sel, ip);
+        if      (screen == SCR_MENU)    draw_connect_screen(aspect, sel, ip);
+        else if (screen == SCR_WORLDS)  draw_world_list(aspect, worlds, n_worlds, wsel, want_host);
+        else if (screen == SCR_CREATE)  draw_create_world(aspect, cname, cseed, cfocus);
+        else                            draw_confirm_delete(aspect, (wsel < n_worlds) ? worlds[wsel].name : "");
         plat_swap_buffers();
 
         { double used = plat_time_ms() - t0;         /* ~30 fps cap (no busy spin) */
@@ -1136,7 +1324,21 @@ int main(void)
         if (cw <= 0 || ch <= 0) { cw = win_w; ch = win_h; }
         render_begin(mvp, 1.0f);
         render_end();
-        draw_connect_screen((float)cw / (float)ch, 2, "127.0.0.1");
+        {   /* VOXEL_MENU_SCREEN selects which screen to capture (default: the menu). */
+            const char *which = getenv("VOXEL_MENU_SCREEN");
+            float a = (float)cw / (float)ch;
+            if (which && strcmp(which, "worlds") == 0) {
+                WorldInfo w[MENU_MAX_WORLDS];
+                int n = persist_list_worlds(WORLD_SAVE_ROOT, w, MENU_MAX_WORLDS);
+                draw_world_list(a, w, n, 0, 0);
+            } else if (which && strcmp(which, "create") == 0) {
+                draw_create_world(a, "My World", "", 0);
+            } else if (which && strcmp(which, "confirm") == 0) {
+                draw_confirm_delete(a, "My World");
+            } else {
+                draw_connect_screen(a, 2, "127.0.0.1");
+            }
+        }
         if (render_screenshot_ppm(shot_path, cw, ch) == 0)
             fprintf(stderr, "main: wrote connect-screen screenshot %s\n", shot_path);
         mesh_buffer_free(&scratch);
@@ -1164,17 +1366,28 @@ int main(void)
                        || (getenv("VOXEL_HOST")    && getenv("VOXEL_HOST")[0])
                        || (getenv("VOXEL_CONNECT") && getenv("VOXEL_CONNECT")[0]);
         int sframes = 0;
-        if (session_test)    { choice.mode = CHOICE_SINGLE; choice.ip[0] = '\0'; }
-        else if (env_single) { choice.mode = CHOICE_ENV;    choice.ip[0] = '\0'; }
+        if (session_test)    { choice.mode = CHOICE_SINGLE; choice.ip[0] = '\0'; choice.dir[0] = '\0'; }
+        else if (env_single) { choice.mode = CHOICE_ENV;    choice.ip[0] = '\0'; choice.dir[0] = '\0'; }
         else {
             choice = connect_screen(win_w, win_h);
             if (choice.mode == CHOICE_QUIT) break;        /* exit program from the menu */
         }
 
-    seed = WORLD_SEED_DEFAULT;
-    seed_env = getenv("VOXEL_SEED");
-    if (seed_env != NULL && seed_env[0] != '\0')
-        seed = (uint64_t)strtoull(seed_env, NULL, 0);
+    /* 0.4 world management: when the menu chose a named world (choice.dir set), its
+     * seed + save dir drive this session. Otherwise (headless/scripted: ENV,
+     * session_test) fall back to the default/VOXEL_SEED seed + resolve_save_dir. */
+    {
+        int menu_world = (choice.dir[0] != '\0')
+                      && (choice.mode == CHOICE_SINGLE || choice.mode == CHOICE_HOST);
+        if (menu_world) {
+            seed = choice.seed;
+        } else {
+            seed = WORLD_SEED_DEFAULT;
+            seed_env = getenv("VOXEL_SEED");
+            if (seed_env != NULL && seed_env[0] != '\0')
+                seed = (uint64_t)strtoull(seed_env, NULL, 0);
+        }
+    }
 
     /* 0.3 multiplayer: open the network BEFORE world_init + persist. A CLIENT
      * completes the handshake here and ADOPTS the host's seed, so it generates the
@@ -1232,7 +1445,13 @@ int main(void)
          * host's relayed edits live; we do not open a local save. */
         persist = NULL;
     } else {
-        save_dir = resolve_save_dir(save_dir_buf, sizeof(save_dir_buf), seed);
+        /* 0.4: a menu-chosen world saves into ITS directory (saves/<slug>); the
+         * headless/scripted path keeps the seed-derived saves/<hex> dir. */
+        if (choice.dir[0] != '\0'
+            && (choice.mode == CHOICE_SINGLE || choice.mode == CHOICE_HOST))
+            save_dir = choice.dir;
+        else
+            save_dir = resolve_save_dir(save_dir_buf, sizeof(save_dir_buf), seed);
         persist = persist_open(save_dir, seed, WG_GEN_VERSION);
         if (persist == NULL)
             fprintf(stderr, "main: persist_open(%s) failed - edits will be "

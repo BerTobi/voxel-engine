@@ -19,6 +19,14 @@ milestone behind a `make check` regression gate; see `PLAN-0.4.md`.
 > (`NET_PROTOCOL_VERSION` 2→3) — both must update to play co-op.
 
 ### Added
+- **World save/load + a Minecraft-style menu.** "Single Player" / "Host Game" now open a
+  **world list** (select / create / delete) instead of a single fixed world. Each world is a
+  named save directory (`saves/<slug>/` with a `world.meta` recording its display name + seed);
+  **Create New World** takes a name + an optional seed (blank → random, typed → numeric or
+  string-hashed). The list scrolls past 7 worlds, sorts by name, and confirms deletes. Hosting
+  hosts the selected world. Existing single-player saves still load via the env/`VOXEL_SAVE`
+  path. New cross-platform world enumeration/create/delete in `persist.c` (opendir/readdir on
+  POSIX, FindFirstFile on Win32). _(Win32 fs path is compile-verified; not yet run under Wine.)_
 - _(M0)_ `make check` aggregate regression gate (runs every unit suite, fails on the
   first non-zero exit) + a GL-free **CA determinism harness** (`testdeterminism`,
   `sim_state_hash`) — the substrate the multiplayer determinism work is verified on.

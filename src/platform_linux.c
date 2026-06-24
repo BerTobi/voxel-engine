@@ -109,6 +109,7 @@ static int keysym_to_plat(KeySym ks)
     case XK_Up:          return PLAT_KEY_UP;
     case XK_Down:        return PLAT_KEY_DOWN;
     case XK_Return: case XK_KP_Enter: return PLAT_KEY_ENTER;
+    case XK_j: case XK_J: return PLAT_KEY_J;
     default:             return -1;
     }
 }

@@ -105,6 +105,7 @@ void   plat_set_fullscreen(int on);
 #define PLAT_KEY_UP     13   /* pause-menu navigation (0.3)                      */
 #define PLAT_KEY_DOWN   14
 #define PLAT_KEY_ENTER  15
-#define PLAT_KEY_COUNT  16   /* size of the backend's key-state array */
+#define PLAT_KEY_J      16   /* toggle the in-world progression journal (0.4 M2) */
+#define PLAT_KEY_COUNT  17   /* size of the backend's key-state array */
 
 #endif /* PLATFORM_H */

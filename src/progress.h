@@ -458,4 +458,13 @@ int prog_has_discovered(const ProgressState *ps, ProgressKind kind, uint8_t mat)
  * blind copy of MaterialDef.melt_point_c's code. */
 const MaterialJournal *prog_journal_of(const ProgressState *ps, uint8_t mat);
 
+/* ---- 0.4 M2: read-only HUD accessors (the in-world journal) -------------- *
+ * Compact snprintf-into-buffer forms of the console-journal phrasing, so the
+ * in-world HUD (main.c) reuses progress.c's wording through ONE source and is
+ * compiler-enforced read-only (const ProgressState*) - it cannot mutate the
+ * observer. NULL/out-of-range-safe (write an empty string). */
+int  prog_discovery_count(const ProgressState *ps);
+void prog_discovery_text(const ProgressState *ps, int i, char *out, int cap);
+void prog_tier_text(const ProgressState *ps, char *out, int cap);
+
 #endif /* PROGRESS_H */

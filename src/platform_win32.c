@@ -111,6 +111,7 @@ static int vk_to_plat(WPARAM vk)
     case VK_UP:      return PLAT_KEY_UP;     /* pause-menu navigation */
     case VK_DOWN:    return PLAT_KEY_DOWN;
     case VK_RETURN:  return PLAT_KEY_ENTER;
+    case 'J':        return PLAT_KEY_J;      /* toggle in-world journal (0.4 M2) */
     default:         return -1;
     }
 }

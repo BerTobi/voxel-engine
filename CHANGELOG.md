@@ -26,6 +26,11 @@ milestone behind a `make check` regression gate; see `PLAN-0.4.md`.
   core to the crust directly under the spawn pole, where `demo_decorate` carves a stone
   **cavity** holding a lava pool with a copper charge submerged — the trapped heat melts
   the charge past 1085 °C (the emergent smelter), now visible from the surface.
+- _(M2)_ The engine's first **in-world progression journal**: a discovery **toast** when a
+  new transition is first observed, and a toggleable **journal panel** (`J`) listing recent
+  discoveries + the current capability tier — surfacing `progress.c` (console-only since 0.1)
+  via the 0.3 text/UI primitives. The HUD reads the observer through a `const` handle, so the
+  read-only "remove it and the sim is byte-identical" invariant is compiler-enforced.
 
 ## 0.3.0 — 2026-06-17 — Multiplayer
 

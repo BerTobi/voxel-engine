@@ -591,6 +591,60 @@ static void mark_home_modified(Chunk *c)
 /* ---- 0.3 pause menu (screen-space, drawn over the frozen frame) ---------- *
  * NDC: x,y in [-1,1], centre (0,0), y up. `aspect` keeps the font square. The
  * coordinates are tuned by eye against the headless VOXEL_MENU screenshot. */
+/* 0.4 M2: the in-world progression JOURNAL HUD. Surfaces the read-only observer
+ * (progress.c, console-only since 0.1) with the 0.3 text/UI primitives: a
+ * transient discovery TOAST when a new (kind,material) is first observed, and a
+ * toggleable JOURNAL panel (J) listing the most recent discoveries + the current
+ * capability tier. `ps` is `const ProgressState *` - the read-only contract is
+ * COMPILER-ENFORCED here, not just documented; the HUD only READS the observer
+ * and never touches sim state (the byte-identical "remove the observer" invariant
+ * is preserved). Drawn after render_end via the overlay program (NDC, y up). */
+static void draw_journal_hud(const ProgressState *ps, float aspect,
+                             int journal_open, int toast_active,
+                             const char *toast_line)
+{
+    if (ps == NULL)
+        return;
+
+    /* Discovery TOAST - a banner near the top. The caller owns the lifetime
+     * (toast_active); reads as something the player just SAW. */
+    if (toast_active && toast_line != NULL && toast_line[0] != '\0') {
+        render_ui_rect(-0.62f, 0.78f, 0.62f, 0.93f, 0.10f, 0.11f, 0.15f, 0.85f);
+        render_text(-0.58f, 0.905f, 0.040f, aspect, 1.0f, 0.82f, 0.25f, 1.0f,
+                    "DISCOVERY");
+        render_text(-0.58f, 0.850f, 0.050f, aspect, 1.0f, 1.0f, 1.0f, 1.0f,
+                    toast_line);
+    }
+
+    /* JOURNAL panel (J): recent discoveries (newest first) + the current tier. */
+    if (journal_open) {
+        char line[64];
+        int  n     = prog_discovery_count(ps);
+        int  shown = (n > 8) ? 8 : n;
+        int  i;
+        float y = 0.50f;
+        render_ui_rect(-0.92f, -0.62f, 0.06f, 0.66f, 0.06f, 0.07f, 0.10f, 0.92f);
+        render_text(-0.88f, 0.60f, 0.060f, aspect, 1.0f, 0.85f, 0.20f, 1.0f,
+                    "JOURNAL");
+        if (n == 0)
+            render_text(-0.88f, 0.44f, 0.040f, aspect, 0.70f, 0.70f, 0.75f, 1.0f,
+                        "nothing observed yet");
+        for (i = 0; i < shown; ++i) {
+            prog_discovery_text(ps, n - 1 - i, line, (int)sizeof line);
+            render_text(-0.88f, y, 0.038f, aspect, 0.92f, 0.92f, 0.96f, 1.0f, line);
+            y -= 0.075f;
+        }
+        {
+            char tier[40], out[64];
+            prog_tier_text(ps, tier, (int)sizeof tier);
+            snprintf(out, sizeof out, "tier: %s", tier);
+            render_text(-0.88f, -0.50f, 0.045f, aspect, 0.55f, 0.85f, 1.0f, 1.0f, out);
+        }
+        render_text(-0.88f, -0.58f, 0.030f, aspect, 0.50f, 0.50f, 0.55f, 1.0f,
+                    "[J] close");
+    }
+}
+
 static void draw_pause_menu(float aspect, int sel, int fullscreen_on)
 {
     const char *labels[4];
@@ -1263,6 +1317,15 @@ int main(void)
     int paused        = (getenv("VOXEL_MENU") != NULL);
     int menu_sel      = 0;
     int esc_prev = 0, up_prev = 0, down_prev = 0, enter_prev = 0;
+    /* 0.4 M2: the in-world journal. J toggles it live; VOXEL_JOURNAL starts it
+     * open so a headless VOXEL_SHOT can capture the panel (mirrors VOXEL_MENU).
+     * The discovery TOAST is latched at the per-frame observer drain below and
+     * shown until toast_until (wall-ms). All frame-local - never sim state. */
+    int    journal_open = (getenv("VOXEL_JOURNAL") != NULL);
+    int    j_prev = 0;
+    double toast_until = 0.0;
+    char   toast_line[48];
+    toast_line[0] = '\0';
     sim_accum_ms = 0.0;            /* per-session: don't inherit the prior session's accumulator */
 
     /* The live-session capture-enable above ran unconditionally; if we start
@@ -1334,6 +1397,14 @@ int main(void)
                 }
             }
             esc_prev = esc_now; up_prev = up_now; down_prev = down_now; enter_prev = enter_now;
+
+            /* 0.4 M2: J toggles the in-world journal (live, not while paused). */
+            {
+                int j_now = plat_key_down(PLAT_KEY_J);
+                if (j_now && !j_prev && !paused)
+                    journal_open = !journal_open;
+                j_prev = j_now;
+            }
         }
 
         /* --- FPS free-look: mouse turns, WASD moves relative to facing ---- *
@@ -1696,8 +1767,15 @@ int main(void)
          * it never writes a voxel or a sim field, so removing this call (or running
          * with prog_state == NULL) leaves the simulation byte-identical. NULL-safe
          * when the observer alloc failed. */
-        if (prog_state != NULL)
-            prog_observe_drain(prog_state, prog_ring);
+        if (prog_state != NULL) {
+            int newd = prog_observe_drain(prog_state, prog_ring);
+            if (newd > 0) {        /* 0.4 M2: latch a toast for the newest discovery */
+                prog_discovery_text(prog_state,
+                                    prog_discovery_count(prog_state) - 1,
+                                    toast_line, (int)sizeof toast_line);
+                toast_until = frame_start + 4500.0;   /* ~4.5 s on screen */
+            }
+        }
 
         /* --- Build the model-view-projection (column-major) -------------- */
         {
@@ -1785,6 +1863,13 @@ int main(void)
                 render_highlight_voxel(hl_x, hl_y, hl_z);
             if (shot_path == NULL)
                 render_crosshair(aspect);
+            /* 0.4 M2: the in-world journal HUD (discovery toast + the J panel),
+             * beneath the pause menu. Drawn live AND in shot mode (so a headless
+             * VOXEL_JOURNAL capture works); suppressed while paused so the menu
+             * owns the screen. */
+            if (!paused)
+                draw_journal_hud(prog_state, aspect, journal_open,
+                                 frame_start < toast_until, toast_line);
             if (paused)                          /* 0.3: pause menu over the frozen scene */
                 draw_pause_menu(aspect, menu_sel, fullscreen_on);
         }

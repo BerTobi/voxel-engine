@@ -488,3 +488,59 @@ const MaterialJournal *prog_journal_of(const ProgressState *ps, uint8_t mat)
         return NULL;
     return &ps->journal[mat];
 }
+
+/* =====================================================================
+ *  0.4 M2: read-only HUD accessors (the in-world journal)
+ * ===================================================================== *
+ * Compact forms of the console-journal phrasing above, written into a caller
+ * buffer, so the in-world HUD reads identically. All const ProgressState* -
+ * pure reads, no sim coupling, no float on any path the sim runs. */
+int prog_discovery_count(const ProgressState *ps)
+{
+    return (ps != NULL) ? (int)ps->n_discoveries : 0;
+}
+
+void prog_discovery_text(const ProgressState *ps, int i, char *out, int cap)
+{
+    const DiscoveryRecord *d;
+    const char *name;
+    int c;
+    if (out == NULL || cap <= 0)
+        return;
+    out[0] = '\0';
+    if (ps == NULL || i < 0 || i >= (int)ps->n_discoveries)
+        return;
+    d    = &ps->discoveries[i];
+    name = material_get(d->material)->name;
+    c    = observed_celsius(d->observed_temp_code);
+    switch ((ProgressKind)d->kind) {
+    case PROG_MELT:
+        snprintf(out, (size_t)cap, "%s melts (~%d C)", name, c);
+        break;
+    case PROG_FREEZE: {
+        const char *solid =
+            material_get(material_get(d->material)->freezes_to)->name;
+        snprintf(out, (size_t)cap, "%s re-solidifies (~%d C)", solid, c);
+        break;
+    }
+    case PROG_TEMP_TIER:
+        snprintf(out, (size_t)cap, "forge sustained ~%d C", c);
+        break;
+    case PROG_FLUID_POOL:
+        snprintf(out, (size_t)cap, "%s pooled as liquid", name);
+        break;
+    default:
+        break;
+    }
+}
+
+void prog_tier_text(const ProgressState *ps, char *out, int cap)
+{
+    static const char *TIER_NAME[5] = {
+        "none", "warm (~200 C)", "hot (~500 C)",
+        "forge (~1000 C)", "furnace (~1500 C)"
+    };
+    if (out == NULL || cap <= 0)
+        return;
+    snprintf(out, (size_t)cap, "%s", TIER_NAME[(int)prog_tier_now(ps)]);
+}

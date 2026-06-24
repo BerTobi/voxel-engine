@@ -92,32 +92,32 @@
  * developer roll a different landscape without a recompile. */
 #define WORLD_SEED_DEFAULT  0x5EED1234ABCD0001ull
 
-/* ---- The fixed HOME demo chunk (heat/fluid sim binds here) ---------------- *
- * The single-chunk heat+fluid SimState binds to ONE fixed world chunk so the
- * lava pool / copper columns / water demo always lands at a known location the
- * camera can frame. We pick a near-origin chunk in the UPPER band layer (cy 1,
- * world-Y 16..31) which sits ENTIRELY ABOVE the procedural surface (the
- * heightmap tops out at WG_HEIGHT_MAX=18, in world-Y 16..18 -> local rows 0..2
- * of cy 1), so demo_decorate can build a clean stone pedestal and stand the
- * lava/water demo on top of it in open air, fully visible regardless of the
- * rolling terrain underneath. HOME is in the resident band [WORLD_BAND_Y0..Y1]
- * (0..1), so it streams in like any other chunk. With Section 8 persistence now
- * live, HOME is flagged CHUNK_MODIFIED after decoration (and whenever the sim
- * materially changes it), so flying away EVICTS it to disk and flying back LOADS
- * the evolved (decorated + settled) state rather than a fresh undecorated chunk;
- * the edits also survive a process restart. (If HOME re-loads from disk already
- * decorated, the attach path's demo_decorate is idempotent over the same
- * footprint, so re-decoration is a harmless no-op overwrite.) */
+/* ---- The fixed HOME forge chunk (heat sim binds here) --------------------- *
+ * The single-chunk heat SimState binds to ONE fixed world chunk so the forge
+ * demo always lands at a known, REACHABLE spot the spawn camera frames. 0.4 M1
+ * picks the CRUST chunk directly under the spawn pole: the player spawns above
+ * the planet's north pole (world (8, 134, 8), main.c camera setup); the pole
+ * SURFACE is world-Y 128 (= chunk cy 8), and HOME is the solid crust chunk just
+ * beneath it - chunk (0,7,0), world-Y 112..127 - so demo_decorate can carve a
+ * stone CAVITY into the crust and the player, standing on the surface, looks
+ * straight down into it. (The (0,1,0) used through 0.3 was ~40 voxels inside the
+ * solid core - a forge there was invisible/unreachable; this is the 0.4 M1 fix.)
+ * HOME is in the resident band [WORLD_BAND_Y0..Y1] (0..8), so it streams in like
+ * any other chunk. With persistence live, HOME is flagged CHUNK_MODIFIED after
+ * decoration (and whenever the sim materially changes it), so flying away EVICTS
+ * it to disk and flying back LOADS the evolved (carved + melted) state rather
+ * than a fresh chunk; the edits survive a process restart. (If HOME re-loads
+ * already decorated, home_is_decorated detects the held-lava marker and we skip
+ * re-decoration, preserving the player/sim's evolved state.) */
 #define HOME_CX           0
-#define HOME_CY           1
+#define HOME_CY           7
 #define HOME_CZ           0
 
-/* Local-Y of the pedestal top the demo sits on (also the camera's look height
- * once offset by the HOME chunk's world origin). The decoration footprint is
- * filled solid stone below this and the demo placed on top, recreating the flat
- * floor the heat/fluid demo was authored against - but raised clear of the
- * rolling terrain so it reads in frame. */
-#define DEMO_FLOOR_Y      8
+/* Local-Y the camera aims at (the forge's lava level), offset by the HOME chunk's
+ * world origin to give DEMO_WORLD_Y. The carved cavity + lava pool sit around
+ * this row (local y 10..12 -> world-Y 122..124), so the default look point lands
+ * on the glow. */
+#define DEMO_FLOOR_Y      12
 
 /* World-Y the camera aims at: HOME chunk origin + the pedestal floor. */
 #define DEMO_WORLD_Y      ((float)(HOME_CY * CHUNK_DIM + DEMO_FLOOR_Y))
@@ -475,157 +475,78 @@ static void apply_net_edit(int wx, int wy, int wz, uint32_t voxel, void *user)
 static void demo_decorate(Chunk *c)
 {
     int x, y, z;
+    const Voxel air    = make_voxel(MAT_AIR);
+    const Voxel lava   = make_voxel(MAT_LAVA);    /* MAT_EMISSIVE: sim auto-holds  */
+    const Voxel copper = make_voxel(MAT_COPPER);
 
     if (c->cx != HOME_CX || c->cy != HOME_CY || c->cz != HOME_CZ)
         return;
 
-    /* --- 0.3 asteroid prototype: demo decoration DISABLED --------------------
-     * The world is now a solid voxel BALL (worldgen.c). The flat-world lava/
-     * water/two-vase demo below would punch a lava+water pit into the asteroid,
-     * so it is short-circuited here. The body is kept (compiled but unreachable)
-     * as the 0.2 water reference; re-enable when fluids return to the sphere. */
-    (void)x; (void)y; (void)z;
-    return;
+    /* 0.4 M1 - a REACHABLE SURFACE FORGE. HOME is the crust chunk directly under
+     * the spawn pole (chunk (0,7,0), world-Y 112..127); the planet's north-pole
+     * surface is world-Y 128, one voxel above the chunk top. The chunk arrives
+     * from worldgen as solid stone, so we CARVE a stone CAVITY into it and stand a
+     * held lava pool inside with a copper charge SUBMERGED: the surrounding stone
+     * is a poor conductor (emergent insulation), so the trapped heat drives the
+     * charge past copper's 1085 C melt point and it MELTS into molten copper - no
+     * recipe, just heat crossing a MaterialDef threshold (the forge thesis). The
+     * cavity opens at the chunk top so the glow reads from the surface above.
+     * Everything is INTERIOR in x/z (the single-chunk sim treats out-of-chunk
+     * faces as a closed wall; the top opening at y=15 is a closed wall too, which
+     * only helps here - it traps heat). Player-lit COMBUSTION (fuel as a real
+     * progression axis) is the 0.5 headline; 0.4 hands the player a NATURAL lava
+     * source to trap and learn from. */
 
-    /* Pedestal: fill the demo footprint (x 2..11, z 2..7) solid stone from the
-     * chunk floor up to DEMO_FLOOR_Y-1, giving the demo a flat floor at local-Y
-     * DEMO_FLOOR_Y clear of the rolling terrain below. */
-    for (x = 2; x <= 11; ++x)
-        for (z = 2; z <= 7; ++z)
-            for (y = 0; y < DEMO_FLOOR_Y; ++y)
-                chunk_set(c, x, y, z, make_voxel(MAT_STONE));
+    /* The lava POOL: a 3x3x3 block (x7..9, z7..9, y10..12 -> world-Y 122..124),
+     * walled and floored by the surrounding un-carved STONE (the insulating
+     * cavity) so the finite lava cannot drain. MAT_LAVA is MAT_EMISSIVE, so
+     * sim_init auto-registers every lava voxel as a held ~1150 C Dirichlet source. */
+    for (x = 7; x <= 9; ++x)
+        for (z = 7; z <= 9; ++z)
+            for (y = 10; y <= 12; ++y)
+                chunk_set(c, x, y, z, lava);
 
-    /* Emergent-smelter demo. A lava pool (held at ~1160 C, surface at the floor
-     * +2) with copper columns standing in it. A column voxel ringed by lava on
-     * its 4 sides is driven toward the lava temperature and, once it banks its
-     * latent heat of fusion, MELTS into molten copper - no scripted recipe, just
-     * heat crossing copper's 1085 C melt point. A stone column never melts. Lava
-     * is also the M2 block-light source (MAT_EMISSIVE); the sim auto-holds every
-     * emissive voxel. */
+    /* The copper CHARGE, fully submerged at the pool centre (8,11,8): lava on all
+     * six faces (the proven melt rig from test_sim/test_progress). It banks its
+     * latent heat of fusion over many ticks, plateaus at the melt point, then
+     * flips to molten copper - the emergent smelter. */
+    chunk_set(c, 8, 11, 8, copper);
 
-    /* Lava BASIN walls. The held-heat/held-fill decoupling means the lava now
-     * holds its TEMPERATURE (Dirichlet heat source, still drives melting) but its
-     * fill is CONSERVED - it is no longer an inexhaustible spring. So a physical
-     * WALL is what keeps the pool in place (without it the finite lava would still
-     * flow off the open pedestal once and drain). Extend the pedestal under a 7x7
-     * tub (x,z 1..7) and raise a 1-thick stone wall ring around the 5x5 pool, one
-     * voxel above the lava surface (to floor+3) so nothing spills over. */
-    for (x = 1; x <= 7; ++x)
-        for (z = 1; z <= 7; ++z) {
-            for (y = 0; y < DEMO_FLOOR_Y; ++y)            /* extend pedestal floor */
-                chunk_set(c, x, y, z, make_voxel(MAT_STONE));
-            if (x == 1 || x == 7 || z == 1 || z == 7)     /* perimeter wall ring   */
-                for (y = DEMO_FLOOR_Y; y <= DEMO_FLOOR_Y + 3; ++y)
-                    chunk_set(c, x, y, z, make_voxel(MAT_STONE));
-        }
+    /* Open a 3x3 viewing shaft above the pool (x7..9, z7..9, y13..15 -> world-Y
+     * 125..127) up to the chunk top, so the glow + the melt read from the surface
+     * (the chunk above, cy 8, is open air over the pole). The lava's top face
+     * (y12) vents into this shaft, but lava is a HELD source (re-stamped each
+     * tick), so venting never cools it - the submerged charge still melts. */
+    for (x = 7; x <= 9; ++x)
+        for (z = 7; z <= 9; ++z)
+            for (y = 13; y <= 15; ++y)
+                chunk_set(c, x, y, z, air);
 
-    /* Lava pool: 5x5 footprint (x,z 2..6), 3 deep (y floor..floor+2), inside the
-     * walled tub above so it stays contained. */
-    for (x = 2; x <= 6; ++x)
-        for (z = 2; z <= 6; ++z)
-            for (y = DEMO_FLOOR_Y; y <= DEMO_FLOOR_Y + 2; ++y)
-                chunk_set(c, x, y, z, make_voxel(MAT_LAVA));
-
-    /* Four 1x1 copper columns inside the pool (y floor..floor+3) - their
-     * submerged, lava-ringed voxels melt - plus one stone column that never
-     * melts. */
-    {
-        static const int cols[4][2] = { {3,3}, {3,5}, {5,3}, {5,5} };
-        int i;
-        for (i = 0; i < 4; ++i)
-            for (y = DEMO_FLOOR_Y; y <= DEMO_FLOOR_Y + 3; ++y)
-                chunk_set(c, cols[i][0], y, cols[i][1], make_voxel(MAT_COPPER));
-    }
-    for (y = DEMO_FLOOR_Y; y <= DEMO_FLOOR_Y + 3; ++y)
-        chunk_set(c, 6, y, 2, make_voxel(MAT_STONE));
-
-    /* Water demo (ARCHITECTURE Section 3): a raised 3x3x5 block of water (fill 15,
-     * 45 cells) that FALLS and settles into a level pool inside a WALLED stone
-     * BASIN, east of the lava tub. The basin is essential: the demo HOME chunk
-     * sits at cy 1, so its local-Y 0 is a CHUNK-BOUNDARY face. Cross-chunk
-     * vertical fluid flow is deferred, so water that runs off an open pedestal
-     * edge cascades to that boundary and pools there - visually "floating" a full
-     * chunk above the terrain below, never touching ground. Containing the water
-     * (like the lava tub) makes it a clean puddle resting on the pedestal floor.
-     * Basin footprint x8..12, z4..8 (extends the pedestal a little east/south,
-     * staying interior to the chunk); a 1-thick wall ring rises to floor+6, tall
-     * enough to hold the settled pool (45 cells / 3x3 = 5 deep -> floor..floor+4)
-     * with freeboard, so nothing spills. The pool is clear of the lava tub (x<=7)
-     * and the chunk's 0/15 faces; different liquids never merge anyway. */
-    for (x = 8; x <= 12; ++x)
-        for (z = 4; z <= 8; ++z) {
-            for (y = 0; y < DEMO_FLOOR_Y; ++y)              /* extend pedestal floor */
-                chunk_set(c, x, y, z, make_voxel(MAT_STONE));
-            if (x == 8 || x == 12 || z == 4 || z == 8)      /* perimeter wall ring   */
-                for (y = DEMO_FLOOR_Y; y <= DEMO_FLOOR_Y + 6; ++y)
-                    chunk_set(c, x, y, z, make_voxel(MAT_STONE));
-        }
-    /* The raised water column inside the basin (interior x9..11, z5..7), starting
-     * a couple of cells above the floor so it visibly FALLS and equalises into a
-     * level pool that rests on - and touches - the pedestal floor. */
-    for (x = 9; x <= 11; ++x)
-        for (z = 5; z <= 7; ++z)
-            for (y = DEMO_FLOOR_Y + 2; y <= DEMO_FLOOR_Y + 6; ++y)
-                chunk_set(c, x, y, z, make_liquid(MAT_WATER));
-
-    /* COMMUNICATING VESSELS demo (0.2 connected-body finisher) with a MANUAL VALVE.
-     * Two EQUAL walled vases (4 wide x 3 deep each) split by a SOLID divider whose
-     * base is a DIRT "valve" - so they start DISCONNECTED: the left vase is brim-full
-     * and the right is empty, and nothing moves (the full vase sits asleep). Break
-     * the dirt valve (left-click) to open a floor channel; water then runs into the
-     * empty right vase from below and the connected-body finisher raises it until
-     * BOTH surfaces meet at the same level - hydrostatic equilibrium ON DEMAND (the
-     * local gravity+lateral rule alone only fills the right vase's floor row; the
-     * finisher lifts the rest as a snap). Sits north of the water basin (z 9..13) on
-     * its own stone pedestal, interior to the HOME chunk and clear of its faces; the
-     * right vase is OPEN so the rise reads from above. Footprint x 2..12, z 9..13. */
-    {
-        const int F = DEMO_FLOOR_Y, VTOP = DEMO_FLOOR_Y + 6;  /* < 15: clear of top */
-        /* Pedestal floor + outer wall ring (x2,x12,z9,z13) up to the vase rim. */
-        for (x = 2; x <= 12; ++x)
-            for (z = 9; z <= 13; ++z) {
-                for (y = 0; y < F; ++y)
-                    chunk_set(c, x, y, z, make_voxel(MAT_STONE));
-                if (x == 2 || x == 12 || z == 9 || z == 13)
-                    for (y = F; y <= VTOP; ++y)
-                        chunk_set(c, x, y, z, make_voxel(MAT_STONE));
-            }
-        /* Divider at x=7: a SOLID stone wall (interior depth z 10..12, y F..VTOP) -
-         * a CLOSED valve, so the two vases start disconnected. */
-        for (z = 10; z <= 12; ++z)
-            for (y = F; y <= VTOP; ++y)
-                chunk_set(c, 7, y, z, make_voxel(MAT_STONE));
-        /* The VALVE: a dirt strip at the divider's base (x7, F, z 10..12). Break it
-         * (left-click) to open the floor channel and start the flow on demand; dirt
-         * blocks water exactly like stone until broken, and reads as a distinct
-         * brown band marking where to open. */
-        for (z = 10; z <= 12; ++z)
-            chunk_set(c, 7, F, z, make_voxel(MAT_DIRT));
-        /* Left vase (x 3..6, z 10..12) brim-full to F+5; right vase (x 8..11) left
-         * empty and OPEN. Equal cross-sections, so once the valve opens they level
-         * to a clean common surface; until then the full left vase sits STILL. */
-        for (x = 3; x <= 6; ++x)
-            for (z = 10; z <= 12; ++z)
-                for (y = F; y <= F + 5; ++y)
-                    chunk_set(c, x, y, z, make_liquid(MAT_WATER));
-    }
+    /* Two reachable copper-ORE voxels set into the shaft wall (x6/x10, y14): far
+     * enough from the lava that they only warm, never melt - mineable ore the
+     * player carries to the heat, vs the submerged charge that melts. (When the
+     * player can MAKE heat, in 0.5, this is the loop's other half.) */
+    chunk_set(c, 6, 14, 8, copper);
+    chunk_set(c, 10, 14, 8, copper);
 }
 
-/* True iff HOME already carries the demo (either decorated this run, or LOADED
- * from a previous run's save). Probes the lava-pool corner at (2,DEMO_FLOOR_Y,2):
- * a fresh worldgen HOME is open air there (cy 1 sits entirely above the surface),
- * while a decorated/persisted HOME has the lava source there - and lava is a held
- * heat+fill source the sim NEVER drains, so the marker survives any amount of sim
+/* True iff HOME already carries the forge (decorated this run, or LOADED from a
+ * previous run's save). Probes the lava-pool floor centre (8,10,8): a fresh
+ * worldgen HOME is solid STONE there (sub-surface crust), while a decorated/
+ * persisted HOME has the held lava source there - and lava is a held heat source
+ * the sim NEVER drains or melts, so the marker survives any amount of sim
  * evolution. This is the guard that makes the cross-restart demo correct: on a
- * re-run HOME loads its EVOLVED (decorated + settled) voxels from disk and we must
- * NOT re-stamp the pristine authored decoration over them. demo_decorate itself is
- * idempotent for the static pieces, but re-stamping would CLOBBER melted copper /
- * settled water / banked heat the player (sim) produced and we just reloaded. */
+ * re-run HOME loads its EVOLVED (carved + melted) voxels from disk and we must
+ * NOT re-stamp the pristine authored decoration over them - that would CLOBBER
+ * the melted copper / banked heat the player (sim) produced and we just reloaded. */
 static int home_is_decorated(const Chunk *c)
 {
     if (c == NULL)
         return 0;
-    return vox_mat(chunk_get(c, 2, DEMO_FLOOR_Y, 2)) == MAT_LAVA;
+    /* Probe the forge pool's floor centre (8,10,8): a held lava source the sim
+     * NEVER drains or melts, so the marker survives any amount of sim evolution.
+     * A fresh-gen HOME is solid stone there; a decorated/persisted one has lava. */
+    return vox_mat(chunk_get(c, 8, 10, 8)) == MAT_LAVA;
 }
 
 /* ===================================================================== */

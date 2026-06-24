@@ -22,6 +22,10 @@ milestone behind a `make check` regression gate; see `PLAN-0.4.md`.
 - _(M0)_ `make check` aggregate regression gate (runs every unit suite, fails on the
   first non-zero exit) + a GL-free **CA determinism harness** (`testdeterminism`,
   `sim_state_hash`) — the substrate the multiplayer determinism work is verified on.
+- _(M1)_ A **reachable surface forge**: the heat sim's HOME chunk moves from the buried
+  core to the crust directly under the spawn pole, where `demo_decorate` carves a stone
+  **cavity** holding a lava pool with a copper charge submerged — the trapped heat melts
+  the charge past 1085 °C (the emergent smelter), now visible from the surface.
 
 ## 0.3.0 — 2026-06-17 — Multiplayer
 

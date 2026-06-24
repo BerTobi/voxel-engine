@@ -546,6 +546,24 @@ void net_set_chunk_server(NetState *n,
     if (n) { n->chunk_serve = serve; n->chunk_serve_user = user; }
 }
 
+/* 0.4 M5: host-authoritative CA streaming. PUSH a chunk delta (a MSG_CDATA body,
+ * built by chunksync_serve) to every live client, UNSOLICITED - clients apply it
+ * via the same chunk_apply path as a requested delta. BACKPRESSURE-SAFE: a client
+ * without room is SKIPPED (NOT killed via conn_queue's overflow-kill) - the CA
+ * re-flags the chunk so a skipped client catches up on a later push, and a
+ * settled chunk's final state arrives once the buffer drains / on re-stream. */
+void net_host_push_chunk(NetState *n, const unsigned char *payload, int len)
+{
+    int i;
+    if (n == NULL || n->mode != NET_HOST || len <= 0) return;
+    for (i = 0; i < (int)NET_MAX_PLAYERS; ++i) {
+        Conn *c = &n->conns[i];
+        if (c->used && !c->dead && !c->connecting &&
+            c->slen + NET_HDR + len <= NET_SEND_CAP)   /* room? skip (never kill) */
+            conn_queue(c, MSG_CDATA, payload, len);
+    }
+}
+
 void net_set_chunk_apply(NetState *n,
     void (*apply)(const unsigned char *, int, void *), void *user)
 {

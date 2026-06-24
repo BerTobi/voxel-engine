@@ -211,6 +211,24 @@ int main(void)
               g_apply_calls == 10, NULL);
     }
 
+    /* 0.4 M5: HOST-INITIATED chunk PUSH (the CA streaming channel). The host pushes
+     * a delta UNSOLICITED (no client request) via net_host_push_chunk; it must reach
+     * the client's apply callback byte-intact - the host-authoritative streaming
+     * path clients render the living world through. */
+    {
+        unsigned char buf[CHUNK_TEST_LEN];
+        int i;
+        buf[0] = (unsigned char)1337; buf[1] = (unsigned char)(1337 >> 8);
+        buf[2] = 0; buf[3] = 0;                       /* cx marker = 1337 */
+        for (i = 4; i < CHUNK_TEST_LEN; ++i) buf[i] = (unsigned char)(i * 7 + 1337);
+        g_apply_calls = 0; g_apply_len = 0; g_apply_ok = 0; g_apply_cx = 0;
+        net_host_push_chunk(host, buf, CHUNK_TEST_LEN);
+        pump(host, client, 16);
+        check("host PUSH (unsolicited) reached the client apply cb byte-intact",
+              g_apply_calls == 1 && g_apply_cx == 1337 &&
+              g_apply_len == CHUNK_TEST_LEN && g_apply_ok, NULL);
+    }
+
     net_shutdown(client);
     net_shutdown(host);
 

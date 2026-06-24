@@ -476,6 +476,7 @@ static int       g_xsim_cx[WORLDCA_MAX_XSIMS];  /* bind-time coords (eviction ch
 static int       g_xsim_cy[WORLDCA_MAX_XSIMS];
 static int       g_xsim_cz[WORLDCA_MAX_XSIMS];
 static int       g_nxsim   = 0;
+static unsigned char g_push_buf[NET_CHUNK_MAX]; /* 0.4 M5: host chunk-stream scratch */
 
 /* Canonical (cy,cz,cx) ordering predicate: 1 iff sim a sorts AFTER sim b. */
 static int casim_after(const SimState *a, const SimState *b)
@@ -1873,8 +1874,11 @@ int main(void)
          * interior face and the tick is order-independent (testdeterminism proves
          * it). Cross-chunk wake requests collected during READ (worldca_wfn) are
          * processed AFTER commit, so a chunk that heat first reaches starts ticking
-         * the NEXT world tick. Fluid faces stay CLOSED (inside sim.c). */
-        if (!paused) {
+         * the NEXT world tick. Fluid faces stay CLOSED (inside sim.c).
+         * 0.4 M5: CLIENTS run NO CA - host-authoritative streaming drives their
+         * world (they apply the host's pushed deltas and render them). Single-
+         * player (net==NULL) and the host run the CA. */
+        if (!paused && (net == NULL || net_mode(net) != NET_CLIENT)) {
             WorldCATickCtx wctx;
             int ticks = 0, i;
 
@@ -1948,6 +1952,8 @@ int main(void)
             {
                 SimState *all[1 + WORLDCA_MAX_XSIMS];
                 int nall = 0, budget = WORLD_REMESH_BUDGET;
+                int is_host = (net != NULL && net_mode(net) == NET_HOST);
+                int push_budget = 4;
                 if (sim->chunk != NULL) all[nall++] = sim;
                 for (i = 0; i < g_nxsim; ++i) all[nall++] = g_xsim[i];
                 for (i = 0; i < nall; ++i) {
@@ -1962,6 +1968,25 @@ int main(void)
                     cb_mesh_upload(sc, world_render_slot(world, sc), &stream_ctx);
                     sc->flags &= (uint8_t)~CHUNK_DIRTY_MESH;
                     all[i]->dirty_mesh = 0;
+                }
+                /* 0.4 M5: the HOST streams CA-changed chunks to clients. Push each
+                 * CHUNK_MODIFIED_BY_SIM chunk's delta-from-seed (the same payload a
+                 * CREQ reply builds, via chunksync_serve) and clear the flag; the
+                 * CA re-flags it on the next change, so a backpressure-skipped
+                 * client catches up. Clients run NO CA and just render these. */
+                if (is_host) {
+                    for (i = 0; i < nall && push_budget > 0; ++i) {
+                        Chunk *sc = all[i]->chunk;
+                        int plen;
+                        if (sc == NULL || !(sc->flags & CHUNK_MODIFIED_BY_SIM))
+                            continue;
+                        plen = chunksync_serve(sc->cx, sc->cy, sc->cz,
+                                               g_push_buf, (int)NET_CHUNK_MAX, &csctx);
+                        if (plen > 0)
+                            net_host_push_chunk(net, g_push_buf, plen);
+                        sc->flags &= (uint8_t)~CHUNK_MODIFIED_BY_SIM;
+                        --push_budget;
+                    }
                 }
             }
         }

@@ -45,6 +45,12 @@ milestone behind a `make check` regression gate; see `PLAN-0.4.md`.
   reaching a chunk boundary **wakes the neighbour chunk** (deferred, enqueue-only), so the
   CA propagates world-wide. The forge gains a lava chimney whose heat visibly crosses into the
   crust above. Single-machine deterministic; ASan/UBSan-clean.
+- _(M5)_ **Multiplayer sees the living world** — host-authoritative CA streaming. The host
+  runs the CA and **pushes** each changed chunk's delta to clients (`net_host_push_chunk`,
+  backpressure-safe); **clients run no CA** and render the host's stream. One authority means
+  no cross-peer divergence. `NET_PROTOCOL_VERSION` 2→3, so 0.3 and 0.4 peers refuse each other
+  at the handshake. Verified by a GL-free push test + a two-process loopback (client joins and
+  renders the host's melting forge).
 
 ## 0.3.0 — 2026-06-17 — Multiplayer
 

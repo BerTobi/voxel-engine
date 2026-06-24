@@ -29,7 +29,7 @@
 #define NET_MAX_PLAYERS      4u           /* host (id 0) + up to 3 clients      */
 #define NET_DEFAULT_PORT     9001         /* used when host/connect omits :port */
 #define NET_MAGIC            0x314E5856u   /* 'V''X''N''1' LE - handshake sentinel */
-#define NET_PROTOCOL_VERSION 2u           /* bump on ANY wire-format change (2: chunk sync) */
+#define NET_PROTOCOL_VERSION 3u           /* bump on ANY wire-format change (3: 0.4 host CA stream) */
 
 /* Max bytes of a serialized chunk delta (the MSG_CDATA payload main.c builds).
  * Worst case is a fully-rewritten 16^3 chunk: 4096 * (u16 index + u32 voxel) +
@@ -110,6 +110,15 @@ void net_drain_edits(NetState *n,
 
 /* CLIENT: request chunk (cx,cy,cz) from the host. No-op unless NET_CLIENT. */
 void net_request_chunk(NetState *n, int cx, int cy, int cz);
+
+/* HOST (0.4 M5): PUSH a chunk delta to every client, UNSOLICITED - the
+ * host-authoritative CA streaming channel. `payload`/`len` is a MSG_CDATA body
+ * (built by chunksync_serve, exactly like a CREQ reply); clients apply it through
+ * the same chunk_apply hook they use for requested deltas. BACKPRESSURE-SAFE: a
+ * client whose send buffer lacks room is SKIPPED (not killed) - the continuous CA
+ * re-flags the chunk so the client catches up on a later push. No-op unless
+ * NET_HOST. */
+void net_host_push_chunk(NetState *n, const unsigned char *payload, int len);
 
 /* HOST: install the server. On a request net.c calls serve(cx,cy,cz,out,cap,user);
  * write the MSG_CDATA payload into out (cap == NET_CHUNK_MAX) and return its length

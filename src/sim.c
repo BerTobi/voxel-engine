@@ -2117,3 +2117,29 @@ void sim_shutdown(SimState *s)
     s->dirty_mesh = 0;
     s->chunk      = NULL;
 }
+
+/* ---- Test-only determinism hash (0.4 M0; VOXEL_DETERMINISM_HARNESS) -------- *
+ * See sim.h. FNV-1a 64-bit over the bound chunk's voxels + the authoritative
+ * heat[]/latent[] side arrays. Compiled out of release builds entirely. */
+#ifdef VOXEL_DETERMINISM_HARNESS
+static uint64_t det_fnv1a(uint64_t h, const void *p, size_t n)
+{
+    const unsigned char *b = (const unsigned char *)p;
+    size_t i;
+    for (i = 0; i < n; ++i) {
+        h ^= (uint64_t)b[i];
+        h *= 1099511628211ull;            /* FNV-1a 64-bit prime */
+    }
+    return h;
+}
+uint64_t sim_state_hash(const SimState *s)
+{
+    uint64_t h = 14695981039346656037ull; /* FNV-1a 64-bit offset basis */
+    if (s == NULL || s->chunk == NULL)
+        return h;
+    h = det_fnv1a(h, s->chunk->voxels, sizeof s->chunk->voxels);
+    h = det_fnv1a(h, s->heat,          sizeof s->heat);
+    h = det_fnv1a(h, s->latent,        sizeof s->latent);
+    return h;
+}
+#endif /* VOXEL_DETERMINISM_HARNESS */

@@ -109,7 +109,7 @@ WIN_LDFLAGS := -static -static-libgcc -Wl,--gc-sections -mwindows
 WIN_LIBS    := -lopengl32 -lgdi32 -luser32 -lws2_32
 
 # ---- Targets -----------------------------------------------------------------
-.PHONY: all linux win test testsim testworld testpersist testprogress testraycast testedit testplayer testnet testchunksync version archive clean
+.PHONY: all linux win test testsim testworld testpersist testprogress testraycast testedit testplayer testnet testchunksync testdeterminism check version archive clean
 
 # Default target: native dev build.
 all: linux
@@ -221,6 +221,24 @@ testchunksync: | $(BUILD)
 		$(SRC)/material.c $(SRC)/chunk.c $(SRC)/worldgen.c $(SRC)/world.c \
 		$(SRC)/persist.c $(SRC)/chunksync.c $(SRC)/test_chunksync.c -lm
 	$(BUILD)/chunksync_test
+
+# 0.4 M0: the GL-free CA DETERMINISM harness. Drives sim_tick directly (no GL,
+# no platform, no sockets) and asserts byte-level reproducibility of the
+# single-machine CA via sim_state_hash, compiled in ONLY here via
+# -DVOXEL_DETERMINISM_HARNESS (so it is absent from release binaries - M6 checks).
+# This is the substrate the M5 two-peer render-fidelity test builds on.
+# apt: build-essential
+testdeterminism: | $(BUILD)
+	$(CC) -std=c99 -Wall -Wextra -Isrc -DVOXEL_DETERMINISM_HARNESS -o $(BUILD)/det_test \
+		$(SRC)/material.c $(SRC)/chunk.c $(SRC)/sim.c $(SRC)/progress.c $(SRC)/test_determinism.c -lm
+	$(BUILD)/det_test
+
+# 0.4 M0: the aggregate regression gate. Runs EVERY unit suite in order; make
+# aborts on the first suite whose binary exits non-zero (each test's exit code is
+# its failure count). This is the mechanically-enforced "full suite green" floor
+# every 0.4 milestone leans on - replaces the honour-system "run them all".
+check: test testsim testworld testpersist testprogress testraycast testedit testplayer testnet testchunksync testdeterminism
+	@echo "=== make check: ALL SUITES PASSED ==="
 
 # Create the build directory on demand (order-only prerequisite).
 $(BUILD):

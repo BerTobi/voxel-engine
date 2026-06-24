@@ -741,4 +741,18 @@ static inline uint8_t heat_to_code(int32_t heat) {
     return temp_encode_c((double)c);
 }
 
+/* ---- Test-only determinism hash (0.4 M0; VOXEL_DETERMINISM_HARNESS) -------- *
+ * FNV-1a 64-bit over the AUTHORITATIVE single-machine sim state: the bound
+ * chunk's voxel words plus the full-resolution heat[] and latent[] side arrays
+ * (the 8-bit voxel temp code is only a storage VIEW; heat[] is the truth, so a
+ * hash of the codes alone would miss sub-quantum divergence). Compiled ONLY when
+ * VOXEL_DETERMINISM_HARNESS is defined (the `make testdeterminism` build), so it
+ * is ABSENT from release binaries and never on the hot path (M6 verifies this).
+ * Position-indexed (not active-set order) => independent of wake history. The
+ * GL-free determinism harness (test_determinism.c) uses it to assert byte-level
+ * reproducibility of the CA; in M5 it backs the two-peer render-fidelity test. */
+#ifdef VOXEL_DETERMINISM_HARNESS
+uint64_t sim_state_hash(const SimState *s);
+#endif
+
 #endif /* SIM_H */

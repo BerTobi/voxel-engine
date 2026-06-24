@@ -406,6 +406,48 @@ static const uint8_t PLACE_MATS[5] = {
     MAT_STONE, MAT_DIRT, MAT_COPPER, MAT_WATER, MAT_LAVA
 };
 
+/* 0.4: the placement HOTBAR - the 5 PLACE_MATS as colour swatches along the
+ * bottom, the SELECTED slot ringed white with its material NAME above it (number
+ * keys 1..5 switch). Tells the player which block a right-click will place. Drawn
+ * over the scene via the overlay program (NDC, y up), live sessions only. */
+static void draw_hotbar(float aspect, int sel_mat)
+{
+    const float slot = 0.12f, gap = 0.012f;
+    const float total = 5.0f * slot + 4.0f * gap;
+    const float x0 = -total * 0.5f;             /* centred along the bottom */
+    const float yb = -0.97f, yt = -0.85f;
+    const MaterialDef *selm = material_get(PLACE_MATS[sel_mat]);
+    char nm[24];
+    int i, k;
+    const char *p;
+
+    render_ui_rect(x0 - 0.02f, yb - 0.02f, x0 + total + 0.02f, yt + 0.02f,
+                   0.0f, 0.0f, 0.0f, 0.55f);     /* backing panel */
+    for (i = 0; i < 5; ++i) {
+        const MaterialDef *m = material_get(PLACE_MATS[i]);
+        float sx = x0 + (float)i * (slot + gap);
+        char num[2];
+        if (i == sel_mat)                        /* selected: white ring behind the swatch */
+            render_ui_rect(sx - 0.013f, yb - 0.013f, sx + slot + 0.013f, yt + 0.013f,
+                           1.0f, 1.0f, 1.0f, 0.95f);
+        render_ui_rect(sx, yb, sx + slot, yt,
+                       m->color_rgba[0] / 255.0f, m->color_rgba[1] / 255.0f,
+                       m->color_rgba[2] / 255.0f, 1.0f);
+        num[0] = (char)('1' + i); num[1] = '\0';
+        render_text(sx + 0.007f, yt - 0.016f, 0.028f, aspect, 1, 1, 1, 1, num);
+    }
+    /* The selected block's NAME above its slot (the answer to "which block?"). */
+    k = 0;
+    for (p = selm->name; *p && k < (int)sizeof nm - 1; ++p) {
+        char ch = *p;
+        if (k == 0 && ch >= 'a' && ch <= 'z') ch = (char)(ch - 'a' + 'A');  /* Capitalise */
+        nm[k++] = ch;
+    }
+    nm[k] = '\0';
+    render_text(x0 + (float)sel_mat * (slot + gap), yt + 0.05f, 0.045f, aspect,
+                1.0f, 0.95f, 0.55f, 1.0f, nm);
+}
+
 /* floor(w/16) without relying on implementation-defined signed right-shift. */
 static int floordiv16(int w)
 {
@@ -2327,6 +2369,11 @@ int main(void)
             if (!paused)
                 draw_journal_hud(prog_state, aspect, journal_open,
                                  frame_start < toast_until, toast_line);
+            /* 0.4: the placement hotbar - which block keys 1..5 will place.
+             * Live + shot mode (so headless captures verify it), hidden while
+             * paused. */
+            if (!paused)
+                draw_hotbar(aspect, sel_mat);
             if (paused)                          /* 0.3: pause menu over the frozen scene */
                 draw_pause_menu(aspect, menu_sel, fullscreen_on);
         }

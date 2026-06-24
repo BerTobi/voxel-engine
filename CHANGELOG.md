@@ -31,6 +31,9 @@ milestone behind a `make check` regression gate; see `PLAN-0.4.md`.
   discoveries + the current capability tier — surfacing `progress.c` (console-only since 0.1)
   via the 0.3 text/UI primitives. The HUD reads the observer through a `const` handle, so the
   read-only "remove it and the sim is byte-identical" invariant is compiler-enforced.
+- _(M3a)_ A global **logical clock** (WorldClock): the heat sim's tick is now owned by the
+  frame loop, not self-counted — the shared clock M3b feeds to every chunk, and the clock
+  player edits are stamped against (the lockstep hook). Byte-identical to 0.3 for one chunk.
 
 ## 0.3.0 — 2026-06-17 — Multiplayer
 

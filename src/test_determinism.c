@@ -140,12 +140,38 @@ static void test_tickcount_not_cadence(void)
     sim_shutdown(&sb);
 }
 
+/* M3a: feeding the sim's tick_index from an EXTERNAL clock (the WorldClock
+ * pattern main.c uses - set tick_index = world_tick before each tick, read it
+ * back after) produces byte-identical state to letting sim_tick self-count.
+ * This validates the exact M3a mechanism: the shared logical clock is equivalent
+ * to the self-counter for one chunk, so M3a is byte-identical to 0.3. */
+static void test_external_clock(void)
+{
+    SimState sa, sb;
+    Chunk ca, cb;
+    uint64_t wt = 0;
+    int t;
+    (void)setup_copper_melt_world(&sa, &ca);   /* A: sim_tick self-counts          */
+    (void)setup_copper_melt_world(&sb, &cb);   /* B: externally clocked (WorldClock) */
+    for (t = 0; t < MELT_TICKS; ++t) {
+        sim_tick(&sa);
+        sb.tick_index = wt;                    /* feed the shared clock            */
+        sim_tick(&sb);
+        wt = sb.tick_index;                    /* read the advanced clock back     */
+    }
+    report("M3a: external WorldClock feed == self-counted tick_index",
+           sim_state_hash(&sa) == sim_state_hash(&sb));
+    sim_shutdown(&sa);
+    sim_shutdown(&sb);
+}
+
 int main(void)
 {
-    printf("== test_determinism (0.4 M0 CA determinism harness) ==\n");
+    printf("== test_determinism (0.4 M0/M3a CA determinism harness) ==\n");
 
     test_reproducible_and_meaningful();
     test_tickcount_not_cadence();
+    test_external_clock();
 
     /* Documented, NOT asserted at M0: the two-peer host->client render-fidelity
      * property (host runs the CA + pushes 8-bit deltas; a passive client applies

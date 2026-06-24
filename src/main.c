@@ -448,12 +448,33 @@ static Voxel place_voxel(uint8_t m)
                                                              : make_voxel(m);
 }
 
+/* ---- 0.4 M3a: the global logical clock (WorldClock) ---------------------- *
+ * One monotone logical tick the heat sim reads as its tick_index, OWNED by the
+ * frame loop rather than self-counted inside each SimState. Single-chunk this
+ * milestone (byte-identical to 0.3: feeding the sim's own counter back in is a
+ * no-op while one chunk self-counts), but it is the SHARED clock M3b feeds to
+ * EVERY resident chunk so they tick on one logical time, and the clock player
+ * EDITS are stamped against (the 0.5-lockstep hook - gap 2: an edit must apply at
+ * the same logical tick on every peer). NOT persisted (session-local); a fresh
+ * sim bind adopts the sim's reset value, so eviction/rebind rewinds exactly as
+ * 0.3 did. */
+static uint64_t g_world_tick     = 0;   /* logical tick fed to the sim each tick   */
+static uint64_t g_last_edit_tick = 0;   /* world_tick of the most recent edit (hook) */
+
 /* Apply a player edit at world voxel (wx,wy,wz); if that voxel lives in the
  * chunk the sim is bound to, wake the sim around it so heat/fluid react. */
 static void edit_and_notify(WorldStore *w, SimState *s, int wx, int wy, int wz, Voxel v)
 {
     if (!world_edit_voxel(w, wx, wy, wz, v))
         return;
+    /* 0.4 M3a: stamp the edit with the current logical tick. A LOCAL field in
+     * 0.4 (the on-wire tick lands with the M5 protocol bump); it is the
+     * 0.5-lockstep hook so edits can later be applied at the same tick on every
+     * peer. VOXEL_DEBUG_EDITS surfaces it; default-off, so behaviour is unchanged. */
+    g_last_edit_tick = g_world_tick;
+    if (getenv("VOXEL_DEBUG_EDITS"))
+        fprintf(stderr, "edit (%d,%d,%d) @ world_tick %llu\n",
+                wx, wy, wz, (unsigned long long)g_last_edit_tick);
     if (s != NULL && s->chunk != NULL) {
         int cx = floordiv16(wx), cy = floordiv16(wy), cz = floordiv16(wz);
         if (s->chunk->cx == cx && s->chunk->cy == cy && s->chunk->cz == cz)
@@ -1273,8 +1294,10 @@ int main(void)
              * NULL): the sim now PUSHES emergent transitions into our ring so the
              * warm-up soak below is observed. NULL prog_ring (alloc failed) detaches
              * cleanly - the sim then emits nothing and is byte-identical. */
-            if (sim->chunk != NULL)
+            if (sim->chunk != NULL) {
                 sim_set_progress_sink(sim, prog_ring);
+                g_world_tick = sim->tick_index;  /* M3a: WorldClock adopts the fresh sim tick (0) */
+            }
 
             /* Soak N ticks, then re-light + re-mesh both streams so the settled
              * fluid / heat plume is uploaded for the first frame. Guarded by the
@@ -1292,7 +1315,9 @@ int main(void)
             if (sim->chunk != NULL && wt > 0L) {
                 long k;
                 for (k = 0; k < wt; ++k) {
+                    sim->tick_index = g_world_tick;     /* M3a: feed the shared clock */
                     sim_tick(sim);
+                    g_world_tick = sim->tick_index;     /* read the advanced clock back */
                     if (prog_state != NULL)
                         prog_observe_drain(prog_state, prog_ring);
                 }
@@ -1705,8 +1730,10 @@ int main(void)
                  * progress to NULL): the re-bound HOME resumes emitting into our
                  * ring so discoveries keep flowing as the player roams away and
                  * back. NULL prog_ring (alloc failed) detaches cleanly. */
-                if (sim->chunk != NULL)
+                if (sim->chunk != NULL) {
                     sim_set_progress_sink(sim, prog_ring);
+                    g_world_tick = sim->tick_index;  /* M3a: WorldClock adopts the rebound sim tick (0) */
+                }
             }
         }
 
@@ -1724,7 +1751,9 @@ int main(void)
                 while (sim_accum_ms >= SIM_TICK_MS
                        && ticks < SIM_MAX_TICKS_PER_FRAME) {
                     sim_accum_ms -= SIM_TICK_MS;
+                    sim->tick_index = g_world_tick;     /* M3a: feed the shared clock */
                     sim_tick(sim);
+                    g_world_tick = sim->tick_index;     /* read the advanced clock back */
                     ++ticks;
                 }
                 if (ticks == SIM_MAX_TICKS_PER_FRAME && sim_accum_ms > SIM_TICK_MS)

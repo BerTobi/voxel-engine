@@ -5,7 +5,7 @@ All notable changes to the Voxel Engine. Versioning is Factorio-style
 `PATCH` = save-compatible fixes, `MINOR` = new gameplay/features, `MAJOR` = 1.0
 or a breaking overhaul.
 
-## 0.4.0 — unreleased — The World Comes Alive (in development)
+## 0.4.0 — 2026-06-24 — The World Comes Alive
 
 0.4 unfreezes the cellular automaton: heat diffusion + melting/freezing tick
 **world-wide across every loaded chunk, with heat crossing chunk faces**, lighting
@@ -14,7 +14,7 @@ Multiplayer sees the living world via **host-authoritative streaming**. Stays on
 1m uniform grid (the fine-voxel shrink is a deferred 0.5 thing). Built milestone by
 milestone behind a `make check` regression gate; see `PLAN-0.4.md`.
 
-> Compatibility (planned): 0.3 single-player **saves load unchanged** (`WG_GEN_VERSION`
+> Compatibility: 0.3 single-player **saves load unchanged** (`WG_GEN_VERSION`
 > held at 2, on-disk format unchanged); 0.3 and 0.4 **network peers are incompatible**
 > (`NET_PROTOCOL_VERSION` 2→3) — both must update to play co-op.
 
@@ -27,6 +27,10 @@ milestone behind a `make check` regression gate; see `PLAN-0.4.md`.
   hosts the selected world. Existing single-player saves still load via the env/`VOXEL_SAVE`
   path. New cross-platform world enumeration/create/delete in `persist.c` (opendir/readdir on
   POSIX, FindFirstFile on Win32). _(Win32 fs path is compile-verified; not yet run under Wine.)_
+- **Placement hotbar HUD.** A bottom-centre row of five colour swatches (Stone · Dirt · Copper ·
+  Water · Lava) drawn from each material's own colour, numbered to match the `1`–`5` select keys,
+  with the active slot ringed white and its material name labelled above — so it's always visible
+  which block a place action will drop.
 - _(M0)_ `make check` aggregate regression gate (runs every unit suite, fails on the
   first non-zero exit) + a GL-free **CA determinism harness** (`testdeterminism`,
   `sim_state_hash`) — the substrate the multiplayer determinism work is verified on.

@@ -34,6 +34,10 @@ milestone behind a `make check` regression gate; see `PLAN-0.4.md`.
 - _(M3a)_ A global **logical clock** (WorldClock): the heat sim's tick is now owned by the
   frame loop, not self-counted — the shared clock M3b feeds to every chunk, and the clock
   player edits are stamped against (the lockstep hook). Byte-identical to 0.3 for one chunk.
+- _(M3b)_ The **world-wide CA container**: the heat sim is no longer one bound chunk — a
+  capped active set (forge + future woken neighbours) ticks in canonical `(cy,cz,cx)` order on
+  the shared clock, with a budgeted sim-remesh and a `CHUNK_MODIFIED_BY_SIM` flag. Faces are
+  still closed, so it is byte-identical to 0.3 for the forge (ASan/UBSan-clean over sessions).
 
 ## 0.3.0 — 2026-06-17 — Multiplayer
 

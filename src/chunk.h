@@ -29,6 +29,7 @@
 #define CHUNK_DIRTY_MESH 0x01u  /* authoritative remesh trigger (Section 4)        */
 #define CHUNK_MODIFIED   0x02u  /* player-altered: must persist on eviction        */
 #define CHUNK_GEN        0x04u  /* freshly generated, not yet meshed               */
+#define CHUNK_MODIFIED_BY_SIM 0x08u /* 0.4: the CA mutated this chunk (host streams it) */
 
 typedef struct Chunk {
     Voxel    voxels[CHUNK_VOXELS];  /* 16 KiB - the payload                        */

@@ -1581,7 +1581,7 @@ int sim_init(SimState *s, Chunk *c)
 /* =====================================================================
  * One heat tick  (sim.h sim_tick - read / commit / compact)
  * ===================================================================== */
-void sim_tick(SimState *s)
+void sim_tick_ex(SimState *s, int phases, SimNeighFn nfn, SimWakeFn wfn, void *user)
 {
     ChunkActive *act;
     Voxel *vox;
@@ -1600,7 +1600,7 @@ void sim_tick(SimState *s)
      * processes ONLY voxels active at the start of this tick, so a just-woken
      * neighbour is first read NEXT tick - the front advances exactly one ring
      * per tick and the read pass remains a true simultaneous FTCS step. */
-    {
+    if (phases & SIM_PHASE_READ) {
         uint32_t read_count = act->count;
 
     /* ---- PHASE 1: read (double-buffered) -----------------------------------
@@ -1640,8 +1640,42 @@ void sim_tick(SimState *s)
 
             if (nx < 0 || nx >= CHUNK_DIM ||
                 ny < 0 || ny >= CHUNK_DIM ||
-                nz < 0 || nz >= CHUNK_DIM)
-                continue;               /* closed no-flux boundary */
+                nz < 0 || nz >= CHUNK_DIM) {
+                /* 0.4 M4: a CROSS-CHUNK face. nfn (NULL => closed wall, the 0.3
+                 * single-chunk path) returns the neighbour voxel's START-OF-TICK
+                 * heat + material from the adjacent chunk; since all active chunks
+                 * READ before any COMMIT, this is the neighbour's start-of-tick
+                 * value, so the seam diffuses exactly like an interior face (same
+                 * kw, order-independent). The neighbour's LOCAL coords wrap the
+                 * single out-of-bounds axis. */
+                int nlx = (nx + CHUNK_DIM) & (CHUNK_DIM - 1);
+                int nly = (ny + CHUNK_DIM) & (CHUNK_DIM - 1);
+                int nlz = (nz + CHUNK_DIM) & (CHUNK_DIM - 1);
+                /* SIM_NEIGH order is +X,-X,+Y,-Y,+Z,-Z but the Chunk neigh[] /
+                 * Face-enum order is -X,+X,-Y,+Y,-Z,+Z - swapped within each axis
+                 * pair, so the neighbour-chunk face index is exactly (n ^ 1). */
+                int face = n ^ 1;
+                int32_t Tn;
+                uint8_t nmt;
+                int64_t into_x;
+                if (nfn == NULL || !nfn(user, s, face, nlx, nly, nlz, &Tn, &nmt))
+                    continue;           /* closed wall: no neighbour to exchange  */
+                flux += (int64_t)g_conduct_lut[mi][nmt] * (int64_t)(Tn - Ti);
+                /* Deliver-flux test across the seam: if we push the neighbour a
+                 * quantum, wake the neighbour CHUNK (enqueue-only; the WorldCA
+                 * acts after commit, so it first ticks next world-tick). */
+                into_x = (int64_t)g_conduct_lut[nmt][mi] * (int64_t)(Ti - Tn);
+                {
+                    int64_t into_dT = into_x >> HEAT_SHIFT;
+                    if (into_dT < 0) into_dT = -into_dT;
+                    if (into_dT > SIM_WAKE_QUANTUM) {
+                        delivers = 1;
+                        if (wfn != NULL)
+                            wfn(user, s, face, nlx, nly, nlz);
+                    }
+                }
+                continue;
+            }
 
             nli  = vox_index(nx, ny, nz);
             nmi  = vox_mat(vox[nli]);
@@ -1746,7 +1780,19 @@ void sim_tick(SimState *s)
             mask_clear(act, li);
         }
     }
-    }   /* end read_count snapshot scope */
+    }   /* end PHASE 1 (read pass) */
+
+    /* 0.4 M4: hand the pending write count READ -> COMMIT, and gate the commit.
+     * A read-only call stops here (the WorldCA runs every chunk's READ before any
+     * COMMIT, so cross-chunk reads above saw start-of-tick state). A commit-only
+     * call loads the count the earlier read pass stored. The single-call wrapper
+     * (sim_tick) runs both, so n_writes is already live. */
+    if (phases & SIM_PHASE_READ)
+        s->n_writes = n_writes;
+    if (!(phases & SIM_PHASE_COMMIT))
+        return;
+    if (!(phases & SIM_PHASE_READ))
+        n_writes = s->n_writes;
 
     /* ---- PHASE 2: commit + re-stamp held sources ---------------------------
      * Commit every queued write THROUGH the authoritative heat[]: store the
@@ -2027,6 +2073,18 @@ void sim_tick(SimState *s)
         s->dirty_mesh = 1;
         s->chunk->flags |= CHUNK_DIRTY_MESH;
     }
+}
+
+/* The single-chunk tick: READ + COMMIT in one call with closed walls (no
+ * cross-chunk neighbour fn), then advance this sim's own tick counter. Every
+ * pre-0.4 caller (tests, the warm-up soak) uses this and is byte-identical to
+ * 0.3. The WorldCA instead drives sim_tick_ex's two phases across all active
+ * chunks and feeds tick_index from the shared WorldClock. */
+void sim_tick(SimState *s)
+{
+    if (s == NULL || s->chunk == NULL)
+        return;
+    sim_tick_ex(s, SIM_PHASE_READ | SIM_PHASE_COMMIT, NULL, NULL, NULL);
     ++s->tick_index;
 }
 

@@ -472,6 +472,9 @@ static uint64_t g_last_edit_tick = 0;   /* world_tick of the most recent edit (h
  * dropped (counted). Session-local: reset + freed per session. */
 #define WORLDCA_MAX_XSIMS 48
 static SimState *g_xsim[WORLDCA_MAX_XSIMS];
+static int       g_xsim_cx[WORLDCA_MAX_XSIMS];  /* bind-time coords (eviction check) */
+static int       g_xsim_cy[WORLDCA_MAX_XSIMS];
+static int       g_xsim_cz[WORLDCA_MAX_XSIMS];
 static int       g_nxsim   = 0;
 
 /* Canonical (cy,cz,cx) ordering predicate: 1 iff sim a sorts AFTER sim b. */
@@ -496,6 +499,85 @@ static void worldca_reset_xsims(void)
         }
     }
     g_nxsim = 0;
+}
+
+/* The SimState simulating chunk c (the forge, or a woken neighbour), or NULL. */
+static SimState *worldca_find(SimState *forge, const Chunk *c)
+{
+    int i;
+    if (forge != NULL && forge->chunk == c)
+        return forge;
+    for (i = 0; i < g_nxsim; ++i)
+        if (g_xsim[i]->chunk == c)
+            return g_xsim[i];
+    return NULL;
+}
+
+/* Bind a fresh SimState to chunk c (woken by cross-chunk heat) and add it to the
+ * active set; returns the already-bound sim if any, NULL if the cap is hit or
+ * alloc/init fails. The sink is installed so a woken chunk's discoveries surface. */
+static SimState *worldca_wake_chunk(SimState *forge, Chunk *c, ProgressSink *sink)
+{
+    SimState *ns = worldca_find(forge, c);
+    if (ns != NULL) return ns;
+    if (g_nxsim >= WORLDCA_MAX_XSIMS) return NULL;
+    ns = (SimState *)malloc(sizeof(SimState));
+    if (ns == NULL) return NULL;
+    ns->chunk = NULL;
+    if (sim_init(ns, c) != 0) { free(ns); return NULL; }
+    sim_set_progress_sink(ns, sink);
+    if (getenv("VOXEL_DEBUG_EDITS"))
+        fprintf(stderr, "CA: woke chunk (%d,%d,%d) [cross-chunk heat]\n",
+                c->cx, c->cy, c->cz);
+    g_xsim_cx[g_nxsim] = c->cx;
+    g_xsim_cy[g_nxsim] = c->cy;
+    g_xsim_cz[g_nxsim] = c->cz;
+    g_xsim[g_nxsim++]  = ns;
+    return ns;
+}
+
+/* Per-world-tick context for the cross-chunk callbacks (passed as `user`). */
+#define WORLDCA_WAKE_MAX 256u
+typedef struct {
+    WorldStore *world;
+    SimState   *forge;
+    Chunk      *wake_chunk[WORLDCA_WAKE_MAX];
+    uint16_t    wake_li[WORLDCA_WAKE_MAX];
+    int         n_wake;
+} WorldCATickCtx;
+
+/* SimNeighFn: a cross-chunk neighbour's START-OF-TICK heat + material. An active
+ * neighbour's live heat[] IS its start-of-tick value (all chunks READ before any
+ * COMMIT); an inactive resident neighbour decodes its (static) voxel temp. A
+ * non-resident neighbour returns 0 = closed wall. */
+static int worldca_nfn(void *user, const SimState *s, int face,
+                       int nlx, int nly, int nlz, int32_t *out_heat, uint8_t *out_mat)
+{
+    WorldCATickCtx *cx = (WorldCATickCtx *)user;
+    Chunk    *nc = s->chunk->neigh[face];
+    SimState *ns;
+    int nli;
+    if (nc == NULL) return 0;
+    nli = vox_index(nlx, nly, nlz);
+    ns  = worldca_find(cx->forge, nc);
+    *out_mat  = vox_mat(nc->voxels[nli]);
+    *out_heat = (ns != NULL) ? ns->heat[nli]
+                             : temp_to_heat(vox_temp_code(nc->voxels[nli]));
+    return 1;
+}
+
+/* SimWakeFn: record (deferred) a request to wake the neighbour chunk's boundary
+ * voxel - processed after the commit pass, so it first ticks NEXT world tick
+ * (enqueue-only => order-independent). Bounded; excess requests just retry. */
+static void worldca_wfn(void *user, const SimState *s, int face,
+                        int nlx, int nly, int nlz)
+{
+    WorldCATickCtx *cx = (WorldCATickCtx *)user;
+    Chunk *nc = s->chunk->neigh[face];
+    if (nc == NULL || (unsigned)cx->n_wake >= WORLDCA_WAKE_MAX) return;
+    cx->wake_chunk[cx->n_wake] = nc;
+    cx->wake_li[cx->n_wake]    = (uint16_t)vox_index(nlx, nly, nlz);
+    ++cx->n_wake;
 }
 
 /* Apply a player edit at world voxel (wx,wy,wz); if that voxel lives in the
@@ -579,6 +661,14 @@ static void demo_decorate(Chunk *c)
         for (z = 7; z <= 9; ++z)
             for (y = 13; y <= 15; ++y)
                 chunk_set(c, x, y, z, air);
+
+    /* 0.4 M4: a lava CHIMNEY up the shaft centre to the chunk top (y15 = world-Y
+     * 127, one below the pole surface). Its top voxel borders the chunk ABOVE, so
+     * the forge's heat CROSSES the chunk seam and warms the crust there - waking
+     * that chunk's CA (the world-wide cross-chunk diffusion, made visible). Held
+     * (MAT_EMISSIVE), so it never drains; continuous with the pool below. */
+    for (y = 13; y <= 15; ++y)
+        chunk_set(c, 8, y, 8, lava);
 
     /* Two reachable copper-ORE voxels set into the shaft wall (x6/x10, y14): far
      * enough from the lava that they only warm, never melt - mineable ore the
@@ -1775,68 +1865,103 @@ int main(void)
             }
         }
 
-        /* --- Heat sim: world-wide CA tick (0.4 M3b) ---------------------- *
-         * The CA is no longer one bound chunk. Build the ACTIVE SET = the forge
-         * (only while HOME is the live resident chunk - the crash-avoidance rule,
-         * never a recycled slab) ∪ the woken neighbours g_xsim (M4 populates it;
-         * EMPTY here, so the forge-only set is byte-identical to 0.3). Tick every
-         * member at the SAME shared world_tick in CANONICAL (cy,cz,cx) order, then
-         * advance the clock ONCE per world tick. A ms accumulator (decoupled from
-         * render) drains whole SIM_TICK_MS slices up to the per-frame cap (no
-         * catch-up spiral). Faces are CLOSED this milestone, so members do not
-         * interact - each evolves exactly as the single-chunk sim did. */
+        /* --- Heat sim: world-wide CA tick (0.4 M4 - faces OPEN) ---------- *
+         * Each world tick: rebuild the ACTIVE SET (forge, while HOME is the live
+         * resident chunk, ∪ woken neighbours), sort canonical, READ every member
+         * (cross-chunk boundaries -> the NEIGHBOUR'S START-OF-TICK heat via
+         * worldca_nfn) before COMMITTING any, so a seam diffuses exactly like an
+         * interior face and the tick is order-independent (testdeterminism proves
+         * it). Cross-chunk wake requests collected during READ (worldca_wfn) are
+         * processed AFTER commit, so a chunk that heat first reaches starts ticking
+         * the NEXT world tick. Fluid faces stay CLOSED (inside sim.c). */
         if (!paused) {
-            SimState *act[1 + WORLDCA_MAX_XSIMS];
-            int na = 0, i, a, b;
-            if (sim->chunk != NULL
-                && world_get(world, HOME_CX, HOME_CY, HOME_CZ) == sim->chunk)
-                act[na++] = sim;
-            for (i = 0; i < g_nxsim; ++i)
-                act[na++] = g_xsim[i];
-            /* Canonical (cy,cz,cx) order (insertion sort; na is tiny). */
-            for (a = 1; a < na; ++a) {
-                SimState *k = act[a];
-                for (b = a - 1; b >= 0 && casim_after(act[b], k); --b)
-                    act[b + 1] = act[b];
-                act[b + 1] = k;
-            }
-            if (na > 0) {
-                int ticks = 0;
-                sim_accum_ms += real_dt_ms;
-                while (sim_accum_ms >= SIM_TICK_MS
-                       && ticks < SIM_MAX_TICKS_PER_FRAME) {
-                    sim_accum_ms -= SIM_TICK_MS;
-                    for (i = 0; i < na; ++i)        /* every member at the SAME tick */
-                        act[i]->tick_index = g_world_tick;
-                    for (i = 0; i < na; ++i)
-                        sim_tick(act[i]);
-                    ++g_world_tick;                 /* advance ONCE per world tick   */
-                    ++ticks;
-                }
-                if (ticks == SIM_MAX_TICKS_PER_FRAME && sim_accum_ms > SIM_TICK_MS)
-                    sim_accum_ms = SIM_TICK_MS;
+            WorldCATickCtx wctx;
+            int ticks = 0, i;
 
-                /* Budgeted sim-remesh: re-mesh up to WORLD_REMESH_BUDGET dirtied
-                 * active chunks this frame; over-budget chunks keep dirty_mesh set
-                 * and remesh next frame (a glow's frame of lag is cosmetic). A
-                 * CA-mutated chunk is flagged CHUNK_MODIFIED (persist on eviction)
-                 * | CHUNK_MODIFIED_BY_SIM (the host streams it in M5). greedy_mesh
-                 * reads neigh[6], so each remesh still culls its seams. */
-                {
-                    int budget = WORLD_REMESH_BUDGET;
-                    for (i = 0; i < na; ++i) {
-                        Chunk *sc = act[i]->chunk;
-                        if (!act[i]->dirty_mesh)
-                            continue;
-                        sc->flags |= CHUNK_MODIFIED | CHUNK_MODIFIED_BY_SIM;
-                        if (budget <= 0)
-                            continue;               /* defer remesh to next frame   */
-                        --budget;
-                        sc->flags |= CHUNK_DIRTY_MESH;
-                        cb_mesh_upload(sc, world_render_slot(world, sc), &stream_ctx);
-                        sc->flags &= (uint8_t)~CHUNK_DIRTY_MESH;
-                        act[i]->dirty_mesh = 0;
+            /* Retire woken neighbours whose chunk was evicted (compare the LIVE
+             * chunk at the bind-time coords vs the bound pointer; never tick a
+             * recycled slab). */
+            {
+                int w = 0;
+                for (i = 0; i < g_nxsim; ++i) {
+                    if (world_get(world, g_xsim_cx[i], g_xsim_cy[i], g_xsim_cz[i])
+                            == g_xsim[i]->chunk) {
+                        g_xsim[w] = g_xsim[i];
+                        g_xsim_cx[w] = g_xsim_cx[i];
+                        g_xsim_cy[w] = g_xsim_cy[i];
+                        g_xsim_cz[w] = g_xsim_cz[i];
+                        ++w;
+                    } else {
+                        if (g_xsim[i]->chunk != NULL) sim_shutdown(g_xsim[i]);
+                        free(g_xsim[i]);
                     }
+                }
+                g_nxsim = w;
+            }
+
+            wctx.world = world;
+            wctx.forge = sim;
+            sim_accum_ms += real_dt_ms;
+            while (sim_accum_ms >= SIM_TICK_MS && ticks < SIM_MAX_TICKS_PER_FRAME) {
+                SimState *act[1 + WORLDCA_MAX_XSIMS];
+                int na = 0, a, b;
+                if (sim->chunk != NULL
+                    && world_get(world, HOME_CX, HOME_CY, HOME_CZ) == sim->chunk)
+                    act[na++] = sim;
+                for (i = 0; i < g_nxsim; ++i)
+                    act[na++] = g_xsim[i];
+                if (na == 0)
+                    break;                           /* nothing active to drain */
+                for (a = 1; a < na; ++a) {           /* canonical (cy,cz,cx) order */
+                    SimState *k = act[a];
+                    for (b = a - 1; b >= 0 && casim_after(act[b], k); --b)
+                        act[b + 1] = act[b];
+                    act[b + 1] = k;
+                }
+                sim_accum_ms -= SIM_TICK_MS;
+                wctx.n_wake = 0;
+                for (i = 0; i < na; ++i) act[i]->tick_index = g_world_tick;
+                for (i = 0; i < na; ++i)
+                    sim_tick_ex(act[i], SIM_PHASE_READ, worldca_nfn, worldca_wfn, &wctx);
+                for (i = 0; i < na; ++i)
+                    sim_tick_ex(act[i], SIM_PHASE_COMMIT, NULL, NULL, NULL);
+                ++g_world_tick;
+                ++ticks;
+                for (i = 0; i < wctx.n_wake; ++i) {  /* deferred cross-chunk wakes */
+                    Chunk *nc = wctx.wake_chunk[i];
+                    if (world_get(world, nc->cx, nc->cy, nc->cz) != nc)
+                        continue;
+                    {
+                        SimState *ns = worldca_wake_chunk(sim, nc, prog_ring);
+                        if (ns != NULL)
+                            sim_notify_edit(ns, (int)wctx.wake_li[i]);
+                    }
+                }
+            }
+            if (ticks == SIM_MAX_TICKS_PER_FRAME && sim_accum_ms > SIM_TICK_MS)
+                sim_accum_ms = SIM_TICK_MS;
+
+            /* Budgeted sim-remesh over the forge + all woken neighbours; over-
+             * budget chunks remesh next frame. A CA-mutated chunk is
+             * CHUNK_MODIFIED (persist on eviction) | CHUNK_MODIFIED_BY_SIM (the
+             * host streams it in M5). */
+            {
+                SimState *all[1 + WORLDCA_MAX_XSIMS];
+                int nall = 0, budget = WORLD_REMESH_BUDGET;
+                if (sim->chunk != NULL) all[nall++] = sim;
+                for (i = 0; i < g_nxsim; ++i) all[nall++] = g_xsim[i];
+                for (i = 0; i < nall; ++i) {
+                    Chunk *sc = all[i]->chunk;
+                    if (sc == NULL || !all[i]->dirty_mesh)
+                        continue;
+                    sc->flags |= CHUNK_MODIFIED | CHUNK_MODIFIED_BY_SIM;
+                    if (budget <= 0)
+                        continue;
+                    --budget;
+                    sc->flags |= CHUNK_DIRTY_MESH;
+                    cb_mesh_upload(sc, world_render_slot(world, sc), &stream_ctx);
+                    sc->flags &= (uint8_t)~CHUNK_DIRTY_MESH;
+                    all[i]->dirty_mesh = 0;
                 }
             }
         }

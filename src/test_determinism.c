@@ -165,13 +165,149 @@ static void test_external_clock(void)
     sim_shutdown(&sb);
 }
 
+/* ===== 0.4 M4: cross-chunk seam tests (GL-free) =====================------ *
+ * Verify the read/commit split + cross-chunk boundary read: heat crosses a chunk
+ * seam, the seam diffuses EXACTLY like an interior face (no seam artifact), and a
+ * world tick is order-independent (the determinism the host stream relies on). */
+typedef struct { SimState *sims[4]; int n; } SeamCtx;
+
+/* SimNeighFn for the tests: read the adjacent chunk's start-of-tick heat[] + the
+ * neighbour voxel's material (or decode an inactive neighbour's voxel temp). */
+static int seam_nfn(void *user, const SimState *s, int face,
+                    int nlx, int nly, int nlz, int32_t *out_heat, uint8_t *out_mat)
+{
+    SeamCtx *cx = (SeamCtx *)user;
+    Chunk   *nc = s->chunk->neigh[face];
+    int      i, nli;
+    if (nc == NULL) return 0;                       /* closed wall */
+    nli = vox_index(nlx, nly, nlz);
+    for (i = 0; i < cx->n; ++i)
+        if (cx->sims[i]->chunk == nc) {             /* active neighbour: live heat[] */
+            *out_heat = cx->sims[i]->heat[nli];
+            *out_mat  = vox_mat(nc->voxels[nli]);
+            return 1;
+        }
+    *out_heat = temp_to_heat(vox_temp_code(nc->voxels[nli]));  /* inactive: voxel temp */
+    *out_mat  = vox_mat(nc->voxels[nli]);
+    return 1;
+}
+
+/* One world tick over a set of sims: feed the shared clock, READ all (cross-chunk
+ * via seam_nfn), then COMMIT all - so every chunk reads start-of-tick state. */
+static void seam_tick(SeamCtx *cx, uint64_t wt)
+{
+    int i;
+    for (i = 0; i < cx->n; ++i) cx->sims[i]->tick_index = wt;
+    for (i = 0; i < cx->n; ++i)
+        sim_tick_ex(cx->sims[i], SIM_PHASE_READ, seam_nfn, NULL, cx);
+    for (i = 0; i < cx->n; ++i)
+        sim_tick_ex(cx->sims[i], SIM_PHASE_COMMIT, NULL, NULL, NULL);
+}
+
+static void fill_copper(Chunk *c, int cx, int cy, int cz)
+{
+    Voxel base = 0;
+    int i;
+    memset(c, 0, sizeof *c);
+    vox_set_mat(&base, MAT_COPPER);
+    vox_set_fill(&base, FLUID_FULL);
+    vox_set_temp_code(&base, 60u);                  /* 20 C ambient */
+    for (i = 0; i < CHUNK_VOXELS; ++i) c->voxels[i] = base;
+    c->cx = cx; c->cy = cy; c->cz = cz;
+}
+
+static void test_seam_diffusion(void)
+{
+    SimState sInt, sA, sB;
+    Chunk    cInt, cA, cB;
+    SeamCtx  cInt1, cAB;
+    int t;
+    sim_build_conduct_lut();
+
+    /* INTERIOR reference: one chunk, held source at (7,8,8). (8,8,8) is auto-woken
+     * (adjacent to the source) and receives flux across the interior 7|8 face. */
+    fill_copper(&cInt, 0, 0, 0);
+    sim_init(&sInt, &cInt);
+    sim_set_source(&sInt, (uint16_t)vox_index(7, 8, 8), 212u /*lava*/);
+    sim_notify_edit(&sInt, vox_index(8, 8, 8));      /* wake the receiver identically to B */
+    cInt1.sims[0] = &sInt; cInt1.n = 1;
+
+    /* SEAM: chunk A (held source at its +X boundary 15,8,8) | chunk B = A's +X
+     * neighbour. B's (0,8,8) then has the SAME neighbourhood as INT's (8,8,8): one
+     * hot face (the source, across the seam) + 5 cold copper faces. We seed B(0,8,8)
+     * active (the auto-wake across a seam is the wfn path, integration-tested). */
+    fill_copper(&cA, 0, 0, 0);
+    fill_copper(&cB, 1, 0, 0);
+    cA.neigh[1] = &cB;   /* A +X (FACE_POS_X) = B */
+    cB.neigh[0] = &cA;   /* B -X (FACE_NEG_X) = A */
+    sim_init(&sA, &cA);
+    sim_init(&sB, &cB);
+    sim_set_source(&sA, (uint16_t)vox_index(15, 8, 8), 212u);
+    sim_notify_edit(&sB, vox_index(0, 8, 8));        /* activate the seam voxel */
+    cAB.sims[0] = &sA; cAB.sims[1] = &sB; cAB.n = 2;
+
+    /* Compare EARLY (6 ticks): both receivers are 1 voxel from a held source with
+     * identical 5-cold-face neighbourhoods, so they heat identically until a far
+     * wall reflects - and the two chunks' forward chains are different lengths
+     * (INT's +X wall is 7 voxels away, B's is 15), so we must read before that
+     * reflection returns. 6 ticks: heat has reached ~6 voxels, no wall hit yet. */
+    for (t = 0; t < 6; ++t) {
+        seam_tick(&cInt1, (uint64_t)t);
+        seam_tick(&cAB,   (uint64_t)t);
+    }
+
+    report("M4: heat crosses the chunk seam (B boundary warmed above ambient)",
+           sB.heat[vox_index(0, 8, 8)] > temp_to_heat(61u));
+    report("M4: seam diffuses like an interior face (B[0,8,8] == INT[8,8,8])",
+           sB.heat[vox_index(0, 8, 8)] == sInt.heat[vox_index(8, 8, 8)]);
+    report("M4: seam diffuses like an interior face (B[1,8,8] == INT[9,8,8])",
+           sB.heat[vox_index(1, 8, 8)] == sInt.heat[vox_index(9, 8, 8)]);
+
+    sim_shutdown(&sInt); sim_shutdown(&sA); sim_shutdown(&sB);
+}
+
+static void test_seam_order_independence(void)
+{
+    SimState a1, b1, a2, b2;
+    Chunk    ca1, cb1, ca2, cb2;
+    SeamCtx  fwd, rev;
+    int t;
+    sim_build_conduct_lut();
+
+    fill_copper(&ca1, 0,0,0); fill_copper(&cb1, 1,0,0);
+    ca1.neigh[1] = &cb1; cb1.neigh[0] = &ca1;
+    sim_init(&a1, &ca1); sim_init(&b1, &cb1);
+    sim_set_source(&a1, (uint16_t)vox_index(15,8,8), 212u);
+    sim_notify_edit(&b1, vox_index(0,8,8));
+
+    fill_copper(&ca2, 0,0,0); fill_copper(&cb2, 1,0,0);
+    ca2.neigh[1] = &cb2; cb2.neigh[0] = &ca2;
+    sim_init(&a2, &ca2); sim_init(&b2, &cb2);
+    sim_set_source(&a2, (uint16_t)vox_index(15,8,8), 212u);
+    sim_notify_edit(&b2, vox_index(0,8,8));
+
+    fwd.sims[0] = &a1; fwd.sims[1] = &b1; fwd.n = 2;   /* tick order [A,B] */
+    rev.sims[0] = &b2; rev.sims[1] = &a2; rev.n = 2;   /* tick order [B,A] */
+    for (t = 0; t < 300; ++t) { seam_tick(&fwd, (uint64_t)t); seam_tick(&rev, (uint64_t)t); }
+
+    report("M4: cross-chunk world tick is order-independent (heat[] + voxels match)",
+           memcmp(a1.heat, a2.heat, sizeof a1.heat) == 0 &&
+           memcmp(b1.heat, b2.heat, sizeof b1.heat) == 0 &&
+           memcmp(ca1.voxels, ca2.voxels, sizeof ca1.voxels) == 0 &&
+           memcmp(cb1.voxels, cb2.voxels, sizeof cb1.voxels) == 0);
+
+    sim_shutdown(&a1); sim_shutdown(&b1); sim_shutdown(&a2); sim_shutdown(&b2);
+}
+
 int main(void)
 {
-    printf("== test_determinism (0.4 M0/M3a CA determinism harness) ==\n");
+    printf("== test_determinism (0.4 M0/M3a/M4 CA determinism harness) ==\n");
 
     test_reproducible_and_meaningful();
     test_tickcount_not_cadence();
     test_external_clock();
+    test_seam_diffusion();
+    test_seam_order_independence();
 
     /* Documented, NOT asserted at M0: the two-peer host->client render-fidelity
      * property (host runs the CA + pushes 8-bit deltas; a passive client applies

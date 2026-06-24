@@ -38,6 +38,13 @@ milestone behind a `make check` regression gate; see `PLAN-0.4.md`.
   capped active set (forge + future woken neighbours) ticks in canonical `(cy,cz,cx)` order on
   the shared clock, with a budgeted sim-remesh and a `CHUNK_MODIFIED_BY_SIM` flag. Faces are
   still closed, so it is byte-identical to 0.3 for the forge (ASan/UBSan-clean over sessions).
+- _(M4)_ **THE HEADLINE — heat crosses chunk faces.** The per-chunk tick splits into a READ
+  pass and a COMMIT pass; the WorldCA runs every active chunk's READ before any COMMIT, so a
+  cross-chunk boundary read sees the neighbour's **start-of-tick** state and a seam diffuses
+  exactly like an interior face (order-independent — proven by new GL-free seam tests). Heat
+  reaching a chunk boundary **wakes the neighbour chunk** (deferred, enqueue-only), so the
+  CA propagates world-wide. The forge gains a lava chimney whose heat visibly crosses into the
+  crust above. Single-machine deterministic; ASan/UBSan-clean.
 
 ## 0.3.0 — 2026-06-17 — Multiplayer
 

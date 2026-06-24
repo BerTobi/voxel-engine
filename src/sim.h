@@ -453,6 +453,7 @@ typedef struct {
     HeatSource  sources[SIM_MAX_SOURCES];
     uint16_t    n_sources;
     uint64_t    tick_index;             /* monotone tick counter (determinism)   */
+    uint32_t    n_writes;               /* 0.4 M4: pending writes handed READ->COMMIT */
     uint8_t     dirty_mesh;             /* set when a tick changed visible state; *
                                          * main.c reads + clears it to remesh    */
     /* ---- Fluid MOVED-THIS-TICK guard (fluid milestone, ARCHITECTURE 3.3) ---- *
@@ -648,6 +649,35 @@ int  sim_init(SimState *s, Chunk *c);
  * changed (so main.c remeshes). Order-independent for heat (double-buffer) and
  * deterministic for fluids (in-place + moved_mask + parity sweep). */
 void sim_tick(SimState *s);
+
+/* ---- 0.4 M4: split tick for the world-wide cross-chunk CA ---------------- *
+ * The per-chunk tick is split into a READ pass (PHASE 1: compute the write list
+ * from START-OF-TICK state) and a COMMIT pass (PHASE 2 commit + 1.5 transitions
+ * + 1.6 fluid + 3 compaction). The WorldCA runs ALL active chunks' READ before
+ * ANY commit, so a cross-chunk boundary read sees the neighbour's start-of-tick
+ * state (order-independent; the seam diffuses exactly like an interior face).
+ *
+ *   nfn (nullable): supply a cross-chunk neighbour voxel's start-of-tick heat +
+ *     material for FACE (0..5, Face-enum / neigh[] order) at the neighbour's
+ *     LOCAL coords (nlx,nly,nlz). Return 1 if a neighbour exists, 0 = closed
+ *     wall (no flux). NULL nfn => every out-of-chunk face is a closed wall, which
+ *     is the 0.3 single-chunk behaviour (byte-identical).
+ *   wfn (nullable): request waking the neighbour CHUNK when this voxel pushed a
+ *     quantum of flux across the seam (enqueue-only; the WorldCA acts on it after
+ *     the commit pass, so the woken chunk first participates NEXT tick).
+ *
+ * sim_tick(s) is now exactly: sim_tick_ex(s, READ|COMMIT, NULL,NULL,NULL) then
+ * ++tick_index - the single-chunk closed-wall path, unchanged for every existing
+ * caller (tests, the warm-up soak). The WorldCA feeds tick_index itself and calls
+ * the two phases separately with its cross-chunk nfn/wfn. */
+typedef int  (*SimNeighFn)(void *user, const SimState *s, int face,
+                           int nlx, int nly, int nlz,
+                           int32_t *out_heat, uint8_t *out_mat);
+typedef void (*SimWakeFn)(void *user, const SimState *s, int face,
+                          int nlx, int nly, int nlz);
+#define SIM_PHASE_READ    1
+#define SIM_PHASE_COMMIT  2
+void sim_tick_ex(SimState *s, int phases, SimNeighFn nfn, SimWakeFn wfn, void *user);
 
 /* Notify the sim that a PLAYER EDIT changed voxel li in the bound chunk (a block
  * broken to air, or one placed). Re-seeds heat[li] from the voxel's current temp,

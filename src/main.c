@@ -155,7 +155,7 @@
  * Mouse-look is LIVE-only: in VOXEL_SHOT mode capture stays OFF and yaw/pitch
  * are frozen at the VOXEL_YAW/VOXEL_PITCH env values, so headless captures use a
  * fixed, reproducible orientation. */
-#define CAM_MOVE_PER_SEC  12.0f     /* metres (voxels) per second              */
+#define CAM_MOVE_PER_SEC  M2V(12.0f) /* 0.5 M2: 12 m/s fly speed (metres via units.h) */
 #define CAM_MOUSE_SENS    0.12f     /* degrees of look per pixel of motion     */
 #define CAM_PITCH_LIMIT   89.0f     /* clamp pitch to avoid gimbal flip        */
 

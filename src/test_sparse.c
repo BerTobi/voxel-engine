@@ -108,6 +108,26 @@ int main(void)
                (double)WORLD_POOL_SLOTS * sizeof(Chunk) / 1024.0);
     }
 
+    /* THE NO-HOLES REGRESSION (M2 grain-review): a player who flies/digs deep sits in
+     * a window that is ENTIRELY solid rock - every chunk needs a slab. Stream the
+     * window fully BELOW the surface and assert the whole 1521-window loads (no
+     * silently-dropped inserts) and the pool does not exhaust. This is the case the
+     * surface-only test above missed; it must hold for any reachable position. */
+    {
+        uint32_t resident, realized;
+        int k;
+        for (k = 0; k < 600; ++k)
+            world_stream_update(ws, 8.0f, 50.0f * 16.0f, 8.0f);   /* ~40 m down, fully submerged */
+        resident = world_resident_count(ws);
+        realized = (uint32_t)WORLD_SLAB_SLOTS - ws->slab_free_top;
+        printf("  underground window: %u resident, %u realized (all-solid worst case)\n",
+               resident, realized);
+        CHECK(resident == (uint32_t)WORLD_WINDOW_CHUNKS,
+              "no holes: a fully-submerged window loads ALL 1521 chunks (slab pool not exhausted)");
+        CHECK(realized <= (uint32_t)WORLD_SLAB_SLOTS,
+              "underground realized count fits the slab pool (no silent insert failure)");
+    }
+
     world_shutdown(ws);
     free(ws);
     printf("=== %d failure(s) ===\n", fails);

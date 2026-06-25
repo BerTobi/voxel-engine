@@ -181,21 +181,30 @@ typedef struct {
  * neigh[6], flags, the voxels pointer + uniform_word) is always resident in the
  * pool above, but its 16 KiB VOXEL BLOCK is now drawn lazily from this separate
  * fixed pool only when the chunk is non-uniform (has solid/water content).
- * UNIFORM-AIR chunks - 72% of the resident window (measured) - hold voxels==NULL
- * + a uniform_word and borrow NO slab, so they cost only the record. This is the
- * memory win: 1777 * 16 KiB (27.8 MiB, all-dense) -> 1777 records (~170 KiB) +
- * WORLD_SLAB_SLOTS * 16 KiB realized blocks.
+ * UNIFORM-AIR chunks hold voxels==NULL + a uniform_word and borrow NO slab, so they
+ * cost only the ~96 B record. Above/at the surface, where much of the window is sky,
+ * this means most slabs go UNTOUCHED (a working-set win on demand-paged systems) and
+ * the air hemisphere costs zero CA + zero mesh. The chunk-RECORD pool also shrinks
+ * from 27.8 MiB (inline voxels) to ~170 KiB. See SIZING below for why the reserved
+ * slab pool itself must still cover the full window (the underground worst case).
  *
- * SIZING: bounded above by the max chunks simultaneously NON-UNIFORM in any
- * resident window + streaming churn. At R=64 (M1) the whole ball is ~430 solid/
- * surface chunks (probe: 431 of 1521); 768 covers that + a leading curtain of
- * churn with margin. world_realize HARD-FAILS if exhausted (a too-small pool is a
- * sizing bug caught by test_sparse's worst-case stream, not silent corruption).
- * Re-tuned at M2: the R=512 surface-following band hugs the ground (the air saving
- * is only the ~4 layers above the surface, not the 72% of the R=64 ball), so the
- * realized count climbs to ~600-850; 1024 covers that with churn margin (measured
- * by test_sparse). The pool NEVER grows (the no-per-chunk-malloc rule still holds). */
-#define WORLD_SLAB_SLOTS  1024u
+ * SIZING (corrected at M2 by the grain-review): the WORST reachable window is one
+ * fully BELOW the surface - a player who flies or digs ~24 m+ down sits in solid
+ * rock, so EVERY chunk in the 1521-window is non-uniform and needs a slab (the
+ * surface window's 72%-air saving does NOT hold underground). A sub-window-sized
+ * pool would silently drop those inserts (holes / fall-through), so the slab pool
+ * must equal the chunk-record pool: WORLD_SLAB_SLOTS == WORLD_POOL_SLOTS. Then
+ * realized <= resident <= WORLD_POOL_SLOTS and a uniform chunk returns its slab,
+ * so a free record ALWAYS implies a free slab and world_realize can NEVER fail.
+ * Sparse-air's win is therefore a WORKING-SET one (above/at the surface only ~28-44%
+ * of slabs are touched) + the record-pool shrink (27.8 MiB -> ~170 KiB), NOT a
+ * smaller reserved pool. The pool NEVER grows (no-per-chunk-malloc rule holds). */
+#define WORLD_SLAB_SLOTS  WORLD_POOL_SLOTS
+/* The no-holes invariant: a slab pool smaller than the record pool can be exhausted
+ * by a fully-solid (underground) window, silently dropping inserts. Keep them equal
+ * (or slabs larger) so world_realize can never fail. */
+_Static_assert(WORLD_SLAB_SLOTS >= WORLD_POOL_SLOTS,
+               "slab pool must cover the worst-case (fully solid) window - else underground holes");
 
 /* ======================================================================== *
  *  4. PER-FRAME STREAMING BUDGET  (ARCHITECTURE Section 6 / Section 7)      *

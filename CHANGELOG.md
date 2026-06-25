@@ -109,6 +109,20 @@ behind the `make check` gate; see `PLAN-0.5.md`.
   full `CHUNK_VOXELS`-word array (or the uniform word for a slab-less air chunk).
 
 ### Added (continued)
+- **Water levels into flat pools instead of stair-step terraces.** Binary water settled by gravity
+  + flow-to-descent alone never spreads to flatten a surface, so lakes/pools came out as ugly
+  terraced mounds. The connected-body **surface-leveling finisher** is now revived for binary
+  water: when a body settles, it is snapped to a flat (within-one-voxel) surface in **whole cells**
+  (no fractional fills), conserving its volume exactly. It fires on a **settle** trigger (binary
+  water settles to a fixed state, so the old limit-cycle detector never confirmed) and loaded/static
+  bodies are woken on bind, so a **saved terraced lake flattens as it loads** (measured: a static
+  4-step lake levels in 2 ticks; a 96-cell pile in 12; both conserve). Enabled on the **−Y polar
+  cap** (where the world-Y column math is correct — water on the sphere's far sides stays terraced
+  until a radial version in 0.6). An adversarial review caught + this fixes two real defects before
+  ship: a conservation break where a column's vessel-extension could swallow a *separate* same-
+  material body and drain it (now bodies are per-body-membership walls, verified 6→6 not 6→4), and a
+  dead trigger (the claimed "rise clause" didn't exist, so static stalls never fired). Cross-platform
+  deterministic (`LEVELED` hash identical on Linux-64/32/wine).
 - **Placeable water springs — make your own rivers.** A new **`MAT_WATER_SOURCE`** material
   (hotbar slot 4, the bright-cyan swatch) is an inexhaustible spring: `sim_init` auto-registers
   every `MAT_SPRING` voxel via `sim_set_spring` (the material *is* the spring, so it persists

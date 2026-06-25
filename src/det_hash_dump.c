@@ -118,11 +118,38 @@ static uint64_t worldgen_hash(void)
     return h;
 }
 
+/* LEVELED: a 4x4x6 water block dropped into a walled basin with the surface-leveling
+ * FINISHER enabled (down=-Y). Exercises the finisher's integer binary-search + cell
+ * distribution - it must settle to a byte-identical flat state on every platform. */
+static uint64_t leveled_hash(void)
+{
+    static Chunk c; SimState s; int x, y, z, t;
+    c.voxels = (Voxel *)calloc(CHUNK_VOXELS, sizeof(Voxel));
+    c.slab_idx = -1;
+    for (x = 0; x < 16; ++x) for (y = 0; y < 16; ++y) for (z = 0; z < 16; ++z)
+        c.voxels[vox_index(x,y,z)] = mk(MAT_AIR, 0);
+    for (x = 1; x <= 6; ++x) for (z = 1; z <= 6; ++z) {
+        c.voxels[vox_index(x,0,z)] = mk(MAT_STONE,15);
+        c.voxels[vox_index(x,1,z)] = mk(MAT_STONE,15);
+    }
+    for (y = 2; y <= 15; ++y) for (x = 1; x <= 6; ++x) {
+        c.voxels[vox_index(x,y,1)] = mk(MAT_STONE,15); c.voxels[vox_index(x,y,6)] = mk(MAT_STONE,15);
+        c.voxels[vox_index(1,y,x)] = mk(MAT_STONE,15); c.voxels[vox_index(6,y,x)] = mk(MAT_STONE,15);
+    }
+    for (x = 2; x <= 5; ++x) for (z = 2; z <= 5; ++z) for (y = 8; y <= 13; ++y)
+        c.voxels[vox_index(x,y,z)] = mk(MAT_WATER,15);
+    sim_build_conduct_lut(); sim_init(&s, &c);
+    sim_set_down_face(&s, 3);   /* enables the leveling finisher */
+    for (t = 0; t < 400; ++t) { sim_tick(&s); if (s.act.count == 0) break; }
+    { uint64_t h = sim_state_hash(&s); sim_shutdown(&s); free(c.voxels); return h; }
+}
+
 int main(void)
 {
     emit("HEAT",     heat_hash());
     emit("WATER",    water_hash());
     emit("COMBINED", combined_hash());
     emit("WORLDGEN", worldgen_hash());
+    emit("LEVELED",  leveled_hash());
     return 0;
 }

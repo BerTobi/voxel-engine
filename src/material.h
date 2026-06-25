@@ -34,7 +34,8 @@ typedef enum {
 #define MAT_OPAQUE    0x01u  /* does this face cull its neighbour (most-read in mesher) */
 #define MAT_EMISSIVE  0x02u  /* injects block-light (lava, fire)                        */
 #define MAT_OXIDIZER  0x04u  /* feeds combustion / rusting reactions                    */
-/* bits 0x08..0x80 reserved */
+#define MAT_SPRING    0x08u  /* inexhaustible liquid SOURCE: sim auto-registers it as a spring */
+/* bits 0x10..0x80 reserved */
 
 /* One material. Exactly 64 bytes, cache-line-friendly. Padded so the array
  * stride is a power of two. Fields earn their place by being read by an
@@ -97,7 +98,8 @@ enum {
     MAT_WOOD       = 9,
     MAT_LAVA          = 10, /* molten rock: PHASE_LIQUID + MAT_EMISSIVE block-light source */
     MAT_MOLTEN_COPPER = 11, /* copper above 1085 C: PHASE_LIQUID, freezes_to MAT_COPPER    */
-    MAT_MOLTEN_IRON   = 12  /* iron above 1538 C: PHASE_LIQUID, freezes_to MAT_IRON         */
+    MAT_MOLTEN_IRON   = 12, /* iron above 1538 C: PHASE_LIQUID, freezes_to MAT_IRON         */
+    MAT_WATER_SOURCE  = 13  /* a held, inexhaustible WATER SPRING (MAT_SPRING); emits MAT_WATER */
     /* ... ~107 committed of 256, ~147 ids of headroom (Section 2.3 census) */
 };
 

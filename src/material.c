@@ -365,4 +365,27 @@ const MaterialDef g_materials[MAX_MATERIALS] = {
         .ignition_c          = -1,
         .flags               = 0,                  /* not opaque, not emissive */
     },
+
+    /* ---- 13: WATER_SOURCE - an inexhaustible water SPRING -----------------
+     * A persistent, placeable held source: sim_init auto-registers every MAT_SPRING
+     * voxel via sim_set_spring, so a spring survives save/reload (the MATERIAL is the
+     * spring, like MAT_EMISSIVE lava is a held heat source). It is held at ambient by
+     * the spring, so it never boils/freezes (melt/boil -1); it EMITS MAT_WATER (the
+     * fluid pass donates plain water, never more sources). Rendered a brighter cyan
+     * than plain water so the source cell is visible at a glance. */
+    [MAT_WATER_SOURCE] = {
+        .name                = "water_source",
+        .atlas_tile          = MAT_WATER,                /* looks like water (water tile) */
+        .phase               = PHASE_LIQUID,
+        .color_rgba          = { 70, 170, 240, 210 },    /* brighter cyan than water */
+        .density_kg_m3       = 1000,
+        .specific_heat       = 4186,
+        .thermal_conductivity= 60,
+        .melt_point_c        = -1,                        /* held source: does not freeze */
+        .boil_point_c        = -1,                        /* held source: does not boil   */
+        .viscosity           = 0,
+        .ignition_c          = -1,
+        .flags               = MAT_SPRING,
+        /* not opaque: alpha-blended by the liquid pass like water */
+    },
 };

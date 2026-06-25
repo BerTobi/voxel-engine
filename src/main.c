@@ -420,7 +420,7 @@ static Voxel make_liquid(uint8_t mat)
 
 /* Placement palette, selected by number keys 1..5. */
 static const uint8_t PLACE_MATS[5] = {
-    MAT_STONE, MAT_DIRT, MAT_COPPER, MAT_WATER, MAT_LAVA
+    MAT_STONE, MAT_DIRT, MAT_COPPER, MAT_WATER_SOURCE, MAT_LAVA
 };
 
 /* 0.4: the placement HOTBAR - the 5 PLACE_MATS as colour swatches along the
@@ -521,6 +521,10 @@ static Voxel place_voxel(uint8_t m)
  * 0.3 did. */
 static uint64_t g_world_tick     = 0;   /* logical tick fed to the sim each tick   */
 static uint64_t g_last_edit_tick = 0;   /* world_tick of the most recent edit (hook) */
+/* Does THIS peer run the cellular automaton? 1 for single-player + host; 0 for a
+ * client (which renders the host's streamed chunks and must not spin up local sims).
+ * Set per session from the net mode; gates the edit-time sim wake in edit_and_notify. */
+static int g_local_ca = 1;
 
 /* ---- 0.4 M3b: the world-wide CA active set ------------------------------- *
  * The heat CA is no longer a single bound chunk. The forge `sim` (main, below)
@@ -710,10 +714,27 @@ static void edit_and_notify(WorldStore *w, SimState *s, int wx, int wy, int wz, 
     if (getenv("VOXEL_DEBUG_EDITS"))
         fprintf(stderr, "edit (%d,%d,%d) @ world_tick %llu\n",
                 wx, wy, wz, (unsigned long long)g_last_edit_tick);
-    if (s != NULL && s->chunk != NULL) {
+    /* Wake the EDITED chunk's sim so a placed fluid / source / heat voxel actually
+     * animates - not just the forge chunk. For a MAT_SPRING source, register it as a
+     * spring on that sim immediately (an already-active chunk does not re-run sim_init's
+     * auto-registration). Host/SP only (g_local_ca): a client renders the host's stream
+     * and must not spin up local sims (it never ticks them -> they would just leak). */
+    if (g_local_ca && s != NULL) {
         int cx = floordiv16(wx), cy = floordiv16(wy), cz = floordiv16(wz);
-        if (s->chunk->cx == cx && s->chunk->cy == cy && s->chunk->cz == cz)
-            sim_notify_edit(s, vox_index(wx - cx * 16, wy - cy * 16, wz - cz * 16));
+        Chunk *ec = world_get(w, cx, cy, cz);
+        SimState *es = NULL;
+        if (ec != NULL) {
+            if (s->chunk != NULL && s->chunk->cx == cx && s->chunk->cy == cy && s->chunk->cz == cz)
+                es = s;                                   /* the forge / HOME sim */
+            else
+                es = worldca_wake_chunk(s, ec, NULL);     /* wake (or find) this chunk's sim */
+        }
+        if (es != NULL) {
+            int eli = vox_index(wx - cx * 16, wy - cy * 16, wz - cz * 16);
+            sim_notify_edit(es, eli);
+            if (material_get(vox_mat(v))->flags & MAT_SPRING)
+                sim_set_spring(es, (uint16_t)eli, vox_temp_code(v));
+        }
     }
 }
 
@@ -804,7 +825,7 @@ static void demo_decorate(WorldStore *ws, Chunk *c)
         for (z = 2; z <= 5; ++z)
             for (y = 8; y <= 15; ++y)
                 chunk_set(c, x, y, z, air);
-    chunk_set(c, DEMO_SPRING_LX, DEMO_SPRING_LY, DEMO_SPRING_LZ, make_liquid(MAT_WATER));
+    chunk_set(c, DEMO_SPRING_LX, DEMO_SPRING_LY, DEMO_SPRING_LZ, make_liquid(MAT_WATER_SOURCE));
 
     /* 0.5 M2 grain: at R=512 the pole-axis SURFACE voxel is world-Y 1024, which lives
      * in the chunk ABOVE home (cy HOME_CY+1, ly 0) - a solid dirt cap sitting directly
@@ -1579,6 +1600,7 @@ int main(void)
     }
     if (net != NULL && net_mode(net) == NET_CLIENT)
         seed = net_seed(net);
+    g_local_ca = (net == NULL || net_mode(net) != NET_CLIENT);   /* host/SP simulate; client renders */
     /* cb_gen (on a client) enqueues chunk-sync requests here; init before world_prime. */
     stream_ctx.net       = net;
     stream_ctx.req_head  = 0;
@@ -1808,10 +1830,9 @@ int main(void)
                 sim->chunk = NULL;
             } else {
                 sim_set_down_face(sim, chunk_down_face(home->cx, home->cy, home->cz));
-                /* 0.5 M3: register the demo water spring (only on the decorated HOME). */
-                if (home->cx == HOME_CX && home->cy == HOME_CY && home->cz == HOME_CZ)
-                    sim_set_spring(sim, (uint16_t)vox_index(DEMO_SPRING_LX, DEMO_SPRING_LY,
-                                   DEMO_SPRING_LZ), temp_encode_c(20.0));
+                /* 0.5: the demo water spring is a MAT_WATER_SOURCE voxel (placed by
+                 * demo_decorate); sim_init auto-registers every MAT_SPRING voxel, so
+                 * no explicit sim_set_spring is needed here (and it survives reload). */
             }
             /* Install the progression sink AFTER sim_init (which reset progress to
              * NULL): the sim now PUSHES emergent transitions into our ring so the

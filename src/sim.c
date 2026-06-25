@@ -964,7 +964,11 @@ static void fluid_move_water(SimState *s, int li, int dst, uint8_t mat, int is_s
      * SPRING instead EMITS a full voxel (fill=15) and keeps its own cell (re-filled
      * in PHASE 2), so it is an inexhaustible source by design. */
     int carry = is_spring ? (int)FLUID_FULL : (int)vox_fill(s->chunk->voxels[li]);
-    fluid_occupy_air(s, dst, mat, carry);
+    /* A SPRING emits plain MAT_WATER, never its own id - so a MAT_WATER_SOURCE cell
+     * floods water, not an exploding field of sources. A non-spring move carries its
+     * own material (the moving body keeps its identity). */
+    uint8_t emit = is_spring ? (uint8_t)MAT_WATER : mat;
+    fluid_occupy_air(s, dst, emit, carry);
     moved_set(s, dst);
     wake_ring(s, dst);
     moved_set(s, li);
@@ -1378,6 +1382,19 @@ int sim_init(SimState *s, Chunk *c)
             s->heat[li] = temp_to_heat(lava_hold);
             active_enqueue(s, li);              /* held by flag; needs no table slot */
         }
+    }
+
+    /* Auto-register every MAT_SPRING voxel (a placed/loaded water source) as an
+     * inexhaustible spring: the MATERIAL is the spring (persisted in mat8), so a
+     * source survives save/reload and floods without an external sim_set_spring call.
+     * Held at its own (ambient) temperature, so it never boils. Unlike emissive lava
+     * a spring DOES take a source-table slot (it carries per-cell spring state); the
+     * table comfortably holds SIM_MAX_SOURCES springs per chunk now that lava is
+     * flag-held. */
+    for (li = 0; li < CHUNK_VOXELS; ++li) {
+        Voxel *v = &c->voxels[li];
+        if (material_get(vox_mat(*v))->flags & MAT_SPRING)
+            sim_set_spring(s, (uint16_t)li, vox_temp_code(*v));
     }
 
     /* Seed the active front: wake every voxel that differs from an in-chunk

@@ -109,6 +109,17 @@ behind the `make check` gate; see `PLAN-0.5.md`.
   full `CHUNK_VOXELS`-word array (or the uniform word for a slab-less air chunk).
 
 ### Added (continued)
+- **Placeable water springs — make your own rivers.** A new **`MAT_WATER_SOURCE`** material
+  (hotbar slot 4, the bright-cyan swatch) is an inexhaustible spring: `sim_init` auto-registers
+  every `MAT_SPRING` voxel via `sim_set_spring` (the material *is* the spring, so it persists
+  across save/reload like emissive lava is a held heat source), and it emits plain `MAT_WATER`
+  that flows + pools under gravity. Placing one wakes the chunk's sim (host/SP) and registers it
+  immediately, so a source placed at the top of one of the new hillsides flows **downhill as a
+  river** and pools into a lake at the bottom. _(On flat ground it just pools — a spring keeps
+  flowing only while its outflow keeps draining downhill.)_ The demo forge's spring is now a
+  `MAT_WATER_SOURCE` too. **Fixes** the demo spring that only ever dropped a single block: the
+  forge's emissive lava had filled the 16-slot held-source table, so `sim_set_spring` failed
+  silently — lava is now held by its flag and takes no slot, freeing the table for real springs.
 - **Per-world generator pinning — worlds survive future worldgen changes** _(the save-
   compatibility contract starts here)_. A world is now tied to the generator version it was
   **created** with: its save records that version (every region header already stamps it), and on

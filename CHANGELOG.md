@@ -36,6 +36,19 @@ behind the `make check` gate; see `PLAN-0.5.md`.
   -record pool from 27.8 MiB to ~153 KiB. Still on the 1 m grain / R=64 planet (the grain flip
   is M2), so **0.4 saves still load** (the persist format + `WG_GEN_VERSION` are unchanged).
   New `test_sparse` suite; ASan/UBSan-clean over streaming + the CA + multi-session teardown.
+- _(M2)_ **The grain flip + a real planet (the hard break).** `VOX_GRAIN_MM=500` is now
+  _applied_: every physical constant (player size/speed/gravity/`r_p`/substep, edit reach, fog
+  distances, dirt depth) is re-expressed in **metres** via `M2V`/`V2M`, so the feel is preserved
+  at the finer grain. The planet grows from a 64-voxel pebble to **R=512 voxels = a 256 m
+  radius** (~1.6 km around). The resident vertical band now **follows the player** (the surface
+  sits at high Y, so a fixed band no longer works) — a 9-layer window re-anchored on the
+  player's chunk-Y each frame, keeping the resident count at 1521. Float32 radial gravity is
+  retained with a regression assert (worst-case `up` error **0.00005 vox** at R=512, far under
+  the 0.25 bound). **HARD BREAK:** `WG_GEN_VERSION` 2→3 and `PERSIST_FORMAT_VERSION` 1→2, so
+  **0.4 saves are refused, not migrated** (a 32 m 1 m-voxel pebble cannot become a 256 m 0.5 m
+  -voxel planet). No water yet — this milestone verifies the 256 m sphere is walkable. New
+  `test_grain` float-precision sweep; both targets `-Wall -Wextra` clean; ASan-clean over a
+  fly-across-the-pole + CA session.
 
 ## 0.4.0 — 2026-06-24 — The World Comes Alive
 

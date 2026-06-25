@@ -51,7 +51,7 @@
 /* Bump on ANY change to generated output (Section 8 versioning). A save written
  * by an older version is "from an older generator" and must not silently
  * regenerate differently (the doc's default: refuse to load on mismatch). */
-#define WG_GEN_VERSION   2u   /* 2: spherical asteroid (was 1: rolling heightmap) */
+#define WG_GEN_VERSION   3u   /* 3: 0.5 fine grain - R=512 (256 m) planet (was 2: R=64) */
 
 /* ---- Surface band (binding; the WorldStore vertical band brackets this) ---- *
  * The heightmap surface lives entirely within [WG_HEIGHT_MIN, WG_HEIGHT_MAX]
@@ -71,7 +71,7 @@
  * passes; this milestone is stone+dirt+rolling-surface, enough to make movement
  * read.) Every solid voxel is stamped fill=15 and ambient temperature, exactly
  * the chunk_gen_flat convention, so light/mesh/sim see a consistent world. */
-#define WG_DIRT_DEPTH    3
+#define WG_DIRT_DEPTH    6     /* 0.5 M2: 6 vox x 0.5 m = 3 m crust (was 3 vox=3 m at 1 m) */
 
 /* ---- Spherical asteroid (0.3 radial-gravity prototype) -------------------- *
  * The world is a single solid voxel BALL: a voxel is STONE where its world-space
@@ -84,10 +84,16 @@
  * column X/Z (=8) and lifted to CY so the ball spans world-Y [CY-R .. CY+R] inside
  * the resident vertical band (world.h WORLD_BAND_Y1 must reach (CY+R)/16). Bigger R
  * = gentler curvature; the band height + pool slack scale with R (see world.h). */
+/* 0.5 M2: at the 0.5 m grain a voxel is 0.5 m, so R=512 voxels = a 256 m physical
+ * radius (a ~1.6 km walk around) - a real planet, not the 32 m pebble R=64 would be.
+ * Center lifted to CY=R so the ball spans world-Y [0 .. 2R]; the resident band now
+ * FOLLOWS the player (world.h), so the surface being at high Y no longer needs a
+ * tall fixed band. Kept near the world origin so float32 radial math stays precise
+ * (test_grain asserts the worst-case `up` error < 0.25 vox at this R). */
 #define WG_PLANET_CX     8     /* planet center, world voxels (X)                */
-#define WG_PLANET_CY     64    /* planet center, world voxels (Y)                */
+#define WG_PLANET_CY     512   /* planet center, world voxels (Y) = R (ball Y 0..2R) */
 #define WG_PLANET_CZ     8     /* planet center, world voxels (Z)                */
-#define WG_PLANET_R      64    /* planet radius (bigger = gentler curvature)     */
+#define WG_PLANET_R      512   /* planet radius, voxels (x0.5 m = 256 m physical) */
 
 /* ---- Value-noise lattice (binding; cheap integer hills) -------------------- *
  * Heights are sampled on a coarse square lattice of period WG_NOISE_PERIOD

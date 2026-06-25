@@ -47,6 +47,19 @@
 #include "worldgen.h"
 #include "world.h"
 
+/* 0.5 M2: the resident band now FOLLOWS the player (world.h dropped the fixed
+ * WORLD_BAND_Y0/Y1). These tests prime with player-Y = TEST_PY so the centre
+ * chunk-Y is TEST_CCY and the band lands on [TEST_CCY-HALF .. TEST_CCY+HALF].
+ * TEST_CCY=64 puts the band on the NORTH-POLE SURFACE (the ball spans cy 0..64 at
+ * R=512; the pole surface is at world-Y 1024 = cy 64), where the window is a
+ * realistic solid-below / air-above mix - NOT deep inside the ball, which would be
+ * nearly all-solid and exhaust the slab sub-pool. The loops/assertions below use
+ * WORLD_BAND_Y0/Y1 = [60..68] = exactly that band. */
+#define TEST_CCY        ((WG_PLANET_CY + WG_PLANET_R) / CHUNK_DIM)  /* pole surface cy = 64 */
+#define TEST_PY         ((float)(TEST_CCY * CHUNK_DIM + 8))         /* center_cy = TEST_CCY */
+#define WORLD_BAND_Y0   (TEST_CCY - WORLD_BAND_HALF)               /* 60 */
+#define WORLD_BAND_Y1   (TEST_CCY + WORLD_BAND_HALF)               /* 68 */
+
 /* ---- Tiny assertion plumbing (same idiom as test_mesher.c) -------------- */
 static int g_failures = 0;
 
@@ -130,11 +143,13 @@ static int cheby(int ax, int az, int bx, int bz)
     return (dx > dz) ? dx : dz;
 }
 
-/* Is (cx,cy,cz) inside the window centred on chunk (ccx,ccz)? Chebyshev radius
- * WORLD_RADIUS horizontally, fixed band [WORLD_BAND_Y0..Y1] vertically. */
-static int in_window(int cx, int cy, int cz, int ccx, int ccz)
+/* Is (cx,cy,cz) inside the window centred on chunk (ccx,ccy,ccz)? Chebyshev radius
+ * WORLD_RADIUS horizontally, and (0.5 M2) a player-following band of WORLD_BAND_HALF
+ * layers above/below the centre chunk-Y. */
+static int in_window(int cx, int cy, int cz, int ccx, int ccy, int ccz)
 {
-    if (cy < WORLD_BAND_Y0 || cy > WORLD_BAND_Y1)
+    int dy = cy - ccy; if (dy < 0) dy = -dy;
+    if (dy > WORLD_BAND_HALF)
         return 0;
     return cheby(cx, cz, ccx, ccz) <= WORLD_RADIUS;
 }
@@ -481,7 +496,7 @@ static void test_window_exact(void)
     ccx = world_to_chunk(px);
     ccz = world_to_chunk(pz);
 
-    world_prime(ws, px, pz);
+    world_prime(ws, px, TEST_PY, pz);
 
     /* every in-window coord must be resident. */
     for (cz = ccz - WORLD_RADIUS; cz <= ccz + WORLD_RADIUS && ok; ++cz)
@@ -500,7 +515,7 @@ static void test_window_exact(void)
         for (cz = ccz - WORLD_RADIUS - 1; cz <= ccz + WORLD_RADIUS + 1 && ok; ++cz)
             for (cx = ccx - WORLD_RADIUS - 1; cx <= ccx + WORLD_RADIUS + 1 && ok; ++cx)
                 for (cy = WORLD_BAND_Y0 - 1; cy <= WORLD_BAND_Y1 + 1; ++cy)
-                    if (!in_window(cx, cy, cz, ccx, ccz)
+                    if (!in_window(cx, cy, cz, ccx, TEST_CCY, ccz)
                         && world_get(ws, cx, cy, cz) != NULL) {
                         ++extra;
                         ok = 0;
@@ -556,7 +571,7 @@ static void test_neighbour_links(void)
 
     ccx = world_to_chunk(px);
     ccz = world_to_chunk(pz);
-    world_prime(ws, px, pz);
+    world_prime(ws, px, TEST_PY, pz);
 
     rc = world_resident_count(ws);
     for (i = 0; i < rc && ok; ++i) {
@@ -566,7 +581,7 @@ static void test_neighbour_links(void)
             int nx = c->cx + NX[d];
             int ny = c->cy + NY[d];
             int nz = c->cz + NZ[d];
-            int resident = in_window(nx, ny, nz, ccx, ccz);
+            int resident = in_window(nx, ny, nz, ccx, TEST_CCY, ccz);
             Chunk *want = resident ? world_get(ws, nx, ny, nz) : NULL;
 
             if (c->neigh[d] != want) {
@@ -659,7 +674,7 @@ static void test_long_walk(void)
 
     /* prime so the home window exists, then walk a long looping path. */
     px = 8.0f; pz = 8.0f;
-    world_prime(ws, px, pz);
+    world_prime(ws, px, TEST_PY, pz);
 
     for (step = 0; step < 4000 && ok; ++step) {
         /* A serpentine path that ranges far in +X and weaves in Z, plus dips
@@ -678,7 +693,7 @@ static void test_long_walk(void)
             px -= 3.0f;                       /* cancel this frame's drift */
         }
 
-        world_stream_update(ws, px, pz);
+        world_stream_update(ws, px, TEST_PY, pz);
 
         /* Invariant 1: bounded resident set. world_stream_update enqueues the
          * leading edge but drains under budget, so mid-flight the count may be
@@ -731,7 +746,7 @@ static void test_long_walk(void)
          * frames (190 for the R=64 ball's 1521-chunk window) + margin. */
         for (drain = 0; drain < WORLD_WINDOW_CHUNKS / WORLD_GEN_BUDGET + 128; ++drain) {
             int cx, cy, cz, miss = 0;
-            world_stream_update(ws, px, pz);
+            world_stream_update(ws, px, TEST_PY, pz);
             for (cz = ccz - WORLD_RADIUS; cz <= ccz + WORLD_RADIUS && !miss; ++cz)
                 for (cx = ccx - WORLD_RADIUS; cx <= ccx + WORLD_RADIUS && !miss; ++cx)
                     for (cy = WORLD_BAND_Y0; cy <= WORLD_BAND_Y1; ++cy)
@@ -782,7 +797,7 @@ static void test_long_walk(void)
                    0, "store alloc failed");
         } else {
             fx = 8.0f; fz = 8.0f;
-            world_prime(fs, fx, fz);
+            world_prime(fs, fx, TEST_PY, fz);
             for (b = 0; b < 30 && conv_ok; ++b) {
                 int fcx, fcz, cx, cy, cz, drain;
                 fx += (float)CHUNK_DIM;            /* exactly one chunk east */
@@ -797,7 +812,7 @@ static void test_long_walk(void)
                  * would skip the move entirely. We always step, then test
                  * MEMBERSHIP (the sound convergence predicate). */
                 for (drain = 0; drain < 16; ++drain)
-                    world_stream_update(fs, fx, fz);
+                    world_stream_update(fs, fx, TEST_PY, fz);
 
                 if (world_resident_count(fs) != (uint32_t)WORLD_WINDOW_CHUNKS) {
                     conv_ok = 0;
@@ -872,7 +887,7 @@ static void test_slab_baseline(void)
     }
 
     if (ok) {
-        world_prime(ws, px, pz);
+        world_prime(ws, px, TEST_PY, pz);
         if (ws->free_top != baseline - world_resident_count(ws)) {
             ok = 0; snprintf(buf, sizeof buf,
                 "after prime free_top=%u resident=%u baseline=%u (mismatch)",
@@ -914,7 +929,7 @@ static void test_slab_baseline(void)
     if (ws != NULL) {
         float qx = 0.0f, qz = 0.0f;
         int ok2 = 1; char d2[128]; d2[0] = '\0';
-        world_prime(ws, qx, qz);
+        world_prime(ws, qx, TEST_PY, qz);
         world_shutdown(ws);   /* should evict all + free pool */
         /* After shutdown the pool is freed; re-init to a clean state to prove
          * the store is reusable and the baseline is restored. */
@@ -957,12 +972,12 @@ static void test_stationary_stable(void)
     if (ws == NULL) { report("stationary player is stable (no churn)", 0,
         "store alloc failed"); return; }
 
-    world_prime(ws, px, pz);
+    world_prime(ws, px, TEST_PY, pz);
     rc0 = world_resident_count(ws);
     ft0 = ws->free_top;
 
     for (i = 0; i < 50 && ok; ++i) {
-        world_stream_update(ws, px, pz);
+        world_stream_update(ws, px, TEST_PY, pz);
         if (world_resident_count(ws) != rc0 || ws->free_top != ft0) {
             ok = 0; snprintf(buf, sizeof buf,
                 "frame %d: residency churned %u->%u free %u->%u",

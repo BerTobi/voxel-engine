@@ -36,7 +36,7 @@ int main(void)
         return 1;
     }
     /* Resident window around the origin; the drain leaves every chunk clean. */
-    world_prime(ws, 0.0f, 0.0f);
+    world_prime(ws, 0.0f, 24.0f, 0.0f);
 
     /* 1) Read + edit a resident INTERIOR voxel: world (8,20,8) -> chunk (0,1,0),
      *    local (8,4,8). Read-back matches, chunk flagged MODIFIED + DIRTY_MESH. */

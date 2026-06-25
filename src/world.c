@@ -784,12 +784,15 @@ static int floor_div_chunk(float world)
 /* Evict every resident whose (cx,cz) Chebyshev distance from the new centre
  * exceeds WORLD_RADIUS (the trailing edge). Walks the dense resident list;
  * because world_evict swap-removes, we do NOT advance i when we evict at i. */
-static void evict_out_of_range(WorldStore *ws, int center_cx, int center_cz)
+static void evict_out_of_range(WorldStore *ws, int center_cx, int center_cy, int center_cz)
 {
     uint32_t i = 0;
     while (i < ws->resident_count) {
         Chunk *c = &ws->pool[ws->resident[i]];
-        if (cheby(c->cx, c->cz, center_cx, center_cz) > WORLD_RADIUS) {
+        int dy = c->cy - center_cy; if (dy < 0) dy = -dy;
+        /* 0.5 M2: out of range horizontally OR outside the player-following band */
+        if (cheby(c->cx, c->cz, center_cx, center_cz) > WORLD_RADIUS ||
+            dy > WORLD_BAND_HALF) {
             world_evict(ws, c->cx, c->cy, c->cz);
             /* a swap-remove pulled another resident into slot i; re-test it */
         } else {
@@ -801,7 +804,7 @@ static void evict_out_of_range(WorldStore *ws, int center_cx, int center_cz)
 /* Enqueue for generation every in-band chunk within radius of the new centre
  * that is not already resident (the leading edge). Coords only; the actual
  * generation happens in the budgeted drain. */
-static void enqueue_in_range(WorldStore *ws, int center_cx, int center_cz)
+static void enqueue_in_range(WorldStore *ws, int center_cx, int center_cy, int center_cz)
 {
     int dx, dz, cy;
 
@@ -819,7 +822,7 @@ static void enqueue_in_range(WorldStore *ws, int center_cx, int center_cz)
      * (we don't want to generate them). */
     ws->genq_head = ws->genq_tail = 0;
 
-    for (cy = WORLD_BAND_Y0; cy <= WORLD_BAND_Y1; ++cy) {
+    for (cy = center_cy - WORLD_BAND_HALF; cy <= center_cy + WORLD_BAND_HALF; ++cy) {
         for (dz = -WORLD_RADIUS; dz <= WORLD_RADIUS; ++dz) {
             for (dx = -WORLD_RADIUS; dx <= WORLD_RADIUS; ++dx) {
                 int cx = center_cx + dx;
@@ -832,19 +835,22 @@ static void enqueue_in_range(WorldStore *ws, int center_cx, int center_cz)
     }
 }
 
-void world_stream_update(WorldStore *ws, float player_x, float player_z)
+void world_stream_update(WorldStore *ws, float player_x, float player_y, float player_z)
 {
     int center_cx = floor_div_chunk(player_x);
+    int center_cy = floor_div_chunk(player_y);
     int center_cz = floor_div_chunk(player_z);
     int moved = (!ws->have_center ||
                  center_cx != ws->center_cx ||
+                 center_cy != ws->center_cy ||
                  center_cz != ws->center_cz);
 
     if (moved) {
         /* trailing edge out, leading edge enqueued */
-        evict_out_of_range(ws, center_cx, center_cz);
-        enqueue_in_range(ws, center_cx, center_cz);
+        evict_out_of_range(ws, center_cx, center_cy, center_cz);
+        enqueue_in_range(ws, center_cx, center_cy, center_cz);
         ws->center_cx = center_cx;
+        ws->center_cy = center_cy;
         ws->center_cz = center_cz;
         ws->have_center = 1;
     }
@@ -855,17 +861,19 @@ void world_stream_update(WorldStore *ws, float player_x, float player_z)
     drain_remesh(ws, WORLD_REMESH_BUDGET);
 }
 
-void world_prime(WorldStore *ws, float player_x, float player_z)
+void world_prime(WorldStore *ws, float player_x, float player_y, float player_z)
 {
     int center_cx = floor_div_chunk(player_x);
+    int center_cy = floor_div_chunk(player_y);
     int center_cz = floor_div_chunk(player_z);
 
     /* Re-centre the window (evict out-of-range, enqueue leading edge) exactly
      * like a move, then drain to EMPTY ignoring the per-frame budget, so the
      * first frame shows the full terrain and tests are deterministic. */
-    evict_out_of_range(ws, center_cx, center_cz);
-    enqueue_in_range(ws, center_cx, center_cz);
+    evict_out_of_range(ws, center_cx, center_cy, center_cz);
+    enqueue_in_range(ws, center_cx, center_cy, center_cz);
     ws->center_cx = center_cx;
+    ws->center_cy = center_cy;
     ws->center_cz = center_cz;
     ws->have_center = 1;
 

@@ -141,12 +141,20 @@ typedef struct {
  * G70's fog the late-arriving chunks are invisible (Section 7 streaming lead). */
 #define WORLD_RADIUS     6                       /* Chebyshev radius, chunks   */
 #define WORLD_DIAM       (2 * WORLD_RADIUS + 1)  /* 13                         */
-#define WORLD_BAND_Y0    0                       /* lowest resident chunk cy   */
-#define WORLD_BAND_Y1    8   /* highest resident chunk cy (0.3: must reach
-                              * (WG_PLANET_CY+WG_PLANET_R)/16; CY=R=64 -> ball
-                              * world-Y 0..128 = cy 0..8, so the player has ground
-                              * under them at every point on the ball). */
-#define WORLD_BAND_H     (WORLD_BAND_Y1 - WORLD_BAND_Y0 + 1)  /* 9 layers      */
+
+/* 0.5 M2: the resident vertical band now FOLLOWS THE PLAYER. At R=64 the whole
+ * ball fit a fixed cy 0..8 band; at R=512 (256 m) the planet is 64 chunks across
+ * and the surface sits at high Y, so a fixed band would leave the player in
+ * unloaded space. The band is a 9-layer window [center_cy-HALF .. center_cy+HALF]
+ * re-anchored on the player's chunk-Y each frame (alongside the horizontal cx/cz
+ * Chebyshev radius), so the resident set is a player-centred box that always
+ * brackets the local surface. Count is unchanged (13x13x9 = 1521), so the slab
+ * pool / render-slot budgets the grain study fixed stay put. The band is in cy
+ * (world-Y) regardless of the local radial "up"; being player-centred it still
+ * covers the surface anywhere, just anisotropically (a full isotropic 3-D box is
+ * a 0.6 refinement if the player roams far from the spawn pole). */
+#define WORLD_BAND_HALF  4                       /* layers above/below center_cy */
+#define WORLD_BAND_H     (2 * WORLD_BAND_HALF + 1)            /* 9 layers      */
 #define WORLD_WINDOW_CHUNKS (WORLD_DIAM * WORLD_DIAM * WORLD_BAND_H) /* 1521    */
 
 /* SLAB POOL (Section 7 "Fixed-Size Slab Pool, No Per-Chunk malloc"). A single
@@ -183,9 +191,11 @@ typedef struct {
  * surface chunks (probe: 431 of 1521); 768 covers that + a leading curtain of
  * churn with margin. world_realize HARD-FAILS if exhausted (a too-small pool is a
  * sizing bug caught by test_sparse's worst-case stream, not silent corruption).
- * Re-tuned at M2 once the R=512 surface-following geometry's realized count is
- * measured. The pool NEVER grows (the no-per-chunk-malloc rule still holds). */
-#define WORLD_SLAB_SLOTS  768u
+ * Re-tuned at M2: the R=512 surface-following band hugs the ground (the air saving
+ * is only the ~4 layers above the surface, not the 72% of the R=64 ball), so the
+ * realized count climbs to ~600-850; 1024 covers that with churn margin (measured
+ * by test_sparse). The pool NEVER grows (the no-per-chunk-malloc rule still holds). */
+#define WORLD_SLAB_SLOTS  1024u
 
 /* ======================================================================== *
  *  4. PER-FRAME STREAMING BUDGET  (ARCHITECTURE Section 6 / Section 7)      *
@@ -345,6 +355,7 @@ struct WorldStore {
     /* ---- streaming origin ---- */
     int         have_center;             /* 0 until the first world_stream_update */
     int         center_cx, center_cz;    /* player chunk the current window centres on */
+    int         center_cy;               /* 0.5 M2: player chunk-Y the band follows    */
 
     uint64_t    seed;                    /* world is a function of this (Section 7) */
     WorldCallbacks cb;                   /* gen / mesh-upload / slot-free        */
@@ -498,16 +509,17 @@ int  world_edit_voxel(WorldStore *ws, int wx, int wy, int wz, Voxel v);
  *      upload on the chunk, clear its CHUNK_DIRTY_MESH). Leftover work stays
  *      queued for the next frame.
  *
- * y is not a parameter: the vertical band [WORLD_BAND_Y0..Y1] is fixed and
- * always resident (Section 7 "vertical column always resident"). */
-void world_stream_update(WorldStore *ws, float player_x, float player_z);
+ * 0.5 M2: player_y now matters - the 9-layer vertical band re-anchors on the
+ * player's chunk-Y (the planet's surface sits at high Y at R=512), so all three
+ * coords drive the resident window. */
+void world_stream_update(WorldStore *ws, float player_x, float player_y, float player_z);
 
-/* Force-fill the ENTIRE window around (player_x, player_z) synchronously,
+/* Force-fill the ENTIRE window around (player_x, player_y, player_z) synchronously,
  * ignoring the per-frame budget: generate + mesh every in-range chunk now.
  * Used at startup (so the first frame shows full terrain, like the old static
  * grid) and in tests (deterministic, no frame pacing). Equivalent to calling
  * world_stream_update and draining to empty. */
-void world_prime(WorldStore *ws, float player_x, float player_z);
+void world_prime(WorldStore *ws, float player_x, float player_y, float player_z);
 
 /* ======================================================================== *
  *  11. NEIGHBOUR MAINTENANCE  (M5 seamless meshing as the window slides)    *

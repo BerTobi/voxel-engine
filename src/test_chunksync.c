@@ -45,8 +45,8 @@ int main(void)
     if (world_init(&HW, seed, &c) != 0 || world_init(&CW, seed, &c) != 0) {
         printf("FAIL: world_init\n"); return 2;
     }
-    world_prime(&HW, 8.0f, 8.0f);
-    world_prime(&CW, 8.0f, 8.0f);
+    world_prime(&HW, 8.0f, 136.0f, 8.0f);
+    world_prime(&CW, 8.0f, 136.0f, 8.0f);
     hctx.world = &HW; hctx.persist = NULL; hctx.seed = seed;
     cctx.world = &CW; cctx.persist = NULL; cctx.seed = seed;
 
@@ -60,13 +60,15 @@ int main(void)
 
     /* (2) three host edits round-trip; an unedited voxel is left alone */
     {
-        int wx0 = CX*16+3,  wy0 = CY*16+2,  wz0 = CZ*16+5;    /* -> stone  */
+        /* 0.5 M2: at R=512 chunk (0,8,0) is solid STONE (it was AIR at R=64), so
+         * each edit must differ from a stone seed to register as a delta. */
+        int wx0 = CX*16+3,  wy0 = CY*16+2,  wz0 = CZ*16+5;    /* -> dirt   */
         int wx1 = CX*16+8,  wy1 = CY*16+0,  wz1 = CZ*16+8;    /* -> air    */
         int wx2 = CX*16+10, wy2 = CY*16+4,  wz2 = CZ*16+2;    /* -> copper */
         int ux  = CX*16+1,  uy  = CY*16+12, uz  = CZ*16+1;    /* NOT edited */
         Voxel before_un;
 
-        world_edit_voxel(&HW, wx0, wy0, wz0, mk(MAT_STONE, 15));
+        world_edit_voxel(&HW, wx0, wy0, wz0, mk(MAT_DIRT, 15));
         world_edit_voxel(&HW, wx1, wy1, wz1, mk(MAT_AIR, 0));
         world_edit_voxel(&HW, wx2, wy2, wz2, mk(MAT_COPPER, 15));
         before_un = world_get_voxel(&CW, ux, uy, uz);

@@ -238,7 +238,7 @@ testdeterminism: | $(BUILD)
 # to the expected value at the 0.5 grain. M2 grows this into the grain grep gate.
 # apt: build-essential
 testgrain: | $(BUILD)
-	$(CC) $(CFLAGS) -o $(BUILD)/grain_test $(SRC)/test_grain.c
+	$(CC) $(CFLAGS) -o $(BUILD)/grain_test $(SRC)/test_grain.c -lm
 	$(BUILD)/grain_test
 
 # 0.5 M0: the WATER CA determinism harness slot. M0 asserts the EXISTING liquid

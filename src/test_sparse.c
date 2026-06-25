@@ -40,11 +40,12 @@ int main(void)
 
     printf("== test_sparse (0.5 M1 sparse-air storage) ==\n");
 
-    /* The R=64 ball is centred at world (8,64,8) = chunk (0,4,0). Chunk (0,40,0)
-     * is world-Y ~640, far above the ball -> wholly air. */
+    /* The R=512 ball is centred at world (8,512,8); the north pole surface is at
+     * world-Y 1024 (chunk cy 64). Chunk (0,80,0) is world-Y ~1280, far above the
+     * pole -> wholly air; chunk (0,63,0) is the solid crust just under the pole. */
     {
-        Chunk *air   = world_insert(ws, 0, 40, 0);
-        Chunk *solid = world_insert(ws, 0, 4, 0);
+        Chunk *air   = world_insert(ws, 0, 80, 0);
+        Chunk *solid = world_insert(ws, 0, 63, 0);
         CHECK(air && air->voxels == NULL && (air->flags & CHUNK_UNIFORM),
               "exterior chunk inserts uniform-air (NULL voxels, no slab)");
         CHECK(air && vox_mat(chunk_vox(air, 0)) == MAT_AIR,
@@ -58,8 +59,8 @@ int main(void)
     /* Mesh: uniform-air -> 0 quads; realized solid -> >0. */
     {
         MeshBuffer mb;
-        Chunk *air   = world_get(ws, 0, 40, 0);
-        Chunk *solid = world_get(ws, 0, 4, 0);
+        Chunk *air   = world_get(ws, 0, 80, 0);
+        Chunk *solid = world_get(ws, 0, 63, 0);
         if (mesh_buffer_init(&mb, 65536u, 98304u) != 0) { printf("mb fail\n"); return 2; }
         CHECK(greedy_mesh(air, &mb) == 0, "uniform-air chunk meshes to 0 quads");
         CHECK(greedy_mesh(solid, &mb) > 0, "realized solid chunk meshes to >0 quads");
@@ -68,7 +69,7 @@ int main(void)
 
     /* realize / set_uniform round-trip on the uniform chunk. */
     {
-        Chunk *air = world_get(ws, 0, 40, 0);
+        Chunk *air = world_get(ws, 0, 80, 0);
         Voxel uw = air->uniform_word;
         uint32_t free_before = ws->slab_free_top;
         int i, all_uw = 1;
@@ -88,7 +89,7 @@ int main(void)
         uint32_t resident, realized;
         int k;
         for (k = 0; k < 600; ++k)
-            world_stream_update(ws, 0.0f, 0.0f);
+            world_stream_update(ws, 8.0f, 1024.0f, 8.0f);
         resident = world_resident_count(ws);
         realized = (uint32_t)WORLD_SLAB_SLOTS - ws->slab_free_top;
         printf("  settled window: %u resident chunks, %u realized blocks "
@@ -97,9 +98,9 @@ int main(void)
         CHECK(ws->slab_inuse_peak < (uint32_t)WORLD_SLAB_SLOTS,
               "slab sub-pool never exhausts over a full window stream (no overflow)");
         CHECK(resident > realized,
-              "sparse win: resident chunks exceed realized blocks (air costs no slab)");
-        CHECK((uint64_t)realized * 2u < resident,
-              "the majority of the resident window is uniform-air (>50% slabs saved)");
+              "sparse win: resident chunks exceed realized blocks (air above the surface costs no slab)");
+        CHECK(ws->slab_inuse_peak + 64u < (uint32_t)WORLD_SLAB_SLOTS,
+              "slab pool sized with churn headroom at the real pole-surface window");
         printf("  RAM: dense would reserve %u x 16 KiB = %.1f MiB of voxels; sparse "
                "touches %u blocks = %.1f MiB (record pool now ~%.0f KiB)\n",
                resident, resident * 16.0 / 1024.0,

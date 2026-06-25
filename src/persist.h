@@ -81,7 +81,7 @@
  *    (Section 8, binding) on a mismatch is REFUSE TO LOAD ("this save belongs
  *    to an older generator") rather than silently corrupt the player's memory
  *    of their world. Bulk-rebake-on-upgrade is explicitly out of scope. */
-#define PERSIST_FORMAT_VERSION  1u
+#define PERSIST_FORMAT_VERSION  2u   /* 0.5 M2: grain flip - 0.4 (v1) saves are refused */
 
 /* ======================================================================== *
  *  1. REGION GEOMETRY  (Section 8 "Region Files", binding numbers)          *

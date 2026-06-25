@@ -77,6 +77,7 @@
 #include "world.h"
 #include "worldgen.h"
 #include "persist.h"
+#include "units.h"      /* 0.5 M2: M2V() - reach/spawn authored in metres */
 #include "progress.h"
 #include "raycast.h"
 #include "player.h"
@@ -112,7 +113,7 @@
  * already decorated, home_is_decorated detects the held-lava marker and we skip
  * re-decoration, preserving the player/sim's evolved state.) */
 #define HOME_CX           0
-#define HOME_CY           7
+#define HOME_CY           63    /* 0.5 M2: crust chunk under the new pole (surface cy 64 at R=512) */
 #define HOME_CZ           0
 
 /* Local-Y the camera aims at (the forge's lava level), offset by the HOME chunk's
@@ -410,7 +411,7 @@ static Voxel make_liquid(uint8_t mat)
  * the empty cell before it. Number keys 1..5 pick the placement material; the
  * targeted block is highlighted. Edits go through world_edit_voxel (remesh +
  * persist) and, when they land in the simulated chunk, wake the sim. */
-#define BLOCK_REACH   6.0f      /* player edit reach, in voxels */
+#define BLOCK_REACH   M2V(3.0f)   /* 0.5 M2: 3 m edit reach (metres via units.h) */
 
 /* Placement palette, selected by number keys 1..5. */
 static const uint8_t PLACE_MATS[5] = {
@@ -1517,7 +1518,9 @@ int main(void)
             world_set_persist(world, persist);
     }
 
-    world_prime(world, cam_look_x, cam_look_z);
+    /* 0.5 M2: prime the window around the spawn pole's Y (= the surface, CY+R) so
+     * the player-following band loads the ground under the spawn before frame 1. */
+    world_prime(world, cam_look_x, (float)(WG_PLANET_CY + WG_PLANET_R), cam_look_z);
 
     /* ---- 6. Heat sim allocation (bound lazily when HOME is resident) ----- *
      * SimState is large (it embeds the double-buffer + latent/heat arrays), so
@@ -1600,7 +1603,7 @@ int main(void)
      * ball) so a live WALK session falls radially onto the surface and a headless
      * fly capture frames the ball. XZ defaults to the planet axis (= cam_look). */
     cam_pos.x    = cam_look_x;
-    cam_pos.y    = (float)(WG_PLANET_CY + WG_PLANET_R) + 6.0f;
+    cam_pos.y    = (float)(WG_PLANET_CY + WG_PLANET_R) + M2V(3.0f);  /* spawn 3 m above the pole */
     cam_pos.z    = cam_look_z;
 
     /* Player body: FLY is forced under VOXEL_SHOT (headless captures must not get
@@ -2078,7 +2081,7 @@ int main(void)
          * and shoots far away near the horizon, which would yank the streamed
          * window off the player. A stationary player with no pending work costs
          * nothing. */
-        world_stream_update(world, cam_pos.x, cam_pos.z);
+        world_stream_update(world, cam_pos.x, cam_pos.y, cam_pos.z);
 
         /* 0.3: send a bounded batch of chunk-sync requests (client only). The ring
          * was just filled by cb_gen for any chunks this stream step generated; the

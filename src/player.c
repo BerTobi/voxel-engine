@@ -11,6 +11,7 @@
  * the deterministic integer sim. A far-away center ~= flat -Y gravity again.
  */
 #include "player.h"
+#include "units.h"   /* 0.5 M2: M2V() - physical constants authored in metres */
 #include <math.h>
 
 /* floor() toward -inf as an int (plain (int) truncates toward zero - wrong for
@@ -117,19 +118,23 @@ static int sphere_resolve(const Player *p, const PlyParams *pp,
 PlyParams player_defaults(void)
 {
     PlyParams pp;
-    pp.half_xz        = 0.3f;
-    pp.height         = 1.8f;
-    pp.eye            = 1.62f;
-    pp.gravity        = 28.0f;
-    pp.term_fall      = 56.0f;
-    pp.walk_speed     = 4.3f;
-    pp.jump_vel       = 8.4f;
+    /* 0.5 M2: lengths/speeds authored in METRES via M2V so the physical feel
+     * (a 1.8 m body, 4.3 m/s walk, 28 m/s^2 gravity) is preserved across the grain
+     * change - at k=2 each is exactly 2x its 0.4 voxel literal. air_control and
+     * water_xy_scale are dimensionless ratios and stay as-is. */
+    pp.half_xz        = M2V(0.3f);
+    pp.height         = M2V(1.8f);
+    pp.eye            = M2V(1.62f);
+    pp.gravity        = M2V(28.0f);
+    pp.term_fall      = M2V(56.0f);
+    pp.walk_speed     = M2V(4.3f);
+    pp.jump_vel       = M2V(8.4f);
     pp.air_control    = 0.35f;
     pp.water_xy_scale = 0.5f;
-    pp.water_term     = 3.0f;
-    pp.swim_vel       = 4.0f;
-    pp.max_substep    = 0.45f;
-    pp.r_p            = 0.45f;   /* collision sphere radius                  */
+    pp.water_term     = M2V(3.0f);
+    pp.swim_vel       = M2V(4.0f);
+    pp.max_substep    = M2V(0.45f);
+    pp.r_p            = M2V(0.45f);   /* collision sphere radius (0.45 m)         */
     pp.center_x       = 0.0f;    /* planet center; the CALLER overrides this */
     pp.center_y       = 0.0f;
     pp.center_z       = 0.0f;

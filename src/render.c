@@ -295,8 +295,11 @@ static const char *VS_OPAQUE =
      * 1000 far plane so distant chunks FADE into the sky colour rather than pop
      * at the clip plane. The central demo (a few tens of voxels out) stays
      * unfogged. The FS mixes the final colour toward the matching sky colour. */
-    "    const float FOG_START = 140.0;\n"
-    "    const float FOG_END   = 340.0;\n"
+    /* 0.5 M2: at the 0.5 m grain the resident window is radius-6 = 96 voxels, so fog
+     * ramps to full by ~92 voxels (~46 m) to hide the streaming edge - the old
+     * 140..340 was sized for the R=64 ball that fit entirely in view. */
+    "    const float FOG_START = 55.0;\n"
+    "    const float FOG_END   = 92.0;\n"
     "    v_fog = clamp((gl_Position.w - FOG_START) / (FOG_END - FOG_START), 0.0, 1.0);\n"
     /* Reconstruct atlas UV from tile id + corner using the shared grid const.
      * col = mod(mat,16); row = floor(mat/16); uv = (corner + (col,row))/cols. */

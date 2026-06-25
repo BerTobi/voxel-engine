@@ -93,10 +93,19 @@ behind the `make check` gate; see `PLAN-0.5.md`.
   targets `-Wall -Wextra` clean; the determinism symbol `sim_state_hash` is absent from the
   release binary (compiled in only under `-DVOXEL_DETERMINISM_HARNESS`); the version string has a
   single source of truth in `version.h`; the integrated heat-forge **and** water-spring sim runs
-  bounded (5000-tick warmup in ~2 s, ~91 MB RSS, no runaway active set). _(Cross-platform
-  determinism under wine — the Windows build hashing identically to Linux — is integer-CA-
-  deterministic by construction and covered by the Linux determinism harness; the explicit wine
-  run is pending a wine install in the dev environment.)_
+  bounded (5000-tick warmup in ~2 s, ~91 MB RSS, no runaway active set).
+- _(M6)_ **Cross-platform determinism — verified, and a real bug fixed on the way.** The integer
+  CA must compute the world byte-for-byte identically on the 32-bit Windows target as on the dev
+  Linux box. New `det_hash_dump` fingerprints fixed heat/water/combined scenarios via
+  `sim_state_hash`, and two `make` gates compare them: **`detcross`** (native LP64 vs `-m32` ILP32
+  — the wine-free data-model check) and **`detwine`** (native vs the actual `i686-w64-mingw32` PE
+  run under wine — the real shipped artifact). Both now report **identical hashes** across all
+  three data points (Linux-64, Linux-32, Windows/wine). Standing this up exposed a latent **M1
+  regression**: `sim_state_hash` hashed `sizeof(voxels)` bytes, which became the **pointer width**
+  (8 on LP64, 4 on ILP32) once `Chunk.voxels` turned into a pointer — so it folded only the first
+  1–2 voxels, leaving the **entire voxel array (including water `fill`) effectively unhashed** in
+  every determinism test (they passed only because `heat[]` carried the signal). Fixed to hash the
+  full `CHUNK_VOXELS`-word array (or the uniform word for a slab-less air chunk).
 
 ## 0.4.0 — 2026-06-24 — The World Comes Alive
 

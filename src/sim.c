@@ -2046,7 +2046,16 @@ uint64_t sim_state_hash(const SimState *s)
     uint64_t h = 14695981039346656037ull; /* FNV-1a 64-bit offset basis */
     if (s == NULL || s->chunk == NULL)
         return h;
-    h = det_fnv1a(h, s->chunk->voxels, sizeof s->chunk->voxels);
+    /* 0.5 M1 made Chunk.voxels a POINTER (was an inline array). `sizeof voxels`
+     * is therefore the pointer WIDTH (8 on LP64 Linux, 4 on ILP32 Win32) - it
+     * folded only the first 1-2 voxels, by a platform-dependent count, so the
+     * voxel state (incl. water fill) was effectively unhashed and the hash was
+     * not cross-platform comparable. Hash the FULL voxel array - or, for a
+     * uniform-air chunk that borrows no slab (voxels==NULL), its uniform word. */
+    if (s->chunk->voxels != NULL)
+        h = det_fnv1a(h, s->chunk->voxels, (size_t)CHUNK_VOXELS * sizeof(Voxel));
+    else
+        h = det_fnv1a(h, &s->chunk->uniform_word, sizeof s->chunk->uniform_word);
     h = det_fnv1a(h, s->heat,          sizeof s->heat);
     h = det_fnv1a(h, s->latent,        sizeof s->latent);
     return h;

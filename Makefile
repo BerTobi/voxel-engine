@@ -109,7 +109,7 @@ WIN_LDFLAGS := -static -static-libgcc -Wl,--gc-sections -mwindows
 WIN_LIBS    := -lopengl32 -lgdi32 -luser32 -lws2_32
 
 # ---- Targets -----------------------------------------------------------------
-.PHONY: all linux win test testsim testworld testpersist testprogress testraycast testedit testplayer testnet testchunksync testwaternet testdeterminism testgrain testwater testsparse check version archive clean
+.PHONY: all linux win test testsim testworld testpersist testprogress testraycast testedit testplayer testnet testchunksync testwaternet testdeterminism testgrain testwater testsparse detcross detwine check version archive clean
 
 # Default target: native dev build.
 all: linux
@@ -272,6 +272,35 @@ testsparse: | $(BUILD)
 		$(SRC)/material.c $(SRC)/chunk.c $(SRC)/mesher.c $(SRC)/worldgen.c \
 		$(SRC)/world.c $(SRC)/persist.c $(SRC)/test_sparse.c -lm
 	$(BUILD)/sparse_test
+
+# 0.5 M6: CROSS-PLATFORM determinism gates (release-time, NOT in `check` since they
+# need extra toolchains). det_hash_dump.c runs fixed heat/water/combined CA scenarios
+# and prints sim_state_hash() as stable hex; the integer-only CA must hash identically
+# regardless of data model or target. Two fidelities:
+#   detcross - native (LP64) vs -m32 (ILP32, the Windows data model). Wine-free, the
+#              fast default gate; catches pointer/long-width determinism bugs.
+#              apt: gcc-multilib
+#   detwine  - native vs the ACTUAL shipped i686-w64-mingw32 PE run under wine. Higher
+#              fidelity (real compiler + Windows CRT). apt: gcc-mingw-w64-i686 wine wine32:i386
+DET_SRC    := $(SRC)/material.c $(SRC)/chunk.c $(SRC)/sim.c $(SRC)/progress.c $(SRC)/det_hash_dump.c
+DET_CFLAGS := -std=c99 -Wall -Wextra -Isrc -DVOXEL_DETERMINISM_HARNESS
+detcross: | $(BUILD)
+	$(CC)      $(DET_CFLAGS) -o $(BUILD)/det_dump   $(DET_SRC) -lm
+	$(CC) -m32 $(DET_CFLAGS) -o $(BUILD)/det_dump32 $(DET_SRC) -lm
+	$(BUILD)/det_dump   > $(BUILD)/det_lp64.txt
+	$(BUILD)/det_dump32 > $(BUILD)/det_ilp32.txt
+	@diff $(BUILD)/det_lp64.txt $(BUILD)/det_ilp32.txt \
+		&& echo "=== detcross: LP64 == ILP32 (data-model deterministic) ===" \
+		|| (echo "=== detcross: MISMATCH - CA is NOT data-model deterministic ==="; exit 1)
+
+detwine: | $(BUILD)
+	$(CC)    $(DET_CFLAGS) -o $(BUILD)/det_dump     $(DET_SRC) -lm
+	$(WINCC) $(DET_CFLAGS) -o $(BUILD)/det_dump.exe $(DET_SRC)
+	$(BUILD)/det_dump > $(BUILD)/det_native.txt
+	WINEDEBUG=-all wine $(BUILD)/det_dump.exe 2>/dev/null | tr -d '\r' > $(BUILD)/det_wine.txt
+	@diff $(BUILD)/det_native.txt $(BUILD)/det_wine.txt \
+		&& echo "=== detwine: native == win/wine (shipped artifact deterministic) ===" \
+		|| (echo "=== detwine: MISMATCH - shipped Windows build diverges ==="; exit 1)
 
 # 0.4 M0: the aggregate regression gate. Runs EVERY unit suite in order; make
 # aborts on the first suite whose binary exits non-zero (each test's exit code is

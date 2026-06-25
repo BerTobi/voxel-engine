@@ -251,7 +251,38 @@ int worldgen_radial_offset(int dx, int dy, int dz)
  * Determinism: a pure function of (cx,cy,cz) into c->voxels (seed-independent, one
  * fixed asteroid). Calling twice with identical inputs yields byte-identical
  * voxels[] (the regenerate-from-seed guarantee, asserted cross-platform). */
-void worldgen_fill_chunk(Chunk *c, int cx, int cy, int cz, uint64_t seed)
+/* gen v3 (RETAINED for cross-version save compat): the smooth sphere - STONE where
+ * d^2 <= R^2, a WG_DIRT_DEPTH dirt crust, AIR outside. No relief. A world stamped
+ * gen_version 3 keeps loading as the smooth ball it was created as. */
+static void gen_fill_v3(Chunk *c, int cx, int cy, int cz)
+{
+    uint8_t ambient = temp_encode_c(WG_AMBIENT_C);
+    int lx, ly, lz;
+    const long R2  = (long)WG_PLANET_R * (long)WG_PLANET_R;
+    const long Rd  = (long)WG_PLANET_R - (long)WG_DIRT_DEPTH;
+    const long Rd2 = Rd * Rd;
+    c->cx = cx; c->cy = cy; c->cz = cz;
+    for (lz = 0; lz < CHUNK_DIM; ++lz) {
+        long dz = (long)(cz * CHUNK_DIM + lz) - WG_PLANET_CZ;
+        for (ly = 0; ly < CHUNK_DIM; ++ly) {
+            long dy = (long)(cy * CHUNK_DIM + ly) - WG_PLANET_CY;
+            for (lx = 0; lx < CHUNK_DIM; ++lx) {
+                long dx = (long)(cx * CHUNK_DIM + lx) - WG_PLANET_CX;
+                long d2 = dx * dx + dy * dy + dz * dz;
+                Voxel v = 0;
+                uint8_t mat = (d2 > R2) ? MAT_AIR : (d2 > Rd2) ? MAT_DIRT : MAT_STONE;
+                vox_set_mat(&v, mat);
+                if (mat != MAT_AIR) vox_set_fill(&v, 15);
+                vox_set_temp_code(&v, ambient);
+                c->voxels[vox_index(lx, ly, lz)] = v;
+            }
+        }
+    }
+    c->flags |= CHUNK_DIRTY_MESH | CHUNK_GEN;
+}
+
+/* gen v4 (current): the smooth sphere with radial terrain RELIEF (hills/basins). */
+static void gen_fill_v4(Chunk *c, int cx, int cy, int cz)
 {
     uint8_t ambient = temp_encode_c(WG_AMBIENT_C);
     int lx, ly, lz;
@@ -262,8 +293,6 @@ void worldgen_fill_chunk(Chunk *c, int cx, int cy, int cz, uint64_t seed)
     const long Rhi2 = Rhi * Rhi;
     const long Rlo  = (long)WG_PLANET_R - WG_RELIEF_AMP - WG_DIRT_DEPTH;
     const long Rlo2 = (Rlo > 0) ? Rlo * Rlo : 0;
-
-    (void)seed;   /* one fixed asteroid; generation is seed-independent */
 
     c->cx = cx;
     c->cy = cy;
@@ -309,6 +338,34 @@ void worldgen_fill_chunk(Chunk *c, int cx, int cy, int cz, uint64_t seed)
     c->flags |= CHUNK_DIRTY_MESH | CHUNK_GEN;
 }
 
+/* ======================================================================== *
+ *  PER-WORLD GENERATOR VERSIONING (cross-version save compatibility)         *
+ * ======================================================================== *
+ * A world is pinned to the generator version it was CREATED with: its save
+ * stores that gen_version, and on load the engine selects the matching generator
+ * here and regenerates unmodified chunks with IT - so a world keeps loading as the
+ * world it was, even after a later version changes the default terrain. The build
+ * RETAINS every supported generator (below); changing terrain in a future version
+ * means ADDING a gen_fill_vN and a case, never editing an old one (an old generator
+ * must keep producing byte-identical output forever or its worlds would corrupt).
+ * Single active version (one world at a time, single-threaded) -> a static is fine
+ * and deterministic. The MP handshake advertises the WORLD's version, not the
+ * build's, so peers regenerate identically (or are refused if they lack it). */
+static uint32_t g_gen_version = WG_GEN_VERSION;   /* the active world's generator */
+
+void worldgen_select_version(uint32_t v) { g_gen_version = v; }
+uint32_t worldgen_active_version(void)   { return g_gen_version; }
+int worldgen_version_supported(uint32_t v) { return v == 3u || v == 4u; }
+
+void worldgen_fill_chunk(Chunk *c, int cx, int cy, int cz, uint64_t seed)
+{
+    (void)seed;   /* one fixed asteroid; generation is seed-independent */
+    switch (g_gen_version) {
+        case 3u:           gen_fill_v3(c, cx, cy, cz); break;
+        case 4u: default:  gen_fill_v4(c, cx, cy, cz); break;
+    }
+}
+
 /* The nearest distance, along one axis, from the planet centre C to the chunk's
  * world-coord span [base, base+CHUNK_DIM-1]: 0 if C is inside the span, else the
  * gap to the nearer end. */
@@ -324,10 +381,11 @@ int worldgen_chunk_all_air(int cx, int cy, int cz)
 {
     /* Min squared distance from the centre to ANY voxel in the chunk = sum of the
      * per-axis nearest distances squared. If even that is beyond the MAXIMUM
-     * possible surface radius (R + WG_RELIEF_AMP, a relief peak), every voxel is
-     * air. Must be conservative against the peak: tagging a chunk that contains a
-     * ridge as all-air would drop real terrain (sparse-air would skip its block). */
-    const long Rhi = (long)WG_PLANET_R + WG_RELIEF_AMP;
+     * possible surface radius, every voxel is air. Must be conservative against the
+     * peak (a v4 relief ridge reaches R+AMP) or sparse-air would drop real terrain;
+     * v3 (smooth) has no relief so its max surface is exactly R. Dispatch on the
+     * active world's generator version, matching worldgen_fill_chunk. */
+    const long Rhi = (long)WG_PLANET_R + ((g_gen_version >= 4u) ? WG_RELIEF_AMP : 0);
     const long Rhi2 = Rhi * Rhi;
     long nx = axis_near(cx * CHUNK_DIM, WG_PLANET_CX);
     long ny = axis_near(cy * CHUNK_DIM, WG_PLANET_CY);

@@ -109,6 +109,23 @@ behind the `make check` gate; see `PLAN-0.5.md`.
   full `CHUNK_VOXELS`-word array (or the uniform word for a slab-less air chunk).
 
 ### Added (continued)
+- **Per-world generator pinning — worlds survive future worldgen changes** _(the save-
+  compatibility contract starts here)_. A world is now tied to the generator version it was
+  **created** with: its save records that version (every region header already stamps it), and on
+  load the engine **peeks** that version (`persist_peek_gen_version`) and **regenerates the world
+  with it** rather than with the build's current generator. The build **retains every supported
+  generator** and dispatches by version (`worldgen_select_version` / `worldgen_version_supported`);
+  the pre-relief smooth sphere is kept as **gen v3**, the relief planet is **gen v4**. So a world
+  you keep loads as the world it was, even after a later version changes the default terrain — and
+  a save is refused only if its generator is genuinely **unknown** (or the file is corrupt), never
+  merely because it is *old*. To get new terrain you create a new world. Multiplayer stays correct:
+  the host advertises the **world's** generator version (not the build's), so a peer that would
+  regenerate different terrain is cleanly refused at the handshake instead of silently desyncing.
+  _Contract going forward: changing terrain means ADDING a `gen_fill_vN` + a dispatch case + a
+  `worldgen_version_supported` entry and bumping `WG_GEN_VERSION` — **never editing a retained
+  generator** (an old generator must keep producing byte-identical output forever, or its worlds
+  corrupt). New `test_worldgen` (v3≠v4 dispatch) + `test_persist` (peek → pin-load → wrong-version
+  miss) cover it._
 - **The planet has terrain — hills, ridges and basins** _(`WG_GEN_VERSION` 3→4)_. The smooth
   dry sphere now displaces its surface radius per direction by a deterministic **integer 3D
   value-noise** field, so water placed on it finds a downhill path and pools in hollows instead

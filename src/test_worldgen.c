@@ -13,6 +13,7 @@
  */
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include "worldgen.h"
 #include "chunk.h"
 #include "voxel.h"
@@ -100,6 +101,36 @@ int main(void)
                 if (off > WG_RELIEF_AMP) over = 1;
             }
         check("surface displacement never exceeds +AMP (all-air predicate is safe)", !over);
+    }
+
+    /* (7) per-world generator VERSIONING: the build retains v3 (smooth) + v4 (relief);
+     * each generates deterministically, and they differ at the surface (relief is not
+     * smooth) - which is the whole point of pinning (a v3 world keeps loading smooth). */
+    {
+        Chunk *c = malloc(sizeof *c);
+        Voxel *v4buf = malloc((size_t)CHUNK_VOXELS * sizeof(Voxel));
+        if (c == NULL || v4buf == NULL) { check("alloc version-test buffers", 0); }
+        else {
+            c->voxels = malloc((size_t)CHUNK_VOXELS * sizeof(Voxel));
+            c->slab_idx = -1;
+            if (c->voxels == NULL) { check("alloc version-test chunk", 0); }
+            else {
+                check("v3 + v4 supported, others rejected",
+                      worldgen_version_supported(3) && worldgen_version_supported(4)
+                      && !worldgen_version_supported(2) && !worldgen_version_supported(99));
+                worldgen_select_version(4);
+                worldgen_fill_chunk(c, 32, 32, 0, 0);   /* equatorial surface: relief active */
+                check("worldgen_active_version reflects the selection", worldgen_active_version() == 4u);
+                memcpy(v4buf, c->voxels, (size_t)CHUNK_VOXELS * sizeof(Voxel));
+                worldgen_select_version(3);
+                worldgen_fill_chunk(c, 32, 32, 0, 0);   /* same chunk, smooth generator */
+                check("v3 (smooth) differs from v4 (relief) at the surface",
+                      memcmp(v4buf, c->voxels, (size_t)CHUNK_VOXELS * sizeof(Voxel)) != 0);
+                worldgen_select_version(WG_GEN_VERSION);   /* restore the latest */
+                free(c->voxels);
+            }
+        }
+        free(v4buf); free(c);
     }
 
     printf("=== %d failure(s) ===\n", g_fail);

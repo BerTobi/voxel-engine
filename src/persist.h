@@ -455,6 +455,13 @@ int  persist_world_meta_write(const char *dir, const char *name, uint64_t seed);
 int  persist_world_meta_read(const char *dir, char *name_out, int name_cap,
                              uint64_t *seed_out);
 
+/* Peek the gen_version a save in `dir` was written with, WITHOUT opening the store:
+ * reads the header of any one region file. Returns 0 and sets *gen_out on success,
+ * non-zero if `dir` holds no valid region file (a fresh/empty world). Used by the
+ * loader to PIN a world to its own generator version (worldgen.h) so a later
+ * generator change does not invalidate it - the world regenerates as it was. */
+int  persist_peek_gen_version(const char *dir, uint32_t *gen_out);
+
 /* List worlds under `root` (subdirs with a valid world.meta) into out[max], sorted
  * by name; returns the count (<= max). */
 int  persist_list_worlds(const char *root, WorldInfo *out, int max);

@@ -158,6 +158,16 @@ int  worldgen_height(uint64_t seed, int wx, int wz);
  * Exposed for the worldgen unit test. */
 int  worldgen_radial_offset(int dx, int dy, int dz);
 
+/* ---- Per-world generator versioning (cross-version save compatibility) ----- *
+ * A world is pinned to the generator version it was created with (stored in its
+ * save). On load the engine SELECTS that version so unmodified chunks regenerate
+ * as the world they were; the build retains every supported generator. New worlds
+ * use WG_GEN_VERSION (the latest). worldgen_fill_chunk + worldgen_chunk_all_air
+ * dispatch on the active selection. Single world at a time -> a static selection. */
+void     worldgen_select_version(uint32_t gen_version);  /* set the active world's generator */
+uint32_t worldgen_active_version(void);                  /* the currently-selected version    */
+int      worldgen_version_supported(uint32_t gen_version); /* 1 iff this build retains it      */
+
 /* Fill chunk c's voxels[] for chunk coords (cx,cy,cz) from `seed`, the
  * deterministic gen(seed, coords) -> Chunk of Section 7/8. For each of the 256
  * columns: compute worldgen_height once, then fill the chunk's 16 rows by a

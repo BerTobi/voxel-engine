@@ -853,6 +853,70 @@ int persist_world_meta_read(const char *dir, char *name_out, int name_cap, uint6
     return 0;
 }
 
+/* Read one region file's gen_version, validating magic + format. 0 + *out on ok. */
+static int region_file_gen(const char *path, uint32_t *out)
+{
+    FILE *f = fopen(path, "rb");
+    RegionHeader h;
+    int ok = -1;
+    if (f == NULL)
+        return -1;
+    if (fread(&h, sizeof h, 1, f) == 1 && h.magic == REGION_MAGIC
+        && h.format_version == PERSIST_FORMAT_VERSION) {
+        if (out != NULL)
+            *out = h.gen_version;
+        ok = 0;
+    }
+    fclose(f);
+    return ok;
+}
+
+int persist_peek_gen_version(const char *dir, uint32_t *gen_out)
+{
+    if (dir == NULL)
+        return -1;
+#ifdef _WIN32
+    {
+        WIN32_FIND_DATA fd;
+        char pat[600];
+        HANDLE h;
+        int found = -1;
+        snprintf(pat, sizeof pat, "%s\\r.*.dat", dir);   /* region files only */
+        h = FindFirstFile(pat, &fd);
+        if (h != INVALID_HANDLE_VALUE) {
+            do {
+                char p[700];
+                snprintf(p, sizeof p, "%s/%s", dir, fd.cFileName);
+                if (region_file_gen(p, gen_out) == 0) { found = 0; break; }
+            } while (FindNextFile(h, &fd));
+            FindClose(h);
+        }
+        return found;
+    }
+#else
+    {
+        DIR *dp = opendir(dir);
+        struct dirent *de;
+        int found = -1;
+        if (dp == NULL)
+            return -1;
+        while (found != 0 && (de = readdir(dp)) != NULL) {
+            size_t L = strlen(de->d_name);
+            char p[700];
+            if (L < 7 || de->d_name[0] != 'r' || de->d_name[1] != '.')
+                continue;                              /* not "r.<x>.<z>.dat" */
+            if (strcmp(de->d_name + (L - 4), ".dat") != 0)
+                continue;
+            snprintf(p, sizeof p, "%s/%s", dir, de->d_name);
+            if (region_file_gen(p, gen_out) == 0)
+                found = 0;
+        }
+        closedir(dp);
+        return found;
+    }
+#endif
+}
+
 /* Insertion-sort the world list by display name (n is small). */
 static void world_sort(WorldInfo *w, int n)
 {

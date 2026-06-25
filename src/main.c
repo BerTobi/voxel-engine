@@ -1287,7 +1287,7 @@ int main(void)
      * on a bad save dir. */
     PersistStore *persist = NULL;
     char          save_dir_buf[512];
-    const char   *save_dir;
+    const char   *save_dir = NULL;   /* resolved per session (gen-pin peek + persist) */
 
     /* 0.3 multiplayer (optional). NULL = single-player (VOXEL_HOST/VOXEL_CONNECT
      * unset), and every net_* call below is then a no-op, so the single-player
@@ -1531,19 +1531,47 @@ int main(void)
         }
     }
 
+    /* Per-world GENERATOR PINNING (worldgen.h): pick this session's generator
+     * version BEFORE the net handshake (the host advertises THIS version, not the
+     * build's) and before any chunk is generated. An existing local save regenerates
+     * with the version it was created with - peeked from its region header - if this
+     * build still retains that generator; a new world / no save / unsupported-or-
+     * foreign save uses the latest (WG_GEN_VERSION). A pure JOIN client owns no local
+     * save and adopts the host's version through the handshake gate, so it is left at
+     * the default latest. This is what lets a world survive a future worldgen change. */
+    if (choice.mode != CHOICE_JOIN) {
+        uint32_t world_gen = (uint32_t)WG_GEN_VERSION;
+        if (choice.dir[0] != '\0'
+            && (choice.mode == CHOICE_SINGLE || choice.mode == CHOICE_HOST))
+            save_dir = choice.dir;
+        else
+            save_dir = resolve_save_dir(save_dir_buf, sizeof save_dir_buf, seed);
+        if (persist_peek_gen_version(save_dir, &world_gen) != 0
+            || !worldgen_version_supported(world_gen))
+            world_gen = (uint32_t)WG_GEN_VERSION;   /* no save / unsupported -> latest */
+        worldgen_select_version(world_gen);
+        if (world_gen != (uint32_t)WG_GEN_VERSION)
+            fprintf(stderr, "worldgen: world pinned to generator v%u (build latest v%u)\n",
+                    world_gen, (unsigned)WG_GEN_VERSION);
+    }
+
     /* 0.3 multiplayer: open the network BEFORE world_init + persist. A CLIENT
      * completes the handshake here and ADOPTS the host's seed, so it generates the
      * byte-identical deterministic planet (no map transfer). The source is the
      * connect-screen choice (Host/Join) or, on the headless/scripted path, the env
      * (net_init_from_env). A failed Join returns to the menu (continue). */
     if (choice.mode == CHOICE_ENV) {
-        net = net_init_from_env(seed, (uint32_t)VOXEL_VERSION_PACKED, (uint32_t)WG_GEN_VERSION);
+        /* advertise the WORLD's pinned generator version (set above), so a peer that
+         * would regenerate different terrain is refused at the handshake. */
+        net = net_init_from_env(seed, (uint32_t)VOXEL_VERSION_PACKED, worldgen_active_version());
     } else if (choice.mode == CHOICE_HOST) {
         net = net_host((unsigned short)NET_DEFAULT_PORT, seed,
-                       (uint32_t)VOXEL_VERSION_PACKED, (uint32_t)WG_GEN_VERSION);
-        if (net) fprintf(stderr, "net: hosting on port %d (seed %016llx)\n",
-                         NET_DEFAULT_PORT, (unsigned long long)seed);
+                       (uint32_t)VOXEL_VERSION_PACKED, worldgen_active_version());
+        if (net) fprintf(stderr, "net: hosting on port %d (seed %016llx, gen v%u)\n",
+                         NET_DEFAULT_PORT, (unsigned long long)seed, worldgen_active_version());
     } else if (choice.mode == CHOICE_JOIN) {
+        /* a client offers the build's latest; the host's advertised world-gen must
+         * match (an old-gen world can't be co-oped until re-created at the latest). */
         net = net_join_str(choice.ip, (uint32_t)VOXEL_VERSION_PACKED, (uint32_t)WG_GEN_VERSION);
         if (net == NULL) continue;                        /* connect failed -> back to menu */
     } else {
@@ -1588,14 +1616,10 @@ int main(void)
          * host's relayed edits live; we do not open a local save. */
         persist = NULL;
     } else {
-        /* 0.4: a menu-chosen world saves into ITS directory (saves/<slug>); the
-         * headless/scripted path keeps the seed-derived saves/<hex> dir. */
-        if (choice.dir[0] != '\0'
-            && (choice.mode == CHOICE_SINGLE || choice.mode == CHOICE_HOST))
-            save_dir = choice.dir;
-        else
-            save_dir = resolve_save_dir(save_dir_buf, sizeof(save_dir_buf), seed);
-        persist = persist_open(save_dir, seed, WG_GEN_VERSION);
+        /* save_dir was resolved above (with the gen-pin peek); open at the world's
+         * PINNED generator version so an existing world reloads as itself (regions
+         * stamped with that version match), and a new world is stamped at it. */
+        persist = persist_open(save_dir, seed, worldgen_active_version());
         if (persist == NULL)
             fprintf(stderr, "main: persist_open(%s) failed - edits will be "
                             "ephemeral this run\n", save_dir);

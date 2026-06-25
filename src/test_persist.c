@@ -634,51 +634,72 @@ static void test_nested_parent_mkdir(void)
     free(src); free(dst);
 }
 
-/* Case 10 (0.5 M6 compat gate) - a save from an OLDER generator version is
- * REFUSED on load, NOT silently mis-read as current data. This is the exact
- * "0.4 saves are refused, not migrated" guarantee: 0.4 stamped gen_version 2,
- * 0.5 expects WG_GEN_VERSION (3). region_read_meta refuses a gen mismatch
- * (persist.c:216) and the LOAD path treats a refused region as a MISS (the chunk
- * regenerates from the current seed/gen), so a 32 m-pebble 0.4 voxel can never
- * be re-interpreted as a 256 m-planet 0.5 voxel. We simulate the old save by
- * opening a store at gen_version-1 (== 2, the literal 0.4 value), then assert a
- * fresh store at the current gen sees the chunk as MISS. */
-#define TEST_STALEGEN_DIR "build/persist_test_stalegen"
+/* Case 10 (0.5 per-world GENERATOR PINNING) - a world is reloaded with the
+ * generator version it was CREATED with, recovered by persist_peek_gen_version, so
+ * a later default-version bump does not invalidate it. We write a save stamped at an
+ * OLD generator version (3), then assert:
+ *   (a) the version is PEEKABLE from the save without opening it,
+ *   (b) reopening PINNED at that version LOADS the chunk (pinning works), and
+ *   (c) reopening at the WRONG version MISSES (the persist-layer safety pinning
+ *       relies on: a region is never mis-read against a different generator).
+ * This is the loader's contract turned into a test; gen 3 is a real retained
+ * generator (smooth sphere), so a v3 world genuinely survives the v4 relief bump. */
+#define TEST_PINGEN_DIR "build/persist_test_pingen"
 
-static void test_stale_gen_refused(void)
+static void test_gen_version_pinning(void)
 {
     Chunk *src = malloc(sizeof(Chunk));
     Chunk *dst = malloc(sizeof(Chunk));
     char buf[192]; int ok = 1; buf[0] = '\0';
-    PersistStore *ps_old, *ps_new;
-    const uint32_t OLD_GEN = WG_GEN_VERSION - 1u;   /* == 2 == the 0.4 gen version */
+    PersistStore *ps;
+    const uint32_t OLD_GEN = 3u;          /* a SUPPORTED older generator version */
+    uint32_t peeked = 0;
 
-    if (src == NULL || dst == NULL) { report("stale-gen refused", 0, "OOM"); free(src); free(dst); return; }
-    remove(TEST_STALEGEN_DIR "/r.0.0.dat");          /* clean slate for re-runs */
+    if (src == NULL || dst == NULL) { report("gen-version pinning", 0, "OOM"); free(src); free(dst); return; }
+    remove(TEST_PINGEN_DIR "/r.0.0.dat");                 /* clean slate for re-runs */
 
-    /* (a) write a "0.4" save: a real modified chunk stamped at the OLD gen version. */
-    ps_old = persist_open(TEST_STALEGEN_DIR, TEST_SEED, OLD_GEN);
-    if (ps_old == NULL) { report("stale-gen refused", 0, "persist_open(old gen) failed"); free(src); free(dst); return; }
+    /* Write a world stamped at the old generator version. */
+    ps = persist_open(TEST_PINGEN_DIR, TEST_SEED, OLD_GEN);
+    if (ps == NULL) { report("gen-version pinning", 0, "persist_open(old gen) failed"); free(src); free(dst); return; }
     build_mixed_chunk(src, 2, 3, 5);
-    if (persist_save_chunk(ps_old, src) != 0) { ok = 0; snprintf(buf, sizeof buf, "save under old gen failed"); }
-    if (ok && persist_flush(ps_old) != 0)     { ok = 0; snprintf(buf, sizeof buf, "flush under old gen failed"); }
-    persist_close(ps_old);
+    if (persist_save_chunk(ps, src) != 0) { ok = 0; snprintf(buf, sizeof buf, "save under old gen failed"); }
+    if (ok && persist_flush(ps) != 0)     { ok = 0; snprintf(buf, sizeof buf, "flush failed"); }
+    persist_close(ps);
 
-    /* (b) a current-gen (0.5) store MUST refuse it -> load MISS, not a mis-read. */
-    if (ok) {
-        ps_new = persist_open(TEST_STALEGEN_DIR, TEST_SEED, WG_GEN_VERSION);
-        if (ps_new == NULL) { ok = 0; snprintf(buf, sizeof buf, "persist_open(current gen) failed"); }
-        else {
-            memset(dst, 0xAB, sizeof *dst); chunk_back(dst, 1);
-            if (persist_load_chunk(ps_new, dst, 2, 3, 5) != 0) {
-                ok = 0; snprintf(buf, sizeof buf, "stale-gen chunk LOADED (mis-read!) - expected MISS (refused)");
-            }
-            persist_close(ps_new);
-        }
+    /* (a) the loader can PEEK the saved generator version without opening the store. */
+    if (ok && (persist_peek_gen_version(TEST_PINGEN_DIR, &peeked) != 0 || peeked != OLD_GEN)) {
+        ok = 0; snprintf(buf, sizeof buf, "peek recovered gen %u, expected %u", peeked, OLD_GEN);
     }
-    report("stale-gen (0.4) save is REFUSED on load, not migrated", ok, buf);
-    remove(TEST_STALEGEN_DIR "/r.0.0.dat");
-    remove(TEST_STALEGEN_DIR);
+    report("saved generator version is peekable from the save", ok, buf);
+
+    /* (b) reopening PINNED at the saved version LOADS the chunk (the pinning win). */
+    ok = 1; buf[0] = '\0';
+    ps = persist_open(TEST_PINGEN_DIR, TEST_SEED, OLD_GEN);
+    if (ps == NULL) { ok = 0; snprintf(buf, sizeof buf, "reopen(pinned old gen) failed"); }
+    else {
+        memset(dst, 0xAB, sizeof *dst); chunk_back(dst, 1);
+        if (persist_load_chunk(ps, dst, 2, 3, 5) != 1) { ok = 0; snprintf(buf, sizeof buf, "pinned reopen MISS (lost world)"); }
+        else if (!chunks_equal_canon(src, dst, buf, sizeof buf)) ok = 0;
+        persist_close(ps);
+    }
+    report("a world reopened at its OWN (old) generator version LOADS (pinned)", ok, buf);
+
+    /* (c) reopening at the WRONG version MISSES - the layer never mis-reads a region
+     * against a different generator (pinning depends on opening with the right one). */
+    ok = 1; buf[0] = '\0';
+    ps = persist_open(TEST_PINGEN_DIR, TEST_SEED, WG_GEN_VERSION);   /* != OLD_GEN */
+    if (ps == NULL) { ok = 0; snprintf(buf, sizeof buf, "reopen(wrong gen) failed"); }
+    else {
+        memset(dst, 0xAB, sizeof *dst); chunk_back(dst, 1);
+        if (persist_load_chunk(ps, dst, 2, 3, 5) != 0) {
+            ok = 0; snprintf(buf, sizeof buf, "wrong-gen reopen LOADED (mis-read!) - expected MISS");
+        }
+        persist_close(ps);
+    }
+    report("reopening at the WRONG generator version MISSES (no mis-read)", ok, buf);
+
+    remove(TEST_PINGEN_DIR "/r.0.0.dat");
+    remove(TEST_PINGEN_DIR);
     free(src); free(dst);
 }
 
@@ -717,7 +738,7 @@ int main(void)
 
     test_restart_durability();
     test_nested_parent_mkdir();
-    test_stale_gen_refused();   /* 0.5 M6: the "0.4 saves refused, not migrated" gate */
+    test_gen_version_pinning();   /* 0.5: per-world generator pinning (peek + pin-load + safety) */
 
     printf("=== %d failure(s) ===\n", g_failures);
     return g_failures;

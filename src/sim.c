@@ -884,6 +884,20 @@ int sim_liquid_unsettled(const SimState *s, uint16_t li)
         if (vox_mat(vox[vox_index(dx, dy, dz)]) == MAT_AIR)
             return 1;
     }
+    /* 0.5 M4: with cross-chunk flow enabled, a water voxel on the DOWN-FACE boundary
+     * may fall into the chunk below - keep it awake so it keeps offering the
+     * cross-move each tick until it crosses. It can't see the neighbour from here, so
+     * this is conservative (a boundary voxel over a SOLID neighbour also stays awake -
+     * a bounded cost paid only at a chunk's down-face floor, rare since water pools on
+     * the in-chunk crust). NULL fluid_xfn (single-chunk / tests) skips this => M3. */
+    if (s->fluid_xfn != NULL) {
+        int dnx = lx + SIM_NEIGH[down][0];
+        int dny = ly + SIM_NEIGH[down][1];
+        int dnz = lz + SIM_NEIGH[down][2];
+        if (dnx < 0 || dnx >= CHUNK_DIM || dny < 0 || dny >= CHUNK_DIM ||
+            dnz < 0 || dnz >= CHUNK_DIM)
+            return 1;                       /* on the down-face boundary: may cross */
+    }
     return 0;
 }
 
@@ -977,11 +991,25 @@ static int fluid_step(SimState *s, int li, int is_source, int is_spring)
     if (is_source && !is_spring)
         return 0;                       /* lava / plain held source: conserve in place */
 
-    /* (a) GRAVITY: fall along the radial-down face into air. */
-    if (fluid_neigh(lx, ly, lz, down, &dn) &&
-        vox_mat(vox[dn]) == MAT_AIR && !moved_test(s, dn)) {
-        fluid_move_water(s, li, dn, mat, is_spring);
-        return 1;
+    /* (a) GRAVITY: fall along the radial-down face. */
+    if (fluid_neigh(lx, ly, lz, down, &dn)) {           /* down is IN-CHUNK */
+        if (vox_mat(vox[dn]) == MAT_AIR && !moved_test(s, dn)) {
+            fluid_move_water(s, li, dn, mat, is_spring);
+            return 1;
+        }
+        /* in-chunk down blocked -> fall through to lateral */
+    } else if (s->fluid_xfn != NULL && !is_spring) {    /* 0.5 M4: down is OUT-OF-CHUNK */
+        /* Ask the WorldCA whether the chunk below has air at this column: if so it
+         * enqueues a deferred ATOMIC cross-move (applied after all chunks commit -
+         * materialise the neighbour cell + revert this one, conserving) and we stop
+         * (gravity beats lateral). If not viable, fall through to in-chunk lateral.
+         * A spring never crosses a seam (it would lose its held cell). Pass the
+         * wrapped neighbour-local coords (the out-of-chunk axis folds to 0 or 15). */
+        int nlx = (lx + SIM_NEIGH[down][0] + CHUNK_DIM) & (CHUNK_DIM - 1);
+        int nly = (ly + SIM_NEIGH[down][1] + CHUNK_DIM) & (CHUNK_DIM - 1);
+        int nlz = (lz + SIM_NEIGH[down][2] + CHUNK_DIM) & (CHUNK_DIM - 1);
+        if (s->fluid_xfn(s->fluid_xfn_user, s, li, down, nlx, nly, nlz))
+            return 0;                                    /* cross-fall enqueued */
     }
 
     /* (b) FLOW-TO-DESCENT: into an air lateral neighbour that can itself fall.
@@ -1288,6 +1316,8 @@ int sim_init(SimState *s, Chunk *c)
     s->fluid_n_fired   = 0;
     s->fluid_down       = 3;   /* 0.5 M3: -Y default (flat gravity for tests/proto) */
     s->fluid_finisher_on = 0;  /* 0.5 M3: terraced binary flow; M4 enables the snap */
+    s->fluid_xfn        = NULL; /* 0.5 M4: no cross-chunk flow until the WorldCA sets it */
+    s->fluid_xfn_user   = NULL;
 
     /* Seed the authoritative full-resolution temperature heat[] from every
      * voxel's stored 8-bit code (ARCHITECTURE 3.4 mitigation). heat[] is kept

@@ -616,12 +616,21 @@ static SimState *worldca_wake_chunk(SimState *forge, Chunk *c, ProgressSink *sin
 
 /* Per-world-tick context for the cross-chunk callbacks (passed as `user`). */
 #define WORLDCA_WAKE_MAX 256u
+#define WORLDCA_DEP_MAX  512u    /* 0.5 M4: cross-chunk water deposits queued per tick */
 typedef struct {
     WorldStore *world;
     SimState   *forge;
     Chunk      *wake_chunk[WORLDCA_WAKE_MAX];
     uint16_t    wake_li[WORLDCA_WAKE_MAX];
     int         n_wake;
+    /* 0.5 M4: deferred cross-chunk water moves (gravity across a chunk seam),
+     * enqueued by worldca_xfn during COMMIT, applied ATOMICALLY after all chunks
+     * commit (materialise the neighbour cell + revert the source = conserved). */
+    Chunk      *dep_src[WORLDCA_DEP_MAX];   /* source chunk                        */
+    uint16_t    dep_srcli[WORLDCA_DEP_MAX]; /* source local index                  */
+    uint8_t     dep_face[WORLDCA_DEP_MAX];  /* SIM_NEIGH face to the neighbour     */
+    uint16_t    dep_nli[WORLDCA_DEP_MAX];   /* neighbour-chunk local index (target) */
+    int         n_dep;
 } WorldCATickCtx;
 
 /* SimNeighFn: a cross-chunk neighbour's START-OF-TICK heat + material. An active
@@ -659,6 +668,32 @@ static void worldca_wfn(void *user, const SimState *s, int face,
     cx->wake_chunk[cx->n_wake] = nc;
     cx->wake_li[cx->n_wake]    = (uint16_t)vox_index(nlx, nly, nlz);
     ++cx->n_wake;
+}
+
+/* SimXFlowFn (0.5 M4): a boundary water voxel at src_li wants to fall across `face`
+ * into the chunk below, whose boundary cell is local (nlx,nly,nlz). Viable iff that
+ * neighbour cell is AIR; if so, enqueue a deferred ATOMIC cross-move (applied after
+ * all chunks commit - see the deposit loop) and return 1 so fluid_step takes the
+ * fall over a lateral. Returns 0 (and fluid_step falls back to lateral) when there
+ * is no neighbour, the cell is occupied, or the queue is full (retry next tick). */
+static int worldca_xfn(void *user, const SimState *s, int src_li, int face,
+                       int nlx, int nly, int nlz)
+{
+    WorldCATickCtx *cx = (WorldCATickCtx *)user;
+    Chunk *nc = s->chunk->neigh[face];
+    int n_li;
+    if (nc == NULL) return 0;                       /* window edge: closed wall    */
+    n_li = vox_index(nlx, nly, nlz);
+    if (vox_mat(chunk_vox(nc, n_li)) != MAT_AIR)    /* neighbour cell not air       */
+        return 0;
+    if ((unsigned)cx->n_dep >= WORLDCA_DEP_MAX)     /* queue full: retry next tick  */
+        return 0;
+    cx->dep_src[cx->n_dep]   = s->chunk;            /* (mutable chunk via the ptr)  */
+    cx->dep_srcli[cx->n_dep] = (uint16_t)src_li;
+    cx->dep_face[cx->n_dep]  = (uint8_t)face;
+    cx->dep_nli[cx->n_dep]   = (uint16_t)n_li;
+    ++cx->n_dep;
+    return 1;
 }
 
 /* Apply a player edit at world voxel (wx,wy,wz); if that voxel lives in the
@@ -2244,7 +2279,12 @@ int main(void)
                 }
                 sim_accum_ms -= SIM_TICK_MS;
                 wctx.n_wake = 0;
-                for (i = 0; i < na; ++i) act[i]->tick_index = g_world_tick;
+                wctx.n_dep  = 0;
+                for (i = 0; i < na; ++i) {
+                    act[i]->tick_index     = g_world_tick;
+                    act[i]->fluid_xfn      = worldca_xfn;   /* 0.5 M4: cross-chunk water */
+                    act[i]->fluid_xfn_user = &wctx;
+                }
                 for (i = 0; i < na; ++i)
                     sim_tick_ex(act[i], SIM_PHASE_READ, worldca_nfn, worldca_wfn, &wctx);
                 for (i = 0; i < na; ++i)
@@ -2265,6 +2305,36 @@ int main(void)
                         if (ns != NULL)
                             sim_notify_edit(ns, (int)wctx.wake_li[i]);
                     }
+                }
+                /* 0.5 M4: apply the deferred cross-chunk water moves ATOMICALLY, in
+                 * enqueue order (deterministic). If the source still holds water and
+                 * the neighbour cell is still air, materialise water in the neighbour
+                 * + revert the source (conserved), then wake both chunks' sims. A
+                 * no-longer-air target (another deposit won, or the neighbour's own
+                 * fluid filled it) is skipped and the source re-woken to retry. */
+                for (i = 0; i < wctx.n_dep; ++i) {
+                    Chunk    *src = wctx.dep_src[i];
+                    int       sli = (int)wctx.dep_srcli[i];
+                    int       nli = (int)wctx.dep_nli[i];
+                    Chunk    *nc;
+                    SimState *ssim, *nsim;
+                    if (world_get(world, src->cx, src->cy, src->cz) != src) continue;
+                    if (vox_mat(chunk_vox(src, sli)) != MAT_WATER) continue;  /* already moved */
+                    nc = src->neigh[wctx.dep_face[i]];
+                    if (nc == NULL || world_get(world, nc->cx, nc->cy, nc->cz) != nc) continue;
+                    if (world_realize(world, nc) != 0) continue;             /* realize neighbour */
+                    ssim = worldca_find(sim, src);
+                    if (vox_mat(nc->voxels[nli]) != MAT_AIR) {               /* target taken */
+                        if (ssim) sim_notify_edit(ssim, sli);                /* retry next tick */
+                        continue;
+                    }
+                    nc->voxels[nli]  = make_liquid(vox_mat(src->voxels[sli]));
+                    src->voxels[sli] = make_voxel(MAT_AIR);
+                    src->flags |= CHUNK_DIRTY_MESH | CHUNK_MODIFIED | CHUNK_MODIFIED_BY_SIM;
+                    nc->flags  |= CHUNK_DIRTY_MESH | CHUNK_MODIFIED | CHUNK_MODIFIED_BY_SIM;
+                    nsim = worldca_wake_chunk(sim, nc, prog_ring);
+                    if (nsim) sim_notify_edit(nsim, nli);
+                    if (ssim) sim_notify_edit(ssim, sli);
                 }
             }
             if (ticks == SIM_MAX_TICKS_PER_FRAME && sim_accum_ms > SIM_TICK_MS)

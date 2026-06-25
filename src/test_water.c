@@ -124,6 +124,52 @@ static void test_bounded_settle(void)
     sim_shutdown(&s); free(c.voxels);
 }
 
+/* ---- (4b) CROSS-CHUNK gravity (M4): water falls across a chunk seam + conserves.
+ * Mirrors the engine: a SimXFlowFn reads the down-neighbour chunk + enqueues; the
+ * test applies the deferred move atomically (materialise neighbour + revert source),
+ * exactly as main.c's WorldCA does. Two chunks A (top) over B (bottom), linked. ---- */
+typedef struct { int pending, src_li, face, n_li; } SeamCtx;
+static int seam_xfn(void *user, const SimState *s, int src_li, int face, int nlx, int nly, int nlz)
+{
+    SeamCtx *cx = (SeamCtx *)user;
+    Chunk *nc = s->chunk->neigh[face];
+    if (nc == NULL) return 0;
+    if (vox_mat(chunk_vox(nc, vox_index(nlx, nly, nlz))) != MAT_AIR) return 0;
+    cx->pending = 1; cx->src_li = src_li; cx->face = face;
+    cx->n_li = vox_index(nlx, nly, nlz);
+    return 1;
+}
+static void test_cross_chunk_seam(void)
+{
+    static Chunk a, b; SimState sa, sb; SeamCtx ctx; long before; int crossed;
+    back(&a); back(&b);
+    a.neigh[3] = &b;   /* A's -Y (face 3, down) neighbour is B */
+    b.neigh[2] = &a;   /* B's +Y (face 2) neighbour is A       */
+    put(&a, 8, 0, 8, mk(MAT_WATER, 15));   /* one water voxel on A's bottom boundary */
+    sim_build_conduct_lut();
+    sim_init(&sa, &a); sim_init(&sb, &b);          /* both default down = -Y (face 3) */
+    sa.fluid_xfn = seam_xfn; sa.fluid_xfn_user = &ctx;   /* enable cross-flow on A */
+    sim_notify_edit(&sa, vox_index(8, 0, 8));   /* wake the boundary voxel (sim_init NULLed xfn,
+                                                 * so it wasn't seeded active; the engine wakes
+                                                 * such water as it flows in) */
+    before = water_count(&a) + water_count(&b);
+    ctx.pending = 0;
+    sim_tick(&sa);                                  /* A's fluid pass enqueues the cross-move */
+    crossed = 0;
+    if (ctx.pending && vox_mat(b.voxels[ctx.n_li]) == MAT_AIR &&
+        vox_mat(a.voxels[ctx.src_li]) == MAT_WATER) {
+        b.voxels[ctx.n_li]  = mk(MAT_WATER, 15);    /* atomic move: materialise in B ... */
+        a.voxels[ctx.src_li] = mk(MAT_AIR, 0);      /* ... revert A (conserves) */
+        crossed = 1;
+    }
+    CHECK(crossed, "boundary water enqueues + crosses a chunk seam (gravity, down-face)");
+    CHECK(vox_mat(b.voxels[vox_index(8, 15, 8)]) == MAT_WATER,
+          "water landed in the neighbour chunk's top boundary cell");
+    CHECK(vox_mat(a.voxels[vox_index(8, 0, 8)]) == MAT_AIR, "source cell vacated");
+    CHECK(water_count(&a) + water_count(&b) == before, "cross-chunk move CONSERVES water");
+    sim_shutdown(&sa); sim_shutdown(&sb); free(a.voxels); free(b.voxels);
+}
+
 /* ---- (5) water + heat coexist (lava stays hot while water flows) ---- */
 static void test_heat_water_coexist(void)
 {
@@ -167,6 +213,7 @@ int main(void)
     test_radial_any_face();
     test_spring();
     test_bounded_settle();
+    test_cross_chunk_seam();
     test_heat_water_coexist();
     test_determinism();
     printf("=== %d failure(s) ===\n", fails);

@@ -61,6 +61,17 @@ behind the `make check` gate; see `PLAN-0.5.md`.
   it). New `test_water` (settle/conserve, radial-from-all-6-faces, spring, bounded dam-break,
   heat+water coexistence, determinism); the old partial-fill `test_sim` fluid cases are adapted
   to the binary invariants. Both targets clean; ASan-clean over a forge+water fly session.
+- _(M4)_ **Water crosses chunk seams** — a river can now flow down across chunk boundaries,
+  not stop at them. A boundary water voxel whose radial-down neighbour is out-of-chunk asks the
+  WorldCA (`SimXFlowFn` on the SimState) whether the chunk below has air there; if so the move is
+  enqueued and applied **atomically after all chunks commit** (materialise the neighbour cell +
+  revert the source = conserved), realizing a uniform-air neighbour first. Deterministic
+  (enqueue order, first-wins on corner conflicts), crash-safe (residency-checked), single-chunk
+  sims keep closed walls (`fluid_xfn == NULL`). New `test_water` cross-chunk seam case (enqueue →
+  cross → conserve). _The radial shell-snap finisher (flat lake surfaces) is **deferred to 0.6**:
+  binary fine voxels settle natively and the river-focused foundation doesn't need it — see the
+  design note. `world_pin` (keeping an active water chunk from eviction mid-flow) is also a 0.6
+  follow-up; the deposit apply is already crash-safe without it._
 
 ## 0.4.0 — 2026-06-24 — The World Comes Alive
 

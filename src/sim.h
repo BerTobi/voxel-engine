@@ -446,7 +446,12 @@ typedef struct {
  * sim_init(), reused across ticks, freed by sim_shutdown(). The conductance LUT
  * is process-global (built once, const after build) so it is shared and not
  * carried per SimState. */
-typedef struct {
+/* 0.5 M4 cross-chunk water deposit callback (see SimState.fluid_xfn). Forward-
+ * declared with the struct tag so the field below can name the typedef. */
+struct SimState;
+typedef int  (*SimXFlowFn)(void *user, const struct SimState *s, int src_li,
+                           int face, int nlx, int nly, int nlz);
+typedef struct SimState {
     Chunk      *chunk;                  /* the single simulated chunk            */
     ChunkActive act;                    /* its active front                      */
     HeatWrite   writes[SIM_ACTIVE_CAP]; /* per-tick double-buffer (active set)   */
@@ -538,6 +543,12 @@ typedef struct {
      * terraced); M4 replaces the finisher with a radial shell-snap and turns it on. */
     int8_t      fluid_down;             /* radial-down SIM_NEIGH face (default 3 = -Y) */
     uint8_t     fluid_finisher_on;      /* 0 in M3 (terraced); M4 enables the snap    */
+    /* 0.5 M4: cross-chunk water flow. NULL on a single-chunk sim (closed wall, M3);
+     * the WorldCA sets these each tick so a river can fall down across chunk seams.
+     * Transient (a per-tick callback into the WorldCA's tick context) - NOT persisted
+     * state and carries nothing the determinism/replay contract depends on. */
+    SimXFlowFn  fluid_xfn;
+    void       *fluid_xfn_user;
     /* ---- OPTIONAL progression event sink (ARCHITECTURE Section 9, READ-ONLY) -*
      * A single BORROWED pointer to a ProgressSink (a ProgressRing) the sim only
      * ever PUSHES to, on emergent transitions it ALREADY computes (a melt/freeze
@@ -687,6 +698,8 @@ typedef int  (*SimNeighFn)(void *user, const SimState *s, int face,
                            int32_t *out_heat, uint8_t *out_mat);
 typedef void (*SimWakeFn)(void *user, const SimState *s, int face,
                           int nlx, int nly, int nlz);
+/* SimXFlowFn (0.5 M4 cross-chunk water deposit) is declared above, before the
+ * SimState struct, since a SimState field holds one. */
 #define SIM_PHASE_READ    1
 #define SIM_PHASE_COMMIT  2
 void sim_tick_ex(SimState *s, int phases, SimNeighFn nfn, SimWakeFn wfn, void *user);

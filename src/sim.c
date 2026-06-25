@@ -1356,32 +1356,28 @@ int sim_init(SimState *s, Chunk *c)
      * is a Dirichlet boundary that drives the sim (sim.h section 5). Stamp BOTH
      * the 8-bit code and the authoritative heat[] to the hold, and wake it so it
      * diffuses into its neighbours from tick 0. Holding is governed by the
-     * MAT_EMISSIVE flag (see is_held_source), so a lava POOL larger than the
-     * SIM_MAX_SOURCES explicit-source table is still held in full - the whole
-     * pool stays hot, not just the first SIM_MAX_SOURCES voxels (without this a
-     * copper slab resting on a large pool sits on cold, unheld lava and never
-     * warms). We still register into the explicit table while it has room, for
-     * symmetry with tests and so held_code_of can carry a per-source hold; the
-     * overflow past the table is harmless now that the flag drives holding. */
+     * MAT_EMISSIVE flag (see is_held_source / held_code_of), so a lava POOL of ANY
+     * size is held in full - the whole pool stays hot, not just the first
+     * SIM_MAX_SOURCES voxels (without this a copper slab resting on a large pool
+     * sits on cold, unheld lava and never warms).
+     *
+     * We deliberately do NOT register emissive lava into the explicit source table:
+     * the flag already drives holding, so slotting lava was pure redundancy that
+     * consumed all SIM_MAX_SOURCES slots on a forge pool and STARVED real held
+     * sources/springs (a demo water spring placed in the forge chunk could not
+     * register -> sim_set_spring returned "table full" -> it never flowed). The
+     * table is now reserved for explicit sim_set_source / sim_set_spring registrations
+     * (springs, player-placed sources); emissive lava costs zero slots. */
     {
         uint8_t lava_hold = g_lava_hold_code;   /* cached in the LUT build above */
-        int slot = 0;
         for (li = 0; li < CHUNK_VOXELS; ++li) {
             Voxel *v = &c->voxels[li];
             if (!(material_get(vox_mat(*v))->flags & MAT_EMISSIVE))
                 continue;
             vox_set_temp_code(v, lava_hold);
             s->heat[li] = temp_to_heat(lava_hold);
-            if (slot < SIM_MAX_SOURCES) {
-                s->sources[slot].li        = (uint16_t)li;
-                s->sources[slot].hold_code = lava_hold;
-                s->sources[slot].active    = 1;
-                ++slot;
-            }
-            active_enqueue(s, li);
+            active_enqueue(s, li);              /* held by flag; needs no table slot */
         }
-        if (slot > (int)s->n_sources)
-            s->n_sources = (uint16_t)slot;
     }
 
     /* Seed the active front: wake every voxel that differs from an in-chunk

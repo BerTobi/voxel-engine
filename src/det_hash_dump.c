@@ -26,6 +26,7 @@
 #include "material.h"
 #include "chunk.h"
 #include "sim.h"
+#include "worldgen.h"
 
 /* Print a 64-bit hash as 16 hex digits using only 32-bit halves, so the format is
  * identical on LP64 (Linux) and the ILP32 Windows target (no %llx / %I64x split). */
@@ -97,10 +98,31 @@ static uint64_t combined_hash(void)
     { uint64_t h = sim_state_hash(&s); sim_shutdown(&s); free(c.voxels); return h; }
 }
 
+/* WORLDGEN: an equatorial SURFACE chunk (relief fully active, far from the flattened
+ * pole), FNV'd byte-by-byte (little-endian on both x86 targets). Exercises the relief
+ * path's integer isqrt + divide + 3D value noise - they must hash identically. */
+static uint64_t worldgen_hash(void)
+{
+    static Chunk c;
+    uint64_t h = 14695981039346656037ull;
+    int i;
+    c.voxels = (Voxel *)calloc(CHUNK_VOXELS, sizeof(Voxel));
+    c.slab_idx = -1;
+    worldgen_fill_chunk(&c, 32, 32, 0, 0);
+    for (i = 0; i < CHUNK_VOXELS; ++i) {
+        uint32_t v = (uint32_t)c.voxels[i];
+        int b;
+        for (b = 0; b < 4; ++b) { h ^= (uint64_t)((v >> (8 * b)) & 0xffu); h *= 1099511628211ull; }
+    }
+    free(c.voxels);
+    return h;
+}
+
 int main(void)
 {
     emit("HEAT",     heat_hash());
     emit("WATER",    water_hash());
     emit("COMBINED", combined_hash());
+    emit("WORLDGEN", worldgen_hash());
     return 0;
 }

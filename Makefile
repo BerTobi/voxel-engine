@@ -109,7 +109,7 @@ WIN_LDFLAGS := -static -static-libgcc -Wl,--gc-sections -mwindows
 WIN_LIBS    := -lopengl32 -lgdi32 -luser32 -lws2_32
 
 # ---- Targets -----------------------------------------------------------------
-.PHONY: all linux win test testsim testworld testpersist testprogress testraycast testedit testplayer testnet testchunksync testwaternet testdeterminism testgrain testwater testsparse detcross detwine check version archive clean
+.PHONY: all linux win test testsim testworld testpersist testprogress testraycast testedit testplayer testnet testchunksync testwaternet testdeterminism testgrain testwater testsparse testworldgen detcross detwine check version archive clean
 
 # Default target: native dev build.
 all: linux
@@ -273,6 +273,15 @@ testsparse: | $(BUILD)
 		$(SRC)/world.c $(SRC)/persist.c $(SRC)/test_sparse.c -lm
 	$(BUILD)/sparse_test
 
+# 0.5: radial terrain relief (worldgen.c). Asserts the relief is bounded, deterministic,
+# pole-flattened, non-trivial (hills + basins) and continuous, and that the generated
+# planet is sane (solid core, air exterior, solid pole/forge crust). No GL, no sockets.
+# apt: build-essential
+testworldgen: | $(BUILD)
+	$(CC) $(CFLAGS) -o $(BUILD)/worldgen_test \
+		$(SRC)/material.c $(SRC)/chunk.c $(SRC)/worldgen.c $(SRC)/test_worldgen.c -lm
+	$(BUILD)/worldgen_test
+
 # 0.5 M6: CROSS-PLATFORM determinism gates (release-time, NOT in `check` since they
 # need extra toolchains). det_hash_dump.c runs fixed heat/water/combined CA scenarios
 # and prints sim_state_hash() as stable hex; the integer-only CA must hash identically
@@ -282,7 +291,7 @@ testsparse: | $(BUILD)
 #              apt: gcc-multilib
 #   detwine  - native vs the ACTUAL shipped i686-w64-mingw32 PE run under wine. Higher
 #              fidelity (real compiler + Windows CRT). apt: gcc-mingw-w64-i686 wine wine32:i386
-DET_SRC    := $(SRC)/material.c $(SRC)/chunk.c $(SRC)/sim.c $(SRC)/progress.c $(SRC)/det_hash_dump.c
+DET_SRC    := $(SRC)/material.c $(SRC)/chunk.c $(SRC)/sim.c $(SRC)/progress.c $(SRC)/worldgen.c $(SRC)/det_hash_dump.c
 DET_CFLAGS := -std=c99 -Wall -Wextra -Isrc -DVOXEL_DETERMINISM_HARNESS
 detcross: | $(BUILD)
 	$(CC)      $(DET_CFLAGS) -o $(BUILD)/det_dump   $(DET_SRC) -lm
@@ -306,7 +315,7 @@ detwine: | $(BUILD)
 # aborts on the first suite whose binary exits non-zero (each test's exit code is
 # its failure count). This is the mechanically-enforced "full suite green" floor
 # every 0.4 milestone leans on - replaces the honour-system "run them all".
-check: test testsim testworld testpersist testprogress testraycast testedit testplayer testnet testchunksync testwaternet testdeterminism testgrain testwater testsparse
+check: test testsim testworld testpersist testprogress testraycast testedit testplayer testnet testchunksync testwaternet testdeterminism testgrain testwater testsparse testworldgen
 	@echo "=== make check: ALL SUITES PASSED ==="
 
 # Create the build directory on demand (order-only prerequisite).

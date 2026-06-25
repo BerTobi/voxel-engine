@@ -14,10 +14,11 @@ planet finally grown to a real size at a finer **0.5 m voxel grain**. The planet
 (evaporation / cloud / snow / ice / melt) is **deferred to 0.6**. Built milestone by milestone
 behind the `make check` gate; see `PLAN-0.5.md`.
 
-> Compatibility (planned): a **hard break** at the grain flip — `WG_GEN_VERSION` 2→3,
+> Compatibility (planned): a **hard break** at the grain flip — `WG_GEN_VERSION` 2→**4**,
 > `PERSIST_FORMAT_VERSION` 1→2, `NET_PROTOCOL_VERSION` 3→4. 0.4 saves are **refused, not
 > migrated** (a 32 m pebble of 1 m voxels cannot meaningfully become a 256 m planet of 0.5 m
-> voxels).
+> voxels). `WG_GEN_VERSION` reached 4 because the terrain gained radial relief late in 0.5-dev;
+> any earlier 0.5-dev save is likewise refused.
 
 ### Added
 - _(M0)_ `src/units.h` — the **metres↔voxels split** (`VOX_GRAIN_MM`, `M2V`/`V2M`), the
@@ -106,6 +107,23 @@ behind the `make check` gate; see `PLAN-0.5.md`.
   1–2 voxels, leaving the **entire voxel array (including water `fill`) effectively unhashed** in
   every determinism test (they passed only because `heat[]` carried the signal). Fixed to hash the
   full `CHUNK_VOXELS`-word array (or the uniform word for a slab-less air chunk).
+
+### Added (continued)
+- **The planet has terrain — hills, ridges and basins** _(`WG_GEN_VERSION` 3→4)_. The smooth
+  dry sphere now displaces its surface radius per direction by a deterministic **integer 3D
+  value-noise** field, so water placed on it finds a downhill path and pools in hollows instead
+  of sitting on a featureless ball. The displacement is sampled on the **surface point** (the
+  unit direction × R, found with an integer `isqrt`) so it's a clean per-direction height
+  (hills, not 3D caves), evaluated only in the thin transition shell near the surface (the deep
+  core and far space short-circuit, so the noise is paid only where it matters). It is **flattened
+  to zero near the spawn pole** so the forge, the spawn, and the pole chimney stay on predictable
+  solid crust. Pure integer end to end — the new `det_hash_dump` **WORLDGEN** fingerprint hashes
+  byte-identically across Linux-64, Linux-32 and the Windows build under wine. `worldgen_chunk_
+  all_air` is now conservative against a relief peak (`R+AMP`) so sparse-air never drops a ridge.
+  New `test_worldgen` asserts the relief is bounded, deterministic, pole-flat, non-trivial, and
+  continuous; amplitude/period are tunable `#define`s in `worldgen.h` (currently ±10 m over
+  ~32 m features). _The natural water **cycle** that fills these basins (snow/melt → rivers →
+  sea) is still 0.6; for now water comes from a placed source and flows over the new terrain._
 
 ### Fixed
 A pre-ship adversarial bug hunt across the whole 0.5 delta (8 lenses, every finding

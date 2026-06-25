@@ -51,7 +51,7 @@
 /* Bump on ANY change to generated output (Section 8 versioning). A save written
  * by an older version is "from an older generator" and must not silently
  * regenerate differently (the doc's default: refuse to load on mismatch). */
-#define WG_GEN_VERSION   3u   /* 3: 0.5 fine grain - R=512 (256 m) planet (was 2: R=64) */
+#define WG_GEN_VERSION   4u   /* 4: 0.5 radial terrain relief (hills/basins); 3 was smooth R=512 */
 
 /* ---- Surface band (binding; the WorldStore vertical band brackets this) ---- *
  * The heightmap surface lives entirely within [WG_HEIGHT_MIN, WG_HEIGHT_MAX]
@@ -95,6 +95,23 @@
 #define WG_PLANET_CZ     8     /* planet center, world voxels (Z)                */
 #define WG_PLANET_R      512   /* planet radius, voxels (x0.5 m = 256 m physical) */
 
+/* ---- Radial terrain RELIEF (0.5: hills, ridges, basins for water) ----------- *
+ * The smooth sphere surface is displaced in/out by a deterministic INTEGER 3D
+ * value-noise field sampled PER DIRECTION (the surface point = the unit direction
+ * x R, found with an integer isqrt - so the displacement is a clean per-direction
+ * height, giving hills + basins rather than 3D caves). Pure integer end to end, so
+ * the planet stays byte-identical across the Linux/Windows targets like the rest of
+ * worldgen. Amplitude is bounded by WG_RELIEF_AMP (fits well inside the resident
+ * vertical band). The relief is FLATTENED to zero within sqrt(WG_POLE_FLAT_R2) of
+ * the Y axis so the +Y spawn pole, the forge, and the pole chimney sit on flat,
+ * predictable solid crust. Terrain is seed-INDEPENDENT (one fixed asteroid), so the
+ * noise uses a fixed internal seed. */
+#define WG_RELIEF_AMP        20    /* max in/out surface displacement, voxels (x0.5m = 10 m) */
+#define WG_RELIEF_PERIOD_LOG2 6u   /* base feature lattice = 2^6 = 64 vox (32 m)             */
+#define WG_RELIEF_OCTAVES    2u    /* period/amplitude-halving octaves (64 + 32 vox)         */
+#define WG_RELIEF_SEED       0x5C0FFEE5u /* fixed: one asteroid, terrain seed-independent     */
+#define WG_POLE_FLAT_R2      2304   /* flatten relief within sqrt(2304)=48 vox (24 m) of the Y axis */
+
 /* ---- Value-noise lattice (binding; cheap integer hills) -------------------- *
  * Heights are sampled on a coarse square lattice of period WG_NOISE_PERIOD
  * world-voxels (a power of two so the in-cell interpolation fraction is a mask,
@@ -132,6 +149,14 @@ static inline uint32_t wg_hash2(uint64_t seed, int32_t lx, int32_t lz)
  * WG_HEIGHT_MAX]. Pure integer; depends ONLY on (seed, wx, wz). This is the
  * heart of the determinism contract and the unit tests assert it directly. */
 int  worldgen_height(uint64_t seed, int wx, int wz);
+
+/* The radial surface displacement (voxels) at world offset-from-centre (dx,dy,dz):
+ * the amount the terrain pushes the sphere surface OUT (+) or IN (-) in that
+ * direction, in [-WG_RELIEF_AMP, +WG_RELIEF_AMP]. Pure integer + deterministic;
+ * 0 on the Y axis (pole-flattened) and blending to full relief by sqrt(WG_POLE_
+ * FLAT_R2) out. worldgen_fill_chunk adds this to WG_PLANET_R to place the crust.
+ * Exposed for the worldgen unit test. */
+int  worldgen_radial_offset(int dx, int dy, int dz);
 
 /* Fill chunk c's voxels[] for chunk coords (cx,cy,cz) from `seed`, the
  * deterministic gen(seed, coords) -> Chunk of Section 7/8. For each of the 256

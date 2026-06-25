@@ -146,24 +146,122 @@ int worldgen_height(uint64_t seed, int wx, int wz)
     }
 }
 
+/* ======================================================================== *
+ *  RADIAL TERRAIN RELIEF (0.5) - displace the sphere surface per direction   *
+ * ======================================================================== */
+
+/* 3D lattice-corner hash - the wg_hash2 finalizer family with a third axis. */
+static uint32_t wg_hash3(uint32_t seed, int32_t lx, int32_t ly, int32_t lz)
+{
+    uint64_t k = (uint64_t)seed;
+    k ^= (uint64_t)((uint32_t)lx) * 0x9E3779B97F4A7C15ull;
+    k ^= (uint64_t)((uint32_t)ly) * 0xC2B2AE3D27D4EB4Full;
+    k ^= (uint64_t)((uint32_t)lz) * 0x165667B19E3779F9ull;
+    k ^= k >> 33; k *= 0xFF51AFD7ED558CCDull;
+    k ^= k >> 33; k *= 0xC4CEB9FE1A85EC53ull;
+    k ^= k >> 33;
+    return (uint32_t)k;
+}
+
+/* Floor of the integer square root of n>=0 (bit-by-bit, pure integer, identical
+ * on every compiler - no float, so no cross-platform FP drift). */
+static int32_t wg_isqrt(int64_t n)
+{
+    int64_t x = 0, b = 1;
+    if (n <= 0) return 0;
+    while (b * 4 <= n) b *= 4;            /* highest power of four <= n */
+    while (b > 0) {
+        if (n >= x + b) { n -= x + b; x = (x >> 1) + b; }
+        else            { x >>= 1; }
+        b >>= 2;
+    }
+    return (int32_t)x;
+}
+
+/* One octave of integer 3D value noise at (x,y,z) on a lattice of the given log2
+ * period: the 8 cube-corner hashes reduced to the signed [-2048,2047] band, then
+ * TRILINEARLY interpolated (int64 - period^3 * 2048 exceeds int32 for log2>=7).
+ * Normalised back to the band by >> (3*log2period). Pure integer, no divide. */
+static int32_t wg_octave3(uint32_t seed, int32_t x, int32_t y, int32_t z, uint32_t log2period)
+{
+    int32_t period = (int32_t)(1u << log2period);
+    int32_t lx = wg_floordiv_pow2(x, log2period), fx = wg_mod_pow2(x, log2period);
+    int32_t ly = wg_floordiv_pow2(y, log2period), fy = wg_mod_pow2(y, log2period);
+    int32_t lz = wg_floordiv_pow2(z, log2period), fz = wg_mod_pow2(z, log2period);
+    int32_t ifx = period - fx, ify = period - fy, ifz = period - fz;
+    int32_t c000 = (int32_t)(wg_hash3(seed, lx,     ly,     lz)     >> 20) - 2048;
+    int32_t c100 = (int32_t)(wg_hash3(seed, lx + 1, ly,     lz)     >> 20) - 2048;
+    int32_t c010 = (int32_t)(wg_hash3(seed, lx,     ly + 1, lz)     >> 20) - 2048;
+    int32_t c110 = (int32_t)(wg_hash3(seed, lx + 1, ly + 1, lz)     >> 20) - 2048;
+    int32_t c001 = (int32_t)(wg_hash3(seed, lx,     ly,     lz + 1) >> 20) - 2048;
+    int32_t c101 = (int32_t)(wg_hash3(seed, lx + 1, ly,     lz + 1) >> 20) - 2048;
+    int32_t c011 = (int32_t)(wg_hash3(seed, lx,     ly + 1, lz + 1) >> 20) - 2048;
+    int32_t c111 = (int32_t)(wg_hash3(seed, lx + 1, ly + 1, lz + 1) >> 20) - 2048;
+    {
+        int64_t x00 = (int64_t)c000 * ifx + (int64_t)c100 * fx;   /* lerp X, y0 z0 */
+        int64_t x10 = (int64_t)c010 * ifx + (int64_t)c110 * fx;   /* lerp X, y1 z0 */
+        int64_t x01 = (int64_t)c001 * ifx + (int64_t)c101 * fx;   /* lerp X, y0 z1 */
+        int64_t x11 = (int64_t)c011 * ifx + (int64_t)c111 * fx;   /* lerp X, y1 z1 */
+        int64_t y0  = x00 * ify + x10 * fy;                       /* lerp Y, z0    */
+        int64_t y1  = x01 * ify + x11 * fy;                       /* lerp Y, z1    */
+        int64_t v   = y0 * ifz + y1 * fz;                         /* lerp Z        */
+        return (int32_t)(v >> (3u * log2period));                 /* -> [-2048,2047] */
+    }
+}
+
+int worldgen_radial_offset(int dx, int dy, int dz)
+{
+    int64_t d2 = (int64_t)dx * dx + (int64_t)dy * dy + (int64_t)dz * dz;
+    int64_t horiz2;
+    int32_t d, sx, sy, sz, acc = 0, wtot = 0, band, off;
+    uint32_t oct;
+    if (d2 == 0) return 0;
+    d = wg_isqrt(d2);
+    if (d == 0) return 0;
+    /* Project the direction onto the sphere of radius R: a PER-DIRECTION sample
+     * point, so all voxels in a radial column see ~the same displacement (a clean
+     * height field, not a 3D density that would carve caves). Integer divide. */
+    sx = (int32_t)((int64_t)dx * WG_PLANET_R / d);
+    sy = (int32_t)((int64_t)dy * WG_PLANET_R / d);
+    sz = (int32_t)((int64_t)dz * WG_PLANET_R / d);
+    for (oct = 0u; oct < WG_RELIEF_OCTAVES; ++oct) {              /* fractal sum */
+        uint32_t lp = (WG_RELIEF_PERIOD_LOG2 > oct) ? (WG_RELIEF_PERIOD_LOG2 - oct) : 0u;
+        int32_t  w  = (int32_t)(1u << (WG_RELIEF_OCTAVES - 1u - oct));
+        acc  += wg_octave3(WG_RELIEF_SEED, sx, sy, sz, lp) * w;
+        wtot += w;
+    }
+    band = acc / wtot;                                           /* [-2048,2047] */
+    off  = (int32_t)(((int64_t)band * WG_RELIEF_AMP) >> 11);     /* +/- WG_RELIEF_AMP */
+    /* Pole-flatten: scale the displacement to 0 within sqrt(WG_POLE_FLAT_R2) of the
+     * Y axis, so the spawn pole / forge / chimney sit on flat, predictable crust. */
+    horiz2 = (int64_t)dx * dx + (int64_t)dz * dz;
+    if (horiz2 < WG_POLE_FLAT_R2)
+        off = (int32_t)((int64_t)off * horiz2 / WG_POLE_FLAT_R2);
+    return off;
+}
+
 /* Fill chunk c's voxels[] for chunk coords (cx,cy,cz) from `seed`: the
- * deterministic gen(seed, coords) -> Chunk of Section 7/8. For each of the 256
- * columns compute worldgen_height ONCE, then fill the 16 rows by a world_y
- * compare - air at/above the surface; dirt in the top WG_DIRT_DEPTH solid rows;
- * stone below. Same strata shape and fill=15/ambient-temp stamping as
- * chunk_gen_flat. Sets c->cx/cy/cz and raises CHUNK_DIRTY_MESH|CHUNK_GEN.
+ * deterministic gen(seed, coords) -> Chunk of Section 7/8. A spherical asteroid
+ * whose surface RADIUS is displaced per direction by worldgen_radial_offset
+ * (hills/ridges/basins), with a WG_DIRT_DEPTH dirt crust. The displacement is only
+ * evaluated in the thin transition shell [R-AMP-DIRT, R+AMP]; voxels deeper than
+ * that are unconditionally STONE and voxels beyond it AIR (so the per-voxel noise
+ * cost is paid only near the surface). lx is the fastest axis.
  *
- * Determinism: a pure function of (cx,cy,cz,seed) into c->voxels (plus the
- * coord/flag stamp). Calling twice with identical inputs yields byte-identical
- * voxels[] (the regenerate-from-seed guarantee). */
+ * Determinism: a pure function of (cx,cy,cz) into c->voxels (seed-independent, one
+ * fixed asteroid). Calling twice with identical inputs yields byte-identical
+ * voxels[] (the regenerate-from-seed guarantee, asserted cross-platform). */
 void worldgen_fill_chunk(Chunk *c, int cx, int cy, int cz, uint64_t seed)
 {
     uint8_t ambient = temp_encode_c(WG_AMBIENT_C);
     int lx, ly, lz;
-    /* Squared radii (pure integer -> deterministic, no sqrt, no FP drift). */
-    const long R2  = (long)WG_PLANET_R * (long)WG_PLANET_R;
-    const long Rd  = (long)WG_PLANET_R - (long)WG_DIRT_DEPTH;
-    const long Rd2 = Rd * Rd;
+    /* The displaced surface lies in the shell [R-AMP-DIRT, R+AMP]; outside it the
+     * classification is unconditional (deep core STONE, far space AIR), so the
+     * per-voxel relief noise is evaluated ONLY in that thin shell. Pure integer. */
+    const long Rhi  = (long)WG_PLANET_R + WG_RELIEF_AMP;
+    const long Rhi2 = Rhi * Rhi;
+    const long Rlo  = (long)WG_PLANET_R - WG_RELIEF_AMP - WG_DIRT_DEPTH;
+    const long Rlo2 = (Rlo > 0) ? Rlo * Rlo : 0;
 
     (void)seed;   /* one fixed asteroid; generation is seed-independent */
 
@@ -171,8 +269,9 @@ void worldgen_fill_chunk(Chunk *c, int cx, int cy, int cz, uint64_t seed)
     c->cy = cy;
     c->cz = cz;
 
-    /* Spherical asteroid: STONE where world-distance^2 from the center <= R^2,
-     * a WG_DIRT_DEPTH dirt crust just under the surface, AIR outside. lx is the
+    /* Spherical asteroid with radial relief: the surface radius in a given
+     * direction is R + worldgen_radial_offset(dir). STONE below it (with a
+     * WG_DIRT_DEPTH dirt crust just under the surface), AIR above. lx is the
      * fastest (contiguous, vox_index = lx + ly*16 + lz*256). */
     for (lz = 0; lz < CHUNK_DIM; ++lz) {
         long dz = (long)(cz * CHUNK_DIM + lz) - WG_PLANET_CZ;
@@ -182,17 +281,25 @@ void worldgen_fill_chunk(Chunk *c, int cx, int cy, int cz, uint64_t seed)
                 long dx = (long)(cx * CHUNK_DIM + lx) - WG_PLANET_CX;
                 long d2 = dx * dx + dy * dy + dz * dz;
                 Voxel v = 0;
+                uint8_t mat;
 
-                if (d2 > R2) {
-                    vox_set_mat(&v, MAT_AIR);
-                } else if (d2 > Rd2) {
-                    vox_set_mat(&v, MAT_DIRT);     /* crust */
-                    vox_set_fill(&v, 15);
+                if (d2 <= Rlo2) {
+                    mat = MAT_STONE;                /* below any possible surface */
+                } else if (d2 > Rhi2) {
+                    mat = MAT_AIR;                  /* above any possible surface */
                 } else {
-                    vox_set_mat(&v, MAT_STONE);    /* core */
-                    vox_set_fill(&v, 15);
+                    int  off  = worldgen_radial_offset((int)dx, (int)dy, (int)dz);
+                    long Re   = (long)WG_PLANET_R + off;          /* displaced surface */
+                    long Re2  = Re * Re;
+                    long Rde  = Re - WG_DIRT_DEPTH;
+                    long Rde2 = (Rde > 0) ? Rde * Rde : 0;
+                    if (d2 > Re2)        mat = MAT_AIR;
+                    else if (d2 > Rde2)  mat = MAT_DIRT;          /* crust */
+                    else                 mat = MAT_STONE;         /* core  */
                 }
 
+                vox_set_mat(&v, mat);
+                if (mat != MAT_AIR) vox_set_fill(&v, 15);
                 vox_set_temp_code(&v, ambient);
                 c->voxels[vox_index(lx, ly, lz)] = v;
             }
@@ -216,11 +323,14 @@ static long axis_near(int base, int center)
 int worldgen_chunk_all_air(int cx, int cy, int cz)
 {
     /* Min squared distance from the centre to ANY voxel in the chunk = sum of the
-     * per-axis nearest distances squared. If even that is outside R^2, every
-     * voxel is air (matches worldgen_fill_chunk's `d2 > R2 -> MAT_AIR`). */
-    const long R2 = (long)WG_PLANET_R * (long)WG_PLANET_R;
+     * per-axis nearest distances squared. If even that is beyond the MAXIMUM
+     * possible surface radius (R + WG_RELIEF_AMP, a relief peak), every voxel is
+     * air. Must be conservative against the peak: tagging a chunk that contains a
+     * ridge as all-air would drop real terrain (sparse-air would skip its block). */
+    const long Rhi = (long)WG_PLANET_R + WG_RELIEF_AMP;
+    const long Rhi2 = Rhi * Rhi;
     long nx = axis_near(cx * CHUNK_DIM, WG_PLANET_CX);
     long ny = axis_near(cy * CHUNK_DIM, WG_PLANET_CY);
     long nz = axis_near(cz * CHUNK_DIM, WG_PLANET_CZ);
-    return (nx * nx + ny * ny + nz * nz) > R2;
+    return (nx * nx + ny * ny + nz * nz) > Rhi2;
 }

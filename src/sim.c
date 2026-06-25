@@ -886,17 +886,28 @@ int sim_liquid_unsettled(const SimState *s, uint16_t li)
     }
     /* 0.5 M4: with cross-chunk flow enabled, a water voxel on the DOWN-FACE boundary
      * may fall into the chunk below - keep it awake so it keeps offering the
-     * cross-move each tick until it crosses. It can't see the neighbour from here, so
-     * this is conservative (a boundary voxel over a SOLID neighbour also stays awake -
-     * a bounded cost paid only at a chunk's down-face floor, rare since water pools on
-     * the in-chunk crust). NULL fluid_xfn (single-chunk / tests) skips this => M3. */
+     * cross-move each tick until it crosses. Stay awake ONLY when the neighbour
+     * chunk's cell below is actually AIR (a viable cross): a boundary voxel resting
+     * over SOLID crust below must be allowed to SLEEP, else its chunk's active set
+     * never drains (a livelock that eventually fills the WORLDCA_MAX_XSIMS pool and
+     * stalls all cross-chunk flow). neigh[] is Face order, SIM_NEIGH is swapped per
+     * axis pair, so the down-neighbour chunk is neigh[down ^ 1] (chunk_vox is sparse-
+     * air safe). NULL fluid_xfn (single-chunk / tests) skips this => M3. */
     if (s->fluid_xfn != NULL) {
         int dnx = lx + SIM_NEIGH[down][0];
         int dny = ly + SIM_NEIGH[down][1];
         int dnz = lz + SIM_NEIGH[down][2];
         if (dnx < 0 || dnx >= CHUNK_DIM || dny < 0 || dny >= CHUNK_DIM ||
-            dnz < 0 || dnz >= CHUNK_DIM)
-            return 1;                       /* on the down-face boundary: may cross */
+            dnz < 0 || dnz >= CHUNK_DIM) {
+            const Chunk *nc = s->chunk->neigh[down ^ 1];
+            if (nc != NULL) {
+                int nlx = (dnx + CHUNK_DIM) & (CHUNK_DIM - 1);
+                int nly = (dny + CHUNK_DIM) & (CHUNK_DIM - 1);
+                int nlz = (dnz + CHUNK_DIM) & (CHUNK_DIM - 1);
+                if (vox_mat(chunk_vox(nc, vox_index(nlx, nly, nlz))) == MAT_AIR)
+                    return 1;               /* air across the seam: keep retrying */
+            }
+        }
     }
     return 0;
 }
@@ -1008,7 +1019,12 @@ static int fluid_step(SimState *s, int li, int is_source, int is_spring)
         int nlx = (lx + SIM_NEIGH[down][0] + CHUNK_DIM) & (CHUNK_DIM - 1);
         int nly = (ly + SIM_NEIGH[down][1] + CHUNK_DIM) & (CHUNK_DIM - 1);
         int nlz = (lz + SIM_NEIGH[down][2] + CHUNK_DIM) & (CHUNK_DIM - 1);
-        if (s->fluid_xfn(s->fluid_xfn_user, s, li, down, nlx, nly, nlz))
+        /* The callback indexes the Chunk neigh[] array, which is in Face-enum order
+         * (-X,+X,-Y,+Y,-Z,+Z) - the SWAP of SIM_NEIGH's (+X,-X,+Y,-Y,+Z,-Z) within
+         * each axis pair. So convert with (down ^ 1), exactly as the heat cross-chunk
+         * path does (see the n^1 above). The neighbour-local coords are already in
+         * SIM_NEIGH[down] terms (correct direction) and are passed explicitly. */
+        if (s->fluid_xfn(s->fluid_xfn_user, s, li, down ^ 1, nlx, nly, nlz))
             return 0;                                    /* cross-fall enqueued */
     }
 

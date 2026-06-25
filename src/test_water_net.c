@@ -128,6 +128,28 @@ int main(void)
         } else { check("pool chunk resident on both peers", 0); }
     }
 
+    /* (3) DRAIN desync regression: a cell the host changes from non-seed BACK to its
+     * seed value is OMITTED from the (delta-from-seed) push, so an additive client
+     * apply would keep phantom water there forever. The client must reset-to-seed on
+     * apply and clear it. (This is the bug the 0.5 bug-hunt found in chunksync_apply.) */
+    {
+        const int CX = 0, CY = 9, CZ = 1;
+        if (world_get(&HW, CX, CY, CZ) != NULL && world_get(&CW, CX, CY, CZ) != NULL) {
+            int wx = CX*16+5, wy = CY*16+5, wz = CZ*16+5;
+            Voxel seedv = world_get_voxel(&HW, wx, wy, wz);   /* pristine seed voxel */
+            world_edit_voxel(&HW, wx, wy, wz, water());       /* host floods one cell  */
+            host_stream_chunk(host, CX, CY, CZ);
+            for (i = 0; i < 40; ++i) { net_poll(host); net_poll(client); net_sys_sleep_ms(1); }
+            check("client received the streamed water cell",
+                  vox_mat(world_get_voxel(&CW, wx, wy, wz)) == MAT_WATER);
+            world_edit_voxel(&HW, wx, wy, wz, seedv);         /* host drains it back to SEED */
+            host_stream_chunk(host, CX, CY, CZ);              /* delta now OMITS this cell   */
+            for (i = 0; i < 40; ++i) { net_poll(host); net_poll(client); net_sys_sleep_ms(1); }
+            check("client CLEARED the drained cell (no phantom water; reset-to-seed)",
+                  persist_canon(world_get_voxel(&CW, wx, wy, wz)) == persist_canon(seedv));
+        } else { check("drain-regression chunk resident on both peers", 0); }
+    }
+
     net_shutdown(client);
     net_shutdown(host);
     world_shutdown(&HW);

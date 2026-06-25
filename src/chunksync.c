@@ -67,14 +67,27 @@ void chunksync_apply(const unsigned char *data, int len, void *user)
 {
     ChunkSyncCtx *cs = (ChunkSyncCtx *)user;
     int cx, cy, cz, nruns, r, pos;
+    Chunk *c;
     if (len < 14) return;
     cx = (int)((uint32_t)data[0] | ((uint32_t)data[1] << 8) | ((uint32_t)data[2] << 16) | ((uint32_t)data[3] << 24));
     cy = (int)((uint32_t)data[4] | ((uint32_t)data[5] << 8) | ((uint32_t)data[6] << 16) | ((uint32_t)data[7] << 24));
     cz = (int)((uint32_t)data[8] | ((uint32_t)data[9] << 8) | ((uint32_t)data[10] << 16) | ((uint32_t)data[11] << 24));
     nruns = (int)(data[12] | (data[13] << 8));
     pos = 14;
-    if (nruns == 0) return;                          /* untouched: seed copy is correct */
-    if (pos + nruns * 8 > len) return;               /* malformed length */
+    if (nruns > 0 && pos + nruns * 8 > len) return;  /* malformed length */
+
+    /* 0.5: the delta is the FULL delta-from-seed. Reset the resident chunk to seed
+     * BEFORE applying so cells the host reverted to seed-equal (and therefore omitted
+     * from this delta) stop lingering on the client - the additive-apply desync that
+     * left a trail of phantom water behind a moving body. Skip a uniform-air chunk
+     * with an empty delta (it already equals its seed word: nothing to clear, and no
+     * slab to spend realizing it). A non-resident chunk is re-requested on regen. */
+    c = world_get(cs->world, cx, cy, cz);
+    if (c == NULL) return;
+    if (c->voxels != NULL || nruns > 0)
+        world_reset_to_seed(cs->world, cx, cy, cz);
+    if (nruns == 0) return;                          /* now exactly seed: done */
+
     for (r = 0; r < nruns; ++r) {                    /* 0.5: expand each RLE run */
         int start = data[pos] | (data[pos + 1] << 8);
         int run   = data[pos + 2] | (data[pos + 3] << 8);

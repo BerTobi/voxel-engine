@@ -552,16 +552,20 @@ void net_set_chunk_server(NetState *n,
  * without room is SKIPPED (NOT killed via conn_queue's overflow-kill) - the CA
  * re-flags the chunk so a skipped client catches up on a later push, and a
  * settled chunk's final state arrives once the buffer drains / on re-stream. */
-void net_host_push_chunk(NetState *n, const unsigned char *payload, int len)
+int net_host_push_chunk(NetState *n, const unsigned char *payload, int len)
 {
-    int i;
-    if (n == NULL || n->mode != NET_HOST || len <= 0) return;
+    int i, skipped = 0;
+    if (n == NULL || n->mode != NET_HOST || len <= 0) return 0;
     for (i = 0; i < (int)NET_MAX_PLAYERS; ++i) {
         Conn *c = &n->conns[i];
-        if (c->used && !c->dead && !c->connecting &&
-            c->slen + NET_HDR + len <= NET_SEND_CAP)   /* room? skip (never kill) */
+        if (!(c->used && !c->dead && !c->connecting))
+            continue;                                  /* not a live client            */
+        if (c->slen + NET_HDR + len <= NET_SEND_CAP)   /* room? (never kill on backpressure) */
             conn_queue(c, MSG_CDATA, payload, len);
+        else
+            ++skipped;                                 /* backpressured: caller retries */
     }
+    return skipped;                                    /* 0 == delivered to every live client */
 }
 
 void net_set_chunk_apply(NetState *n,

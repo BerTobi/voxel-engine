@@ -728,7 +728,7 @@ static void apply_net_edit(int wx, int wy, int wz, uint32_t voxel, void *user)
 /* The chunk-delta serialize/apply live in chunksync.c (world-coupled, unit-tested);
  * main.c just wires chunksync_serve/chunksync_apply into the net callbacks. */
 
-static void demo_decorate(Chunk *c)
+static void demo_decorate(WorldStore *ws, Chunk *c)
 {
     int x, y, z;
     const Voxel air    = make_voxel(MAT_AIR);
@@ -739,8 +739,9 @@ static void demo_decorate(Chunk *c)
         return;
 
     /* 0.4 M1 - a REACHABLE SURFACE FORGE. HOME is the crust chunk directly under
-     * the spawn pole (chunk (0,7,0), world-Y 112..127); the planet's north-pole
-     * surface is world-Y 128, one voxel above the chunk top. The chunk arrives
+     * the spawn pole (0.5 M2 grain: chunk (0,63,0), world-Y 1008..1023); the pole
+     * surface voxel is world-Y 1024, in the chunk ABOVE (we open its centre cap at
+     * the end of this function so the chimney vents to sky). The chunk arrives
      * from worldgen as solid stone, so we CARVE a stone CAVITY into it and stand a
      * held lava pool inside with a copper charge SUBMERGED: the surrounding stone
      * is a poor conductor (emergent insulation), so the trapped heat drives the
@@ -770,7 +771,7 @@ static void demo_decorate(Chunk *c)
 
     /* Open a 3x3 viewing shaft above the pool (x7..9, z7..9, y13..15 -> world-Y
      * 125..127) up to the chunk top, so the glow + the melt read from the surface
-     * (the chunk above, cy 8, is open air over the pole). The lava's top face
+     * (the chunk above, cy 64, is open sky over the pole). The lava's top face
      * (y12) vents into this shaft, but lava is a HELD source (re-stamped each
      * tick), so venting never cools it - the submerged charge still melts. */
     for (x = 7; x <= 9; ++x)
@@ -779,7 +780,7 @@ static void demo_decorate(Chunk *c)
                 chunk_set(c, x, y, z, air);
 
     /* 0.4 M4: a lava CHIMNEY up the shaft centre to the chunk top (y15 = world-Y
-     * 127, one below the pole surface). Its top voxel borders the chunk ABOVE, so
+     * 1023, one below the pole surface at R=512). Its top voxel borders the chunk ABOVE, so
      * the forge's heat CROSSES the chunk seam and warms the crust there - waking
      * that chunk's CA (the world-wide cross-chunk diffusion, made visible). Held
      * (MAT_EMISSIVE), so it never drains; continuous with the pool below. */
@@ -804,6 +805,22 @@ static void demo_decorate(Chunk *c)
             for (y = 8; y <= 15; ++y)
                 chunk_set(c, x, y, z, air);
     chunk_set(c, DEMO_SPRING_LX, DEMO_SPRING_LY, DEMO_SPRING_LZ, make_liquid(MAT_WATER));
+
+    /* 0.5 M2 grain: at R=512 the pole-axis SURFACE voxel is world-Y 1024, which lives
+     * in the chunk ABOVE home (cy HOME_CY+1, ly 0) - a solid dirt cap sitting directly
+     * over the chimney top (8,15,8 here). The 8 shaft cells ringing it open to air, but
+     * the exact centre column would be sealed, occluding the forge glow there. Open that
+     * one cap cell so the chimney vents to open sky at the centre too. world_edit_voxel
+     * realizes + remeshes the chunk above (and persists the vent), or no-ops if it isn't
+     * resident. fill stays 0 (clean air, not make_voxel's full-cube fill). */
+    {
+        Voxel vent = 0;
+        vox_set_mat(&vent, MAT_AIR);
+        vox_set_temp_code(&vent, temp_encode_c(20.0));
+        world_edit_voxel(ws, HOME_CX * CHUNK_DIM + 8,
+                             (HOME_CY + 1) * CHUNK_DIM + 0,
+                             HOME_CZ * CHUNK_DIM + 8, vent);
+    }
 }
 
 /* True iff HOME already carries the forge (decorated this run, or LOADED from a
@@ -1757,7 +1774,7 @@ int main(void)
              * Either way flag HOME CHUNK_MODIFIED so the evolved home is written
              * back on eviction / shutdown (Section 8 modified policy). */
             if (!home_is_decorated(home))
-                demo_decorate(home);
+                demo_decorate(world, home);
             mark_home_modified(home);
             slot = world_render_slot(world, home);
             cb_mesh_upload(home, slot, &stream_ctx);
@@ -2201,7 +2218,7 @@ int main(void)
                 /* ATTACH: (decorate if fresh) + re-mesh + bind the resident HOME. */
                 int slot = world_render_slot(world, home);
                 if (!home_is_decorated(home))
-                    demo_decorate(home);
+                    demo_decorate(world, home);
                 mark_home_modified(home);
                 cb_mesh_upload(home, slot, &stream_ctx);
                 if (sim_init(sim, home) != 0) {
@@ -2243,8 +2260,13 @@ int main(void)
             {
                 int w = 0;
                 for (i = 0; i < g_nxsim; ++i) {
+                    /* Keep only if the bound chunk is STILL resident at its coords AND
+                     * still holds a voxel block. The voxels!=NULL guard is defensive
+                     * against an ABA recycle (same coords + pool slot re-collapsed to
+                     * uniform-air): an active sim chunk is always realized, so this
+                     * drops no valid entry, but it can never tick a NULL-voxel chunk. */
                     if (world_get(world, g_xsim_cx[i], g_xsim_cy[i], g_xsim_cz[i])
-                            == g_xsim[i]->chunk) {
+                            == g_xsim[i]->chunk && g_xsim[i]->chunk->voxels != NULL) {
                         g_xsim[w] = g_xsim[i];
                         g_xsim_cx[w] = g_xsim_cx[i];
                         g_xsim_cy[w] = g_xsim_cy[i];
@@ -2328,8 +2350,23 @@ int main(void)
                         if (ssim) sim_notify_edit(ssim, sli);                /* retry next tick */
                         continue;
                     }
-                    nc->voxels[nli]  = make_liquid(vox_mat(src->voxels[sli]));
-                    src->voxels[sli] = make_voxel(MAT_AIR);
+                    /* Materialise + drain mirroring the IN-CHUNK fluid move
+                     * (fluid_occupy_air / fluid_revert_to_air): the destination keeps
+                     * its own temp (don't mint fresh 20 C water across the seam), and
+                     * the drained source becomes fill-0 air (make_voxel hardcodes
+                     * fill=15, which would leave a stray-fill air cell). */
+                    {
+                        Voxel nv = nc->voxels[nli];     /* preserve dest cell temp */
+                        Voxel sv = src->voxels[sli];    /* preserve source cell temp */
+                        vox_set_mat(&nv, vox_mat(sv));
+                        vox_set_fill(&nv, 15);
+                        vox_set_flags(&nv, vox_flags(nv) | VF_LIQUID);
+                        nc->voxels[nli] = nv;
+                        vox_set_mat(&sv, MAT_AIR);
+                        vox_set_fill(&sv, 0);
+                        vox_set_flags(&sv, vox_flags(sv) & ~VF_LIQUID);
+                        src->voxels[sli] = sv;
+                    }
                     src->flags |= CHUNK_DIRTY_MESH | CHUNK_MODIFIED | CHUNK_MODIFIED_BY_SIM;
                     nc->flags  |= CHUNK_DIRTY_MESH | CHUNK_MODIFIED | CHUNK_MODIFIED_BY_SIM;
                     nsim = worldca_wake_chunk(sim, nc, prog_ring);
@@ -2366,9 +2403,12 @@ int main(void)
                 }
                 /* 0.4 M5: the HOST streams CA-changed chunks to clients. Push each
                  * CHUNK_MODIFIED_BY_SIM chunk's delta-from-seed (the same payload a
-                 * CREQ reply builds, via chunksync_serve) and clear the flag; the
-                 * CA re-flags it on the next change, so a backpressure-skipped
-                 * client catches up. Clients run NO CA and just render these. */
+                 * CREQ reply builds, via chunksync_serve). Clear the flag only when the
+                 * push reached EVERY live client; if a client was backpressure-skipped
+                 * keep the flag set so the chunk is re-pushed next frame - otherwise a
+                 * chunk that SETTLES right after a skipped push (the CA stops re-flagging
+                 * it) would leave that client stuck at the pre-final state. Clients run
+                 * NO CA and just render these. */
                 if (is_host) {
                     for (i = 0; i < nall && push_budget > 0; ++i) {
                         Chunk *sc = all[i]->chunk;
@@ -2377,9 +2417,8 @@ int main(void)
                             continue;
                         plen = chunksync_serve(sc->cx, sc->cy, sc->cz,
                                                g_push_buf, (int)NET_CHUNK_MAX, &csctx);
-                        if (plen > 0)
-                            net_host_push_chunk(net, g_push_buf, plen);
-                        sc->flags &= (uint8_t)~CHUNK_MODIFIED_BY_SIM;
+                        if (plen <= 0 || net_host_push_chunk(net, g_push_buf, plen) == 0)
+                            sc->flags &= (uint8_t)~CHUNK_MODIFIED_BY_SIM;  /* delivered to all */
                         --push_budget;
                     }
                 }

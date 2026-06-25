@@ -107,6 +107,36 @@ behind the `make check` gate; see `PLAN-0.5.md`.
   every determinism test (they passed only because `heat[]` carried the signal). Fixed to hash the
   full `CHUNK_VOXELS`-word array (or the uniform word for a slab-less air chunk).
 
+### Fixed
+A pre-ship adversarial bug hunt across the whole 0.5 delta (8 lenses, every finding
+verified by independent skeptics) surfaced — and these fix — the following, each with a
+regression test where one was missing:
+- **Cross-chunk water flowed into the WRONG chunk** _(critical, M4)_. The fluid cross-seam
+  path passed a `SIM_NEIGH` face index (`{+X,-X,+Y,-Y,…}`) straight to `neigh[]`, which is in
+  the **swapped** Face-enum order (`{-X,+X,-Y,+Y,…}`) — so radial-down (−Y) fetched the chunk
+  **above**. The heat path already converts with `^1`; the fluid path now does too
+  (`sim.c`). The M4 seam test was passing only because it wired neighbours backwards — it now
+  uses the production convention and **fails if the `^1` is dropped**.
+- **Water pooled on a chunk's down-face boundary never settled** _(high, M4)_. The "keep a
+  boundary voxel awake to retry the cross-move" clause didn't check whether the neighbour
+  below was air, so water resting over solid crust spun forever — and, since active chunks are
+  never retired until eviction, eventually filled the 48-sim pool and **stalled all cross-chunk
+  flow**. The clause now stays awake only when the cell across the seam is actually air.
+- **Multiplayer clients accumulated phantom water** _(high, M5)_. `chunksync_apply` patched the
+  delta-from-seed onto the resident chunk **additively**, so a cell the host reverted to
+  seed-equal (omitted from the delta — e.g. water that flowed onward) lingered on the client
+  forever. Apply now resets the chunk to seed before applying the delta (new
+  `world_reset_to_seed`); a new `test_water_net` drain case guards it.
+- **Cross-seam water was reset to 20 °C and left a stray-fill air cell** _(low, M4)_. The
+  deferred deposit now mirrors the in-chunk move: the destination keeps its own temperature and
+  the drained source becomes fill-0 air (was minting fresh 20 °C water / `fill=15` air).
+- **Backpressured clients could miss a chunk's final state** _(M5)_. The host cleared a chunk's
+  stream flag even when a slow client was skipped; if the chunk then settled it was never
+  re-sent. `net_host_push_chunk` now reports skips and the flag is kept until every client
+  receives it.
+- **Forge chimney centre was capped** _(M2 grain)_ and a defensive guard added against a
+  (theoretical) evicted-chunk reuse in the sim retire loop. Stale R=64-era comments corrected.
+
 ## 0.4.0 — 2026-06-24 — The World Comes Alive
 
 0.4 unfreezes the cellular automaton: heat diffusion + melting/freezing tick

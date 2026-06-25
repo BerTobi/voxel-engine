@@ -143,8 +143,13 @@ static void test_cross_chunk_seam(void)
 {
     static Chunk a, b; SimState sa, sb; SeamCtx ctx; long before; int crossed;
     back(&a); back(&b);
-    a.neigh[3] = &b;   /* A's -Y (face 3, down) neighbour is B */
-    b.neigh[2] = &a;   /* B's +Y (face 2) neighbour is A       */
+    /* Wire per the PRODUCTION Chunk neigh[]/Face convention (-X,+X,-Y,+Y,-Z,+Z), NOT
+     * the SIM_NEIGH order: A's radial-down (-Y) neighbour is neigh[2]. The cross-flow
+     * path converts SIM_NEIGH down (3) to the Face index (down^1 == 2) before indexing
+     * neigh[], so B (below) must sit at a.neigh[2]; if the ^1 is ever dropped this test
+     * fails (face 3 -> a.neigh[3] == NULL -> no cross). */
+    a.neigh[2] = &b;   /* A's -Y (FACE_NEG_Y, radial-down) neighbour is B (below) */
+    b.neigh[3] = &a;   /* B's +Y (FACE_POS_Y) neighbour is A (above)              */
     put(&a, 8, 0, 8, mk(MAT_WATER, 15));   /* one water voxel on A's bottom boundary */
     sim_build_conduct_lut();
     sim_init(&sa, &a); sim_init(&sb, &b);          /* both default down = -Y (face 3) */

@@ -496,6 +496,14 @@ Voxel world_get_voxel(const WorldStore *ws, int wx, int wy, int wz);
  * edited chunk is the simulated one (the world layer has no sim dependency). */
 int  world_edit_voxel(WorldStore *ws, int wx, int wy, int wz, Voxel v);
 
+/* Reset a resident chunk's voxels to its pure seed (regenerate via cb.gen) and
+ * queue a FULL remesh of it + its 6 resident neighbours (a whole-chunk change moves
+ * every seam). No-op if the chunk is not resident. Used by the MP client's chunk-
+ * delta apply: a streamed delta is delta-from-seed, so the client must start each
+ * apply from seed - otherwise cells the host reverted to seed-equal (and therefore
+ * OMITTED from the delta) would linger forever (the additive-apply desync). */
+void world_reset_to_seed(WorldStore *ws, int cx, int cy, int cz);
+
 /* ======================================================================== *
  *  10. STREAMING DRIVER  (the per-frame entry point - Section 6/7)          *
  * ======================================================================== */

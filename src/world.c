@@ -610,6 +610,26 @@ int world_edit_voxel(WorldStore *ws, int wx, int wy, int wz, Voxel v)
     return 1;
 }
 
+void world_reset_to_seed(WorldStore *ws, int cx, int cy, int cz)
+{
+    Chunk *c = world_get(ws, cx, cy, cz);
+    Chunk *n;
+    if (c == NULL)
+        return;                          /* not resident: nothing to reset */
+    if (world_realize(ws, c) != 0)
+        return;                          /* slab pool exhausted (cannot regen) */
+    ws->cb.gen(c, cx, cy, cz, ws->seed, ws->cb.user);   /* pure seed terrain (now == seed) */
+    c->flags &= ~(uint8_t)CHUNK_DIRTY_MESH;             /* clear so the enqueue actually queues */
+    remesh_enqueue(ws, c);
+    /* A whole-chunk change moves every shared seam: re-mesh all 6 resident neighbours. */
+    n = world_get(ws, cx - 1, cy, cz); if (n) remesh_enqueue(ws, n);
+    n = world_get(ws, cx + 1, cy, cz); if (n) remesh_enqueue(ws, n);
+    n = world_get(ws, cx, cy - 1, cz); if (n) remesh_enqueue(ws, n);
+    n = world_get(ws, cx, cy + 1, cz); if (n) remesh_enqueue(ws, n);
+    n = world_get(ws, cx, cy, cz - 1); if (n) remesh_enqueue(ws, n);
+    n = world_get(ws, cx, cy, cz + 1); if (n) remesh_enqueue(ws, n);
+}
+
 /* ======================================================================== *
  *  Lifecycle                                                               *
  * ======================================================================== */

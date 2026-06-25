@@ -119,10 +119,12 @@ void net_request_chunk(NetState *n, int cx, int cy, int cz);
  * host-authoritative CA streaming channel. `payload`/`len` is a MSG_CDATA body
  * (built by chunksync_serve, exactly like a CREQ reply); clients apply it through
  * the same chunk_apply hook they use for requested deltas. BACKPRESSURE-SAFE: a
- * client whose send buffer lacks room is SKIPPED (not killed) - the continuous CA
- * re-flags the chunk so the client catches up on a later push. No-op unless
- * NET_HOST. */
-void net_host_push_chunk(NetState *n, const unsigned char *payload, int len);
+ * client whose send buffer lacks room is SKIPPED (not killed). RETURNS the number
+ * of live clients that were skipped (0 == delivered to all): the caller should keep
+ * the chunk's MODIFIED_BY_SIM flag set when >0 so a settled chunk (whose CA stops
+ * re-flagging it) is still re-pushed until every client receives its final state.
+ * No-op (returns 0) unless NET_HOST. */
+int net_host_push_chunk(NetState *n, const unsigned char *payload, int len);
 
 /* HOST: install the server. On a request net.c calls serve(cx,cy,cz,out,cap,user);
  * write the MSG_CDATA payload into out (cap == NET_CHUNK_MAX) and return its length

@@ -634,6 +634,54 @@ static void test_nested_parent_mkdir(void)
     free(src); free(dst);
 }
 
+/* Case 10 (0.5 M6 compat gate) - a save from an OLDER generator version is
+ * REFUSED on load, NOT silently mis-read as current data. This is the exact
+ * "0.4 saves are refused, not migrated" guarantee: 0.4 stamped gen_version 2,
+ * 0.5 expects WG_GEN_VERSION (3). region_read_meta refuses a gen mismatch
+ * (persist.c:216) and the LOAD path treats a refused region as a MISS (the chunk
+ * regenerates from the current seed/gen), so a 32 m-pebble 0.4 voxel can never
+ * be re-interpreted as a 256 m-planet 0.5 voxel. We simulate the old save by
+ * opening a store at gen_version-1 (== 2, the literal 0.4 value), then assert a
+ * fresh store at the current gen sees the chunk as MISS. */
+#define TEST_STALEGEN_DIR "build/persist_test_stalegen"
+
+static void test_stale_gen_refused(void)
+{
+    Chunk *src = malloc(sizeof(Chunk));
+    Chunk *dst = malloc(sizeof(Chunk));
+    char buf[192]; int ok = 1; buf[0] = '\0';
+    PersistStore *ps_old, *ps_new;
+    const uint32_t OLD_GEN = WG_GEN_VERSION - 1u;   /* == 2 == the 0.4 gen version */
+
+    if (src == NULL || dst == NULL) { report("stale-gen refused", 0, "OOM"); free(src); free(dst); return; }
+    remove(TEST_STALEGEN_DIR "/r.0.0.dat");          /* clean slate for re-runs */
+
+    /* (a) write a "0.4" save: a real modified chunk stamped at the OLD gen version. */
+    ps_old = persist_open(TEST_STALEGEN_DIR, TEST_SEED, OLD_GEN);
+    if (ps_old == NULL) { report("stale-gen refused", 0, "persist_open(old gen) failed"); free(src); free(dst); return; }
+    build_mixed_chunk(src, 2, 3, 5);
+    if (persist_save_chunk(ps_old, src) != 0) { ok = 0; snprintf(buf, sizeof buf, "save under old gen failed"); }
+    if (ok && persist_flush(ps_old) != 0)     { ok = 0; snprintf(buf, sizeof buf, "flush under old gen failed"); }
+    persist_close(ps_old);
+
+    /* (b) a current-gen (0.5) store MUST refuse it -> load MISS, not a mis-read. */
+    if (ok) {
+        ps_new = persist_open(TEST_STALEGEN_DIR, TEST_SEED, WG_GEN_VERSION);
+        if (ps_new == NULL) { ok = 0; snprintf(buf, sizeof buf, "persist_open(current gen) failed"); }
+        else {
+            memset(dst, 0xAB, sizeof *dst); chunk_back(dst, 1);
+            if (persist_load_chunk(ps_new, dst, 2, 3, 5) != 0) {
+                ok = 0; snprintf(buf, sizeof buf, "stale-gen chunk LOADED (mis-read!) - expected MISS (refused)");
+            }
+            persist_close(ps_new);
+        }
+    }
+    report("stale-gen (0.4) save is REFUSED on load, not migrated", ok, buf);
+    remove(TEST_STALEGEN_DIR "/r.0.0.dat");
+    remove(TEST_STALEGEN_DIR);
+    free(src); free(dst);
+}
+
 int main(void)
 {
     PersistStore *ps;
@@ -669,6 +717,7 @@ int main(void)
 
     test_restart_durability();
     test_nested_parent_mkdir();
+    test_stale_gen_refused();   /* 0.5 M6: the "0.4 saves refused, not migrated" gate */
 
     printf("=== %d failure(s) ===\n", g_failures);
     return g_failures;

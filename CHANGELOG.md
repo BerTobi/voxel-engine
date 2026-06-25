@@ -86,6 +86,17 @@ behind the `make check` gate; see `PLAN-0.5.md`.
   real RLE codec, pushes it over the socket, and the client's `chunksync_apply` reconstructs the
   water voxel-for-voxel; `test_chunksync` gains the flood-to-one-run and worst-case-no-truncation
   cases. (0.4↔0.5 peers were already refused at the handshake by the M2 `gen_version` bump.)
+- _(M6)_ **Release hardening.** A new `test_persist` case asserts the headline compatibility
+  promise directly: a save stamped at the **0.4 generator version (gen 2)** is **refused on load
+  by a 0.5 build (gen 3) — it reads as a MISS and regenerates, never mis-interpreted** as 0.5
+  data (a 32 m-pebble voxel cannot be re-read as a 256 m-planet voxel). Verified for ship: both
+  targets `-Wall -Wextra` clean; the determinism symbol `sim_state_hash` is absent from the
+  release binary (compiled in only under `-DVOXEL_DETERMINISM_HARNESS`); the version string has a
+  single source of truth in `version.h`; the integrated heat-forge **and** water-spring sim runs
+  bounded (5000-tick warmup in ~2 s, ~91 MB RSS, no runaway active set). _(Cross-platform
+  determinism under wine — the Windows build hashing identically to Linux — is integer-CA-
+  deterministic by construction and covered by the Linux determinism harness; the explicit wine
+  run is pending a wine install in the dev environment.)_
 
 ## 0.4.0 — 2026-06-24 — The World Comes Alive
 

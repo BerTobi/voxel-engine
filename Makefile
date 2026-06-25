@@ -109,7 +109,7 @@ WIN_LDFLAGS := -static -static-libgcc -Wl,--gc-sections -mwindows
 WIN_LIBS    := -lopengl32 -lgdi32 -luser32 -lws2_32
 
 # ---- Targets -----------------------------------------------------------------
-.PHONY: all linux win test testsim testworld testpersist testprogress testraycast testedit testplayer testnet testchunksync testdeterminism check version archive clean
+.PHONY: all linux win test testsim testworld testpersist testprogress testraycast testedit testplayer testnet testchunksync testdeterminism testgrain testwater check version archive clean
 
 # Default target: native dev build.
 all: linux
@@ -233,11 +233,29 @@ testdeterminism: | $(BUILD)
 		$(SRC)/material.c $(SRC)/chunk.c $(SRC)/sim.c $(SRC)/progress.c $(SRC)/test_determinism.c -lm
 	$(BUILD)/det_test
 
+# 0.5 M0: the metres<->voxels macro algebra (units.h). No engine deps - forces
+# units.h to compile (firing its _Static_assert) and checks each conversion folds
+# to the expected value at the 0.5 grain. M2 grows this into the grain grep gate.
+# apt: build-essential
+testgrain: | $(BUILD)
+	$(CC) $(CFLAGS) -o $(BUILD)/grain_test $(SRC)/test_grain.c
+	$(BUILD)/grain_test
+
+# 0.5 M0: the WATER CA determinism harness slot. M0 asserts the EXISTING liquid
+# fluid pass is reproducible (two identical water worlds hash-equal after N ticks
+# via sim_state_hash, which covers the fill nibble). -DVOXEL_DETERMINISM_HARNESS
+# mirrors testdeterminism. M3 expands it into the binary-fill flow/settle tests.
+# apt: build-essential
+testwater: | $(BUILD)
+	$(CC) -std=c99 -Wall -Wextra -Isrc -DVOXEL_DETERMINISM_HARNESS -o $(BUILD)/water_test \
+		$(SRC)/material.c $(SRC)/chunk.c $(SRC)/sim.c $(SRC)/progress.c $(SRC)/test_water.c -lm
+	$(BUILD)/water_test
+
 # 0.4 M0: the aggregate regression gate. Runs EVERY unit suite in order; make
 # aborts on the first suite whose binary exits non-zero (each test's exit code is
 # its failure count). This is the mechanically-enforced "full suite green" floor
 # every 0.4 milestone leans on - replaces the honour-system "run them all".
-check: test testsim testworld testpersist testprogress testraycast testedit testplayer testnet testchunksync testdeterminism
+check: test testsim testworld testpersist testprogress testraycast testedit testplayer testnet testchunksync testdeterminism testgrain testwater
 	@echo "=== make check: ALL SUITES PASSED ==="
 
 # Create the build directory on demand (order-only prerequisite).

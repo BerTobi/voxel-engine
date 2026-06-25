@@ -5,6 +5,28 @@ All notable changes to the Voxel Engine. Versioning is Factorio-style
 `PATCH` = save-compatible fixes, `MINOR` = new gameplay/features, `MAJOR` = 1.0
 or a breaking overhaul.
 
+## 0.5.0 — unreleased — Finite Flowing Water (in development)
+
+0.5 ships the soul of the project: **finite water that flows downhill under radial
+gravity, pools in basins, and settles** — rivers from a spring or a placed source, on a
+planet finally grown to a real size at a finer **0.5 m voxel grain**. The planet starts
+**dry**; every drop comes from a source and is conserved. The full water *cycle*
+(evaporation / cloud / snow / ice / melt) is **deferred to 0.6**. Built milestone by milestone
+behind the `make check` gate; see `PLAN-0.5.md`.
+
+> Compatibility (planned): a **hard break** at the grain flip — `WG_GEN_VERSION` 2→3,
+> `PERSIST_FORMAT_VERSION` 1→2, `NET_PROTOCOL_VERSION` 3→4. 0.4 saves are **refused, not
+> migrated** (a 32 m pebble of 1 m voxels cannot meaningfully become a 256 m planet of 0.5 m
+> voxels).
+
+### Added
+- _(M0)_ `src/units.h` — the **metres↔voxels split** (`VOX_GRAIN_MM`, `M2V`/`V2M`), the
+  compile-time grain knob the fine-grain future rests on. Additive and applied nowhere yet
+  (the grain flip is M2); its algebra is asserted by a new `test_grain` suite, and a
+  `test_water` determinism harness slot is wired into `make check` (the binary-fill water CA
+  lands at M3). This milestone changes no engine behaviour — the build is byte-identical to
+  0.4.0 but for the version string.
+
 ## 0.4.0 — 2026-06-24 — The World Comes Alive
 
 0.4 unfreezes the cellular automaton: heat diffusion + melting/freezing tick

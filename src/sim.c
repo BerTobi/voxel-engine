@@ -2147,7 +2147,12 @@ void sim_shutdown(SimState *s)
      * to another subsystem) sees clean ground-truth flags, then drop the front
      * and source tables. SimState owns no heap in this milestone, so this is
      * symmetry with sim_init (forward-compat) rather than a free(). */
-    if (s->chunk != NULL) {
+    /* 0.5 M1: tolerate a chunk whose voxel block is GONE. A SimState can outlive
+     * its chunk's eviction (e.g. world_shutdown evicts everything before the
+     * WorldCA tears down g_xsim), and an evicted/uniform chunk has voxels == NULL.
+     * There is no live block to clear VF_ACTIVE on (and the chunk is being
+     * destroyed anyway), so skip - pre-0.5 this read stale-but-valid inline memory. */
+    if (s->chunk != NULL && s->chunk->voxels != NULL) {
         for (i = 0; i < (int)s->act.count; ++i) {
             int li = s->act.active[i];
             Voxel *v = &s->chunk->voxels[li];

@@ -35,6 +35,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
+#include <stdlib.h>   /* 0.5 M1: calloc for test chunk blocks */
 
 #include "voxel.h"
 #include "chunk.h"
@@ -79,6 +80,8 @@ static Voxel make_solid(uint8_t mat, uint8_t temp_code)
 static void fill_uniform(Chunk *c, uint8_t mat, uint8_t temp_code)
 {
     memset(c, 0, sizeof *c);
+    c->voxels = calloc(CHUNK_VOXELS, sizeof(Voxel)); /* 0.5 M1: voxels is a pointer */
+    c->slab_idx = -1;
     Voxel v = make_solid(mat, temp_code);
     for (int i = 0; i < CHUNK_VOXELS; ++i)
         c->voxels[i] = v;
@@ -998,6 +1001,8 @@ static void build_stone_box(Chunk *c, uint8_t temp_code,
 {
     int lx, ly, lz, n = 0;
     memset(c, 0, sizeof *c);
+    c->voxels = calloc(CHUNK_VOXELS, sizeof(Voxel)); /* 0.5 M1: voxels is a pointer */
+    c->slab_idx = -1;
     /* Interior + walls all start as the uniform-temperature material; we stamp
      * the boundary shell to stone and leave the interior air. Air at the uniform
      * temp keeps the whole field gradient-free. */

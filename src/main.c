@@ -355,6 +355,17 @@ static void cb_gen(Chunk *c, int cx, int cy, int cz, uint64_t seed, void *user)
     }
 }
 
+/* 0.5 M1 sparse-air: tells the WorldStore which chunks generate as WHOLLY AIR so
+ * it skips the 16 KiB slab + the fill for them (the ~72%-air resident window).
+ * Mirrors worldgen exactly. world_insert still runs cb_gen FIRST (so a CLIENT's
+ * host-delta request above still fires), then collapses to uniform-air; an edited
+ * sky chunk syncs in later via world_edit_voxel, which realizes a real block. */
+static int cb_is_air(int cx, int cy, int cz, uint64_t seed, void *user)
+{
+    (void)seed; (void)user;
+    return worldgen_chunk_all_air(cx, cy, cz);
+}
+
 /* ---- Demo decoration (M2 lighting + M3/M4 heat + M6 fluid) --------------- *
  * Decorate ONLY the HOME chunk (the one the single-chunk sim binds to). The
  * lava pool + copper columns + water blob sit INTERIOR to this chunk, well clear
@@ -605,9 +616,12 @@ static int worldca_nfn(void *user, const SimState *s, int face,
     if (nc == NULL) return 0;
     nli = vox_index(nlx, nly, nlz);
     ns  = worldca_find(cx->forge, nc);
-    *out_mat  = vox_mat(nc->voxels[nli]);
+    /* 0.5 M1: the neighbour chunk may be uniform-air (NULL voxels) - read via
+     * chunk_vox, which returns its uniform_word (the worldgen air word, ambient
+     * temp), so an inactive air neighbour decodes the same heat as a dense one. */
+    *out_mat  = vox_mat(chunk_vox(nc, nli));
     *out_heat = (ns != NULL) ? ns->heat[nli]
-                             : temp_to_heat(vox_temp_code(nc->voxels[nli]));
+                             : temp_to_heat(vox_temp_code(chunk_vox(nc, nli)));
     return 1;
 }
 
@@ -1459,6 +1473,7 @@ int main(void)
     cb.gen         = cb_gen;
     cb.mesh_upload = cb_mesh_upload;
     cb.slot_free   = cb_slot_free;
+    cb.is_air      = cb_is_air;     /* 0.5 M1: enable sparse-air (skip empty chunks) */
     cb.user        = &stream_ctx;
 
     world = (WorldStore *)malloc(sizeof(WorldStore));
@@ -2195,6 +2210,11 @@ int main(void)
                 for (i = 0; i < wctx.n_wake; ++i) {  /* deferred cross-chunk wakes */
                     Chunk *nc = wctx.wake_chunk[i];
                     if (world_get(world, nc->cx, nc->cy, nc->cz) != nc)
+                        continue;
+                    /* 0.5 M1: the woken neighbour may be uniform-air - the CA reads
+                     * AND writes its voxels, so give it a real block first (realize
+                     * expands the air word so unheated voxels stay correct). */
+                    if (world_realize(world, nc) != 0)
                         continue;
                     {
                         SimState *ns = worldca_wake_chunk(sim, nc, prog_ring);

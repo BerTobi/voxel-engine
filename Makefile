@@ -109,7 +109,7 @@ WIN_LDFLAGS := -static -static-libgcc -Wl,--gc-sections -mwindows
 WIN_LIBS    := -lopengl32 -lgdi32 -luser32 -lws2_32
 
 # ---- Targets -----------------------------------------------------------------
-.PHONY: all linux win test testsim testworld testpersist testprogress testraycast testedit testplayer testnet testchunksync testdeterminism testgrain testwater check version archive clean
+.PHONY: all linux win test testsim testworld testpersist testprogress testraycast testedit testplayer testnet testchunksync testdeterminism testgrain testwater testsparse check version archive clean
 
 # Default target: native dev build.
 all: linux
@@ -251,11 +251,22 @@ testwater: | $(BUILD)
 		$(SRC)/material.c $(SRC)/chunk.c $(SRC)/sim.c $(SRC)/progress.c $(SRC)/test_water.c -lm
 	$(BUILD)/water_test
 
+# 0.5 M1: sparse-air chunk storage (Chunk.voxels as a pointer + the slab sub-pool).
+# Drives a real WorldStore with the sphere worldgen + the all-air predicate: an
+# exterior chunk costs no 16 KiB block, a realized one does, and over a full
+# streamed window the slab pool never exhausts while resident >> realized.
+# apt: build-essential
+testsparse: | $(BUILD)
+	$(CC) $(CFLAGS) -o $(BUILD)/sparse_test \
+		$(SRC)/material.c $(SRC)/chunk.c $(SRC)/mesher.c $(SRC)/worldgen.c \
+		$(SRC)/world.c $(SRC)/persist.c $(SRC)/test_sparse.c -lm
+	$(BUILD)/sparse_test
+
 # 0.4 M0: the aggregate regression gate. Runs EVERY unit suite in order; make
 # aborts on the first suite whose binary exits non-zero (each test's exit code is
 # its failure count). This is the mechanically-enforced "full suite green" floor
 # every 0.4 milestone leans on - replaces the honour-system "run them all".
-check: test testsim testworld testpersist testprogress testraycast testedit testplayer testnet testchunksync testdeterminism testgrain testwater
+check: test testsim testworld testpersist testprogress testraycast testedit testplayer testnet testchunksync testdeterminism testgrain testwater testsparse
 	@echo "=== make check: ALL SUITES PASSED ==="
 
 # Create the build directory on demand (order-only prerequisite).

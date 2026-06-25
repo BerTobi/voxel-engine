@@ -78,7 +78,16 @@ static void test_gen_cb(Chunk *c, int cx, int cy, int cz, uint64_t seed,
     worldgen_fill_chunk(c, cx, cy, cz, seed);
 }
 
-/* Build a headless WorldCallbacks: gen only, render hooks NULL. */
+/* 0.5 M1: the test gen IS the sphere worldgen, so the real all-air predicate
+ * applies - exercising sparse-air exactly as the engine does (so the slab
+ * sub-pool, sized < the full window, never exhausts on the empty-space majority). */
+static int test_is_air_cb(int cx, int cy, int cz, uint64_t seed, void *user)
+{
+    (void)seed; (void)user;
+    return worldgen_chunk_all_air(cx, cy, cz);
+}
+
+/* Build a headless WorldCallbacks: gen + sparse-air predicate, render hooks NULL. */
 static WorldCallbacks headless_cb(void)
 {
     WorldCallbacks cb;
@@ -86,6 +95,7 @@ static WorldCallbacks headless_cb(void)
     cb.mesh_upload = NULL;
     cb.slot_free   = NULL;
     cb.user        = NULL;
+    cb.is_air      = test_is_air_cb;   /* 0.5 M1: sparse-air (skip empty chunks) */
     return cb;
 }
 

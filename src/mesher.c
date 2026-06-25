@@ -112,29 +112,32 @@ static int mb_reserve_indices(MeshBuffer *mb, uint32_t need) {
  * (all neigh[] NULL) meshes byte-for-byte as before, so the world's true outer
  * faces still emit while interior seams between linked solid chunks cull. */
 static inline Voxel sample(const Chunk *c, int x, int y, int z) {
+    /* 0.5 M1: a NEIGHBOUR chunk may be uniform-air (voxels == NULL), so seam reads
+     * go through chunk_vox(); c itself is realized here (greedy_mesh early-outs on
+     * a uniform chunk before any sweep), so its own read indexes voxels directly. */
     if (x < 0) {
         const Chunk *n = c->neigh[FACE_NEG_X];
-        return n ? n->voxels[vox_index(x + CHUNK_DIM, y, z)] : 0;
+        return n ? chunk_vox(n, vox_index(x + CHUNK_DIM, y, z)) : 0;
     }
     if (x >= CHUNK_DIM) {
         const Chunk *n = c->neigh[FACE_POS_X];
-        return n ? n->voxels[vox_index(x - CHUNK_DIM, y, z)] : 0;
+        return n ? chunk_vox(n, vox_index(x - CHUNK_DIM, y, z)) : 0;
     }
     if (y < 0) {
         const Chunk *n = c->neigh[FACE_NEG_Y];
-        return n ? n->voxels[vox_index(x, y + CHUNK_DIM, z)] : 0;
+        return n ? chunk_vox(n, vox_index(x, y + CHUNK_DIM, z)) : 0;
     }
     if (y >= CHUNK_DIM) {
         const Chunk *n = c->neigh[FACE_POS_Y];
-        return n ? n->voxels[vox_index(x, y - CHUNK_DIM, z)] : 0;
+        return n ? chunk_vox(n, vox_index(x, y - CHUNK_DIM, z)) : 0;
     }
     if (z < 0) {
         const Chunk *n = c->neigh[FACE_NEG_Z];
-        return n ? n->voxels[vox_index(x, y, z + CHUNK_DIM)] : 0;
+        return n ? chunk_vox(n, vox_index(x, y, z + CHUNK_DIM)) : 0;
     }
     if (z >= CHUNK_DIM) {
         const Chunk *n = c->neigh[FACE_POS_Z];
-        return n ? n->voxels[vox_index(x, y, z - CHUNK_DIM)] : 0;
+        return n ? chunk_vox(n, vox_index(x, y, z - CHUNK_DIM)) : 0;
     }
     return c->voxels[vox_index(x, y, z)];
 }
@@ -545,6 +548,13 @@ static uint32_t sweep_axis(const Chunk *c, MeshBuffer *mb, int d, int dir,
 uint32_t greedy_mesh(const Chunk *c, MeshBuffer *out) {
     mesh_buffer_reset(out);
 
+    /* 0.5 M1: a uniform chunk (voxels == NULL) is all-air (uniform-solid is not
+     * used) - no solid source voxels, so zero opaque quads. Its neighbours' faces
+     * toward it are emitted by THEIR sweeps (which read this chunk as air via
+     * chunk_vox). Skipping avoids a NULL deref in sample()'s own-chunk read. */
+    if (c->voxels == NULL)
+        return 0;
+
     uint32_t quads = 0;
     quads += sweep_axis(c, out, 0, -1, FACE_NEG_X, 0);
     quads += sweep_axis(c, out, 0, +1, FACE_POS_X, 0);
@@ -563,6 +573,9 @@ uint32_t greedy_mesh(const Chunk *c, MeshBuffer *out) {
  * the empty-mask scan. Resets `out` first, exactly like greedy_mesh. */
 uint32_t greedy_mesh_liquid(const Chunk *c, MeshBuffer *out) {
     mesh_buffer_reset(out);
+
+    if (c->voxels == NULL)        /* 0.5 M1: uniform-air -> no liquid quads */
+        return 0;
 
     uint32_t quads = 0;
     quads += sweep_axis(c, out, 0, -1, FACE_NEG_X, 1);

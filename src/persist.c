@@ -386,7 +386,7 @@ static int record_encode(const Chunk *c, uint8_t **out_buf, size_t *out_len)
     int i;
 
     for (i = 0; i < CHUNK_VOXELS; ++i) {
-        Voxel cw = persist_canon(c->voxels[i]);
+        Voxel cw = persist_canon(chunk_vox(c, i));
         uint16_t pi;
         int found = -1;
         uint16_t j;
@@ -427,7 +427,7 @@ static int record_encode(const Chunk *c, uint8_t **out_buf, size_t *out_len)
         memcpy(buf, &hdr, sizeof hdr);
         words = (Voxel *)(buf + sizeof hdr);
         for (i = 0; i < CHUNK_VOXELS; ++i)
-            words[i] = persist_canon(c->voxels[i]);
+            words[i] = persist_canon(chunk_vox(c, i));
         *out_buf = buf;
         *out_len = len;
         return 0;
@@ -480,7 +480,7 @@ static int record_encode(const Chunk *c, uint8_t **out_buf, size_t *out_len)
                 memcpy(rbuf, &hdr, sizeof hdr);
                 words = (Voxel *)(rbuf + sizeof hdr);
                 for (i = 0; i < CHUNK_VOXELS; ++i)
-                    words[i] = persist_canon(c->voxels[i]);
+                    words[i] = persist_canon(chunk_vox(c, i));
                 *out_buf = rbuf;
                 *out_len = raw_len;
                 return 0;

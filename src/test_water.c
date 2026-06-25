@@ -11,6 +11,7 @@
  * mirroring testdeterminism. Links material.c chunk.c sim.c progress.c. */
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>   /* 0.5 M1: calloc for test chunk blocks */
 #include "voxel.h"
 #include "chunk.h"
 #include "material.h"
@@ -26,6 +27,8 @@ static void setup_water(SimState *s, Chunk *c)
     int x, y, z;
     Voxel stone = 0, water = 0;
     memset(c, 0, sizeof *c);
+    c->voxels = calloc(CHUNK_VOXELS, sizeof(Voxel));   /* 0.5 M1: voxels is a pointer now */
+    c->slab_idx = -1;
     vox_set_mat(&stone, MAT_STONE); vox_set_fill(&stone, FLUID_FULL); vox_set_temp_code(&stone, 60u);
     vox_set_mat(&water, MAT_WATER); vox_set_fill(&water, FLUID_FULL); vox_set_temp_code(&water, 60u);
     for (z = 0; z < CHUNK_DIM; ++z) for (x = 0; x < CHUNK_DIM; ++x) for (y = 0; y < 2; ++y)

@@ -47,11 +47,66 @@
  *  Small helpers                                                           *
  * ======================================================================== */
 
-/* Pool index of a resident chunk: its offset into the contiguous slab array.
+/* Pool index of a resident chunk: its offset into the contiguous record array.
  * Valid only for a chunk that came from ws->pool (every resident chunk does). */
 static inline uint32_t pool_index(const WorldStore *ws, const Chunk *c)
 {
     return (uint32_t)(c - ws->pool);
+}
+
+/* ---- sparse-air slab sub-pool (0.5 M1) ---------------------------------- *
+ * slab_pop hands a RAW (unfilled) 16 KiB voxel block to a chunk; world_realize
+ * (public) additionally expands the chunk's uniform_word into it. Returns 0 on
+ * success, 1 if the slab pool is exhausted (a WORLD_SLAB_SLOTS sizing bug). */
+static int slab_pop(WorldStore *ws, Chunk *c)
+{
+    uint32_t sidx, inuse;
+    if (c->voxels != NULL)
+        return 0;                            /* already realized */
+    if (ws->slab_free_top == 0u)
+        return 1;                            /* exhausted: caller handles */
+    sidx = ws->slab_free[--ws->slab_free_top];
+    c->slab_idx = (int32_t)sidx;
+    c->voxels   = ws->slabs + (size_t)sidx * CHUNK_VOXELS;
+    c->flags   &= ~(uint8_t)CHUNK_UNIFORM;
+    inuse = WORLD_SLAB_SLOTS - ws->slab_free_top;
+    if (inuse > ws->slab_inuse_peak)
+        ws->slab_inuse_peak = inuse;
+    return 0;
+}
+
+int world_realize(WorldStore *ws, Chunk *c)
+{
+    Voxel u;
+    int i;
+    if (c == NULL)
+        return 1;
+    if (c->voxels != NULL)
+        return 0;                            /* already realized */
+    u = c->uniform_word;                     /* capture before slab_pop clears state */
+    if (slab_pop(ws, c) != 0)
+        return 1;
+    /* Expand the uniform value into the fresh (possibly recycled, stale) block so
+     * every voxel the caller does NOT overwrite is correct - the realize-on-EDIT
+     * and realize-on-CA-wake of a uniform-air chunk must read air everywhere else.
+     * (world_insert uses slab_pop directly + overwrites all 4096, so it pays no
+     * redundant fill.) */
+    for (i = 0; i < CHUNK_VOXELS; ++i)
+        c->voxels[i] = u;
+    return 0;
+}
+
+void world_set_uniform(WorldStore *ws, Chunk *c, Voxel word)
+{
+    if (c == NULL)
+        return;
+    if (c->slab_idx >= 0) {                  /* return its block to the sub-pool */
+        ws->slab_free[ws->slab_free_top++] = (uint32_t)c->slab_idx;
+        c->slab_idx = -1;
+    }
+    c->voxels       = NULL;
+    c->uniform_word = word;
+    c->flags       |= CHUNK_UNIFORM;
 }
 
 /* Chebyshev (chessboard) distance between two chunk columns, used by the
@@ -349,25 +404,41 @@ Chunk *world_insert(WorldStore *ws, int cx, int cy, int cz)
     pidx = ws->free_idx[--ws->free_top];
     c = &ws->pool[pidx];
 
-    /* clear the slab so a recycled slab carries no stale voxels/neigh/flags
-     * before worldgen stamps it (worldgen also sets cx/cy/cz, but be explicit
-     * so the neigh wiring below reads the right coords). */
+    /* clear the record so a recycled slot carries no stale neigh/flags before
+     * worldgen stamps it. memset leaves voxels==NULL/uniform_word=0 (uniform-air);
+     * restate slab_idx == -1 (0 would alias slab 0). */
     memset(c, 0, sizeof(*c));
+    c->slab_idx = -1;
     c->cx = cx;
     c->cy = cy;
     c->cz = cz;
 
-    /* Fill the slab. Section 8 gen-vs-stored: PERSISTED edits win over the seed.
-     * Try the save first - persist_load_chunk restores a stored chunk's
-     * mat|temp|fill verbatim (light|ao|flags left 0 for light.c / the CA to
-     * rebake / re-wake) and returns 1 on a HIT, in which case the deterministic
-     * generator is SKIPPED. The common case (and ALWAYS when ws->store == NULL,
-     * e.g. test_world.c) is a MISS (returns 0), so we fall through to cb.gen
-     * exactly as the M7 path did. The chunk is lit + meshed identically below
-     * whichever branch filled it. */
+    /* 0.5 M1: hand the chunk a RAW voxel block, then fill it. persist HIT or gen
+     * overwrites all 4096 (so slab_pop does no redundant fill). A gen MISS that
+     * comes out WHOLLY AIR is collapsed back to uniform-air (slab returned), which
+     * is the 72%-of-the-window memory win. Slab exhaustion is a sizing bug
+     * (WORLD_SLAB_SLOTS); roll the record pop back and fail like a full pool. */
+    if (slab_pop(ws, c) != 0) {
+        ws->free_idx[ws->free_top++] = pidx;
+        return NULL;
+    }
+
+    /* Section 8 gen-vs-stored: PERSISTED edits win over the seed. Try the save
+     * first - persist_load_chunk restores a stored chunk's mat|temp|fill verbatim
+     * (light|ao|flags left 0 for light.c / the CA to rebake / re-wake) and returns
+     * 1 on a HIT, skipping the generator. The common case (and ALWAYS when
+     * ws->store == NULL, e.g. test_world.c) is a MISS, so we gen exactly as before.
+     * A store-less or is_air-less store keeps every chunk realized (dense), so the
+     * pre-0.5 behaviour is byte-for-byte preserved. */
     if (!persist_load_chunk(ws->store, c, cx, cy, cz)) {
-        /* MISS: regenerate from seed via the required gen callback */
         ws->cb.gen(c, cx, cy, cz, ws->seed, ws->cb.user);
+        if (ws->cb.is_air && ws->cb.is_air(cx, cy, cz, ws->seed, ws->cb.user))
+            /* Collapse to uniform using the generator's OWN air word (voxels[0],
+             * which the all-air gen made identical everywhere) - NOT a bare 0 - so
+             * the uniform value carries worldgen's ambient temp/fill exactly. A
+             * neighbour CA reading this chunk via chunk_vox() then sees the same
+             * temperature it would from a dense air voxel: byte-identical behaviour. */
+            world_set_uniform(ws, c, c->voxels[0]);   /* wholly air -> drop the slab */
     }
     /* gen sets CHUNK_GEN|CHUNK_DIRTY_MESH; a persist HIT leaves flags 0 (the
      * remesh enqueue below raises CHUNK_DIRTY_MESH unconditionally, so a loaded
@@ -456,7 +527,18 @@ void world_evict(WorldStore *ws, int cx, int cy, int cz)
      * never "dirty"). */
     c->flags = 0;
 
-    /* return the slab to the pool */
+    /* 0.5 M1: return the voxel block (if realized) to the slab sub-pool. A uniform
+     * chunk (slab_idx == -1) borrowed none. Done AFTER the persist writeback above,
+     * which only fires for CHUNK_MODIFIED chunks - and those are always realized
+     * (world_edit_voxel realizes before it raises MODIFIED), so the save never sees
+     * NULL voxels. */
+    if (c->slab_idx >= 0) {
+        ws->slab_free[ws->slab_free_top++] = (uint32_t)c->slab_idx;
+        c->slab_idx = -1;
+    }
+    c->voxels = NULL;
+
+    /* return the chunk record to the pool */
     ws->free_idx[ws->free_top++] = pidx;
 }
 
@@ -501,6 +583,11 @@ int world_edit_voxel(WorldStore *ws, int wx, int wy, int wz, Voxel v)
     if (c == NULL)
         return 0;                    /* can't edit an unloaded chunk */
 
+    /* 0.5 M1: a uniform-air chunk has no voxel block - realize it first (which
+     * expands its uniform_word so every OTHER voxel stays correct air). */
+    if (world_realize(ws, c) != 0)
+        return 0;                    /* slab pool exhausted (sizing bug) */
+
     chunk_set(c, lx, ly, lz, v);      /* writes the voxel AND raises CHUNK_DIRTY_MESH */
     c->flags |= CHUNK_MODIFIED;       /* persist this edit on eviction */
     /* chunk_set already raised CHUNK_DIRTY_MESH, but remesh_enqueue's dedup SKIPS a
@@ -538,10 +625,26 @@ int world_init(WorldStore *ws, uint64_t seed, const WorldCallbacks *cb)
     ws->seed = seed;
     ws->cb   = *cb;
 
-    /* one big contiguous slab pool, reserved once and never grown */
+    /* one big contiguous CHUNK-RECORD pool, reserved once and never grown.
+     * 0.5 M1: a record no longer carries an inline 16 KiB voxel block, so this is
+     * now ~170 KiB (1777 small records) rather than 27.8 MiB. */
     ws->pool = (Chunk *)calloc(WORLD_POOL_SLOTS, sizeof(Chunk));
     if (ws->pool == NULL)
         return 1;
+
+    /* 0.5 M1: the separate VOXEL-BLOCK slab sub-pool (one contiguous calloc, never
+     * grows) + its free-list. Realized (non-uniform) chunks borrow a block; uniform
+     * -air chunks borrow none. calloc-zero = a block of MAT_AIR. */
+    ws->slabs = (Voxel *)calloc((size_t)WORLD_SLAB_SLOTS * CHUNK_VOXELS, sizeof(Voxel));
+    if (ws->slabs == NULL) {
+        free(ws->pool);
+        ws->pool = NULL;
+        return 1;
+    }
+    ws->slab_free_top = 0;
+    for (i = WORLD_SLAB_SLOTS; i-- > 0; )
+        ws->slab_free[ws->slab_free_top++] = i;
+    ws->slab_inuse_peak = 0;
 
     /* free-list stack: all slabs free (push in descending order so the first
      * pop hands out index 0 - tidy, not required). */
@@ -606,6 +709,8 @@ void world_shutdown(WorldStore *ws)
 
     free(ws->pool);
     ws->pool = NULL;
+    free(ws->slabs);             /* 0.5 M1: the voxel-block sub-pool */
+    ws->slabs = NULL;
 }
 
 /* ======================================================================== *

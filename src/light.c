@@ -102,7 +102,7 @@ static inline int light_seam_level(const Chunk *c, int nx, int ny, int nz)
         return 0;                          /* true window edge: no inherit       */
 
     li = vox_index(nx, ny, nz);
-    if (light_opaque(n->voxels[li]))
+    if (light_opaque(chunk_vox(n, li)))    /* 0.5 M1: n may be uniform-air (NULL voxels) */
         return 0;                          /* continuing wall: dark like interior */
     return LIGHT_MAX;                      /* lit air next door bleeds onto face  */
 }
@@ -180,6 +180,14 @@ static void light_flood(uint8_t *field, const Chunk *c,
 
 void light_compute(Chunk *c)
 {
+    /* 0.5 M1: a uniform-air chunk (voxels == NULL) has no block to bake light into
+     * and produces no mesh, so there is nothing to light. Its neighbours read it as
+     * air (non-opaque, full skylight) through chunk_vox in light_seam_level, so the
+     * seam stays correct. Skip - also guards the c->voxels[] reads/writes below.
+     * (!ptr not ==NULL: light.c does not include <stddef.h>, matching its idiom.) */
+    if (!c->voxels)
+        return;
+
     /* Two 0..15 scratch channels + one circular index ring, all stack-local so
      * the call is self-contained and re-entrant (light.h: scratch lives outside
      * the voxel word). sky/blk are 4 KiB each; the ring is LIGHT_QCAP ints

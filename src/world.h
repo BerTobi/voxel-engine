@@ -167,7 +167,25 @@ typedef struct {
  * contiguous block is grabbed before the heap fragments. */
 #define WORLD_POOL_SLACK  256u  /* >= 2 leading curtains = 2*WORLD_DIAM*WORLD_BAND_H
                                  * = 2*13*9 = 234 (band is 9 layers for the R=64 ball) */
-#define WORLD_POOL_SLOTS  (WORLD_WINDOW_CHUNKS + WORLD_POOL_SLACK)  /* 804 */
+#define WORLD_POOL_SLOTS  (WORLD_WINDOW_CHUNKS + WORLD_POOL_SLACK)  /* 1521+256 = 1777 */
+
+/* SLAB SUB-POOL (0.5 M1 sparse-air storage). A Chunk RECORD (~96 B: coords,
+ * neigh[6], flags, the voxels pointer + uniform_word) is always resident in the
+ * pool above, but its 16 KiB VOXEL BLOCK is now drawn lazily from this separate
+ * fixed pool only when the chunk is non-uniform (has solid/water content).
+ * UNIFORM-AIR chunks - 72% of the resident window (measured) - hold voxels==NULL
+ * + a uniform_word and borrow NO slab, so they cost only the record. This is the
+ * memory win: 1777 * 16 KiB (27.8 MiB, all-dense) -> 1777 records (~170 KiB) +
+ * WORLD_SLAB_SLOTS * 16 KiB realized blocks.
+ *
+ * SIZING: bounded above by the max chunks simultaneously NON-UNIFORM in any
+ * resident window + streaming churn. At R=64 (M1) the whole ball is ~430 solid/
+ * surface chunks (probe: 431 of 1521); 768 covers that + a leading curtain of
+ * churn with margin. world_realize HARD-FAILS if exhausted (a too-small pool is a
+ * sizing bug caught by test_sparse's worst-case stream, not silent corruption).
+ * Re-tuned at M2 once the R=512 surface-following geometry's realized count is
+ * measured. The pool NEVER grows (the no-per-chunk-malloc rule still holds). */
+#define WORLD_SLAB_SLOTS  768u
 
 /* ======================================================================== *
  *  4. PER-FRAME STREAMING BUDGET  (ARCHITECTURE Section 6 / Section 7)      *
@@ -259,10 +277,18 @@ typedef void (*WorldMeshUploadFn)(Chunk *c, int slot, void *user);
  * NULL (headless tests). */
 typedef void (*WorldSlotFreeFn)(int slot, void *user);
 
+/* 0.5 M1 sparse-air: return 1 iff chunk (cx,cy,cz) would generate as WHOLLY AIR,
+ * so world_insert can skip the slab + the fill and set it uniform-air instead.
+ * MAY be NULL -> the store never sparsifies (always realizes + gens, the pre-0.5
+ * dense behaviour, so a store without it is byte-for-byte unchanged). The real
+ * engine binds worldgen_chunk_all_air; the tests leave it NULL. */
+typedef int (*WorldIsAirFn)(int cx, int cy, int cz, uint64_t seed, void *user);
+
 typedef struct {
     WorldGenFn        gen;          /* REQUIRED                                */
     WorldMeshUploadFn mesh_upload;  /* may be NULL (headless)                  */
     WorldSlotFreeFn   slot_free;    /* may be NULL (headless)                  */
+    WorldIsAirFn      is_air;       /* may be NULL (no sparse-air -> dense)    */
     void             *user;         /* opaque ctx threaded into every callback */
 } WorldCallbacks;
 
@@ -277,10 +303,21 @@ struct WorldStore {
     ChunkSlot   table[WORLD_HASH_CAP];   /* open-addressing, linear probing     */
     uint32_t    table_count;             /* live residents                      */
 
-    /* ---- slab pool (Section 7) ---- */
+    /* ---- chunk-record pool (Section 7) ---- */
     Chunk      *pool;                    /* one contiguous calloc, WORLD_POOL_SLOTS */
     uint32_t    free_idx[WORLD_POOL_SLOTS]; /* free-list stack of pool indices  */
     uint32_t    free_top;                /* count of free slots (stack height)  */
+
+    /* ---- voxel-block slab sub-pool (0.5 M1 sparse-air) ---- *
+     * One contiguous calloc of WORLD_SLAB_SLOTS * CHUNK_VOXELS voxels + a
+     * free-list stack of slab indices. world_realize pops a block for a
+     * non-uniform chunk (c->slab_idx, c->voxels = &slabs[idx*CHUNK_VOXELS]);
+     * world_evict / world_set_uniform push it back. slab_inuse_peak tracks the
+     * high-water mark so test_sparse can assert the pool sizing holds. */
+    Voxel      *slabs;                   /* WORLD_SLAB_SLOTS * CHUNK_VOXELS words */
+    uint32_t    slab_free[WORLD_SLAB_SLOTS]; /* free-list stack of slab indices  */
+    uint32_t    slab_free_top;
+    uint32_t    slab_inuse_peak;         /* max slabs ever simultaneously realized */
 
     /* ---- resident iteration list ---- *
      * Dense array of pool indices of LIVE residents, so the frame loop and the
@@ -393,6 +430,18 @@ Chunk *world_insert(WorldStore *ws, int cx, int cy, int cz);
  * this milestone (Section 8 deferred): a MODIFIED chunk loses its edits here -
  * documented and acceptable. No-op if not resident. */
 void world_evict(WorldStore *ws, int cx, int cy, int cz);
+
+/* ---- sparse-air realize / uniform (0.5 M1) ---- *
+ * world_realize: ensure a resident chunk has a real 16 KiB voxel block (pops one
+ * from the slab sub-pool if the chunk is currently uniform). Returns 0 on
+ * success, non-zero if the slab pool is exhausted (a sizing bug). A no-op if the
+ * chunk is already realized. Call BEFORE any write to c->voxels (worldgen fill,
+ * persist load, the CA binding a chunk, a player edit).
+ *   world_set_uniform: collapse a chunk to a single repeated word (e.g. all-air),
+ * returning its slab to the pool if it had one. voxels becomes NULL; reads go
+ * through chunk_vox() which returns uniform_word. */
+int  world_realize(WorldStore *ws, Chunk *c);
+void world_set_uniform(WorldStore *ws, Chunk *c, Voxel word);
 
 /* Iterate resident chunks. The frame loop walks these to draw; the streaming
  * update walks them to find out-of-range evictees. world_resident_count() is

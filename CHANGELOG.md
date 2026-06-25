@@ -26,6 +26,16 @@ behind the `make check` gate; see `PLAN-0.5.md`.
   `test_water` determinism harness slot is wired into `make check` (the binary-fill water CA
   lands at M3). This milestone changes no engine behaviour — the build is byte-identical to
   0.4.0 but for the version string.
+- _(M1)_ **Sparse-air chunk storage.** `Chunk.voxels` becomes a pointer: a non-uniform chunk
+  borrows a 16 KiB block from a new WorldStore slab sub-pool; a **uniform-air** chunk (the
+  ~72%-empty majority of a resident window, measured) holds `voxels == NULL` + a `uniform_word`
+  and borrows none. All cross-chunk neighbour reads route through a new `chunk_vox()`; the
+  mesher/lighter/CA early-out on uniform chunks; `world_realize`/`world_set_uniform` +
+  copy-on-write back a chunk on first edit or CA wake. The resident voxel working set drops
+  from a dense **23.8 MiB to ~6.7 MiB** (431 realized blocks of a 768-slab pool) and the chunk
+  -record pool from 27.8 MiB to ~153 KiB. Still on the 1 m grain / R=64 planet (the grain flip
+  is M2), so **0.4 saves still load** (the persist format + `WG_GEN_VERSION` are unchanged).
+  New `test_sparse` suite; ASan/UBSan-clean over streaming + the CA + multi-session teardown.
 
 ## 0.4.0 — 2026-06-24 — The World Comes Alive
 

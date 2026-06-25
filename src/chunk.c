@@ -32,6 +32,14 @@ Chunk *chunk_alloc(int cx, int cy, int cz)
     Chunk *c = calloc(1, sizeof(Chunk));
     if (c == NULL)
         return NULL;
+    /* 0.5 M1: voxels is no longer inline. The standalone/bring-up path OWNS its
+     * 16 KiB block (calloc -> all MAT_AIR), marked slab_idx == -1 so chunk_free
+     * releases it (WorldStore pool chunks borrow from the slab sub-pool instead
+     * and are never chunk_free'd). */
+    c->voxels = calloc(CHUNK_VOXELS, sizeof(Voxel));
+    if (c->voxels == NULL) { free(c); return NULL; }
+    c->slab_idx = -1;
+    c->uniform_word = 0;
     c->cx = cx;
     c->cy = cy;
     c->cz = cz;
@@ -44,6 +52,10 @@ Chunk *chunk_alloc(int cx, int cy, int cz)
 
 void chunk_free(Chunk *c)
 {
+    if (c == NULL)
+        return;
+    if (c->slab_idx < 0)        /* standalone-owned block (pool blocks are freed by world) */
+        free(c->voxels);
     free(c);
 }
 
@@ -97,7 +109,7 @@ Voxel chunk_get(const Chunk *c, int lx, int ly, int lz)
         ly < 0 || ly >= CHUNK_DIM ||
         lz < 0 || lz >= CHUNK_DIM)
         return (Voxel)0;
-    return c->voxels[vox_index(lx, ly, lz)];
+    return chunk_vox(c, vox_index(lx, ly, lz));   /* 0.5 M1: uniform-aware */
 }
 
 void chunk_set(Chunk *c, int lx, int ly, int lz, Voxel v)
@@ -112,9 +124,22 @@ void chunk_set(Chunk *c, int lx, int ly, int lz, Voxel v)
 
 /* ---- Whole-chunk fill ---------------------------------------------------- */
 
+/* 0.5 M1: bring-up/test chunks are often `Chunk c; memset(&c,0,sizeof c);` which
+ * leaves voxels == NULL. chunk_fill / chunk_gen_flat are TEST/bring-up-only (the
+ * shipping engine fills via worldgen into a slab-backed chunk), so they lazily
+ * allocate a standalone block (slab_idx == -1) when handed an unbacked chunk. */
+static void chunk_ensure_block(Chunk *c)
+{
+    if (c->voxels == NULL) {
+        c->voxels   = calloc(CHUNK_VOXELS, sizeof(Voxel));
+        c->slab_idx = -1;
+    }
+}
+
 void chunk_fill(Chunk *c, Voxel v)
 {
     int i;
+    chunk_ensure_block(c);
     for (i = 0; i < CHUNK_VOXELS; ++i)
         c->voxels[i] = v;
     c->flags |= CHUNK_DIRTY_MESH;
@@ -130,6 +155,8 @@ void chunk_gen_flat(Chunk *c, int ground_height)
 {
     uint8_t ambient = temp_encode_c(CHUNK_AMBIENT_C);
     int lx, ly, lz;
+
+    chunk_ensure_block(c);   /* 0.5 M1: test/bring-up chunk may be unbacked */
 
     for (lz = 0; lz < CHUNK_DIM; ++lz) {
         for (ly = 0; ly < CHUNK_DIM; ++ly) {

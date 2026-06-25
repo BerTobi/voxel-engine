@@ -30,6 +30,7 @@
  */
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>   /* 0.5 M1: calloc for test chunk blocks */
 
 #include "voxel.h"
 #include "material.h"
@@ -65,6 +66,8 @@ static uint16_t setup_copper_melt_world(SimState *s, Chunk *c)
     Voxel base = 0;
 
     memset(c, 0, sizeof *c);
+    c->voxels = calloc(CHUNK_VOXELS, sizeof(Voxel)); /* 0.5 M1: voxels is a pointer */
+    c->slab_idx = -1;
     vox_set_mat(&base, MAT_COPPER);
     vox_set_fill(&base, FLUID_FULL);
     vox_set_temp_code(&base, 60u);   /* ambient: temp_encode_c(20 C) == 60 */
@@ -184,11 +187,11 @@ static int seam_nfn(void *user, const SimState *s, int face,
     for (i = 0; i < cx->n; ++i)
         if (cx->sims[i]->chunk == nc) {             /* active neighbour: live heat[] */
             *out_heat = cx->sims[i]->heat[nli];
-            *out_mat  = vox_mat(nc->voxels[nli]);
+            *out_mat  = vox_mat(chunk_vox(nc, nli));     /* 0.5 M1: nc may be uniform */
             return 1;
         }
-    *out_heat = temp_to_heat(vox_temp_code(nc->voxels[nli]));  /* inactive: voxel temp */
-    *out_mat  = vox_mat(nc->voxels[nli]);
+    *out_heat = temp_to_heat(vox_temp_code(chunk_vox(nc, nli)));  /* inactive: voxel temp */
+    *out_mat  = vox_mat(chunk_vox(nc, nli));
     return 1;
 }
 
@@ -209,6 +212,8 @@ static void fill_copper(Chunk *c, int cx, int cy, int cz)
     Voxel base = 0;
     int i;
     memset(c, 0, sizeof *c);
+    c->voxels = calloc(CHUNK_VOXELS, sizeof(Voxel)); /* 0.5 M1: voxels is a pointer */
+    c->slab_idx = -1;
     vox_set_mat(&base, MAT_COPPER);
     vox_set_fill(&base, FLUID_FULL);
     vox_set_temp_code(&base, 60u);                  /* 20 C ambient */
@@ -293,8 +298,8 @@ static void test_seam_order_independence(void)
     report("M4: cross-chunk world tick is order-independent (heat[] + voxels match)",
            memcmp(a1.heat, a2.heat, sizeof a1.heat) == 0 &&
            memcmp(b1.heat, b2.heat, sizeof b1.heat) == 0 &&
-           memcmp(ca1.voxels, ca2.voxels, sizeof ca1.voxels) == 0 &&
-           memcmp(cb1.voxels, cb2.voxels, sizeof cb1.voxels) == 0);
+           memcmp(ca1.voxels, ca2.voxels, CHUNK_VOXELS * sizeof(Voxel)) == 0 &&
+           memcmp(cb1.voxels, cb2.voxels, CHUNK_VOXELS * sizeof(Voxel)) == 0);
 
     sim_shutdown(&a1); sim_shutdown(&b1); sim_shutdown(&a2); sim_shutdown(&b2);
 }

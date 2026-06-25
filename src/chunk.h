@@ -30,9 +30,19 @@
 #define CHUNK_MODIFIED   0x02u  /* player-altered: must persist on eviction        */
 #define CHUNK_GEN        0x04u  /* freshly generated, not yet meshed               */
 #define CHUNK_MODIFIED_BY_SIM 0x08u /* 0.4: the CA mutated this chunk (host streams it) */
+#define CHUNK_UNIFORM    0x10u  /* 0.5 M1: voxels==NULL, content is uniform_word (air)  */
 
 typedef struct Chunk {
-    Voxel    voxels[CHUNK_VOXELS];  /* 16 KiB - the payload                        */
+    /* 0.5 M1 sparse-air: the 16 KiB voxel block is no longer inline. A NON-uniform
+     * chunk borrows a block from the WorldStore slab sub-pool (voxels != NULL,
+     * slab_idx >= 0); a UNIFORM chunk (72% of a resident window are pure air) holds
+     * voxels == NULL + CHUNK_UNIFORM and its single repeated value in uniform_word,
+     * borrowing no block. READ a voxel through chunk_vox() (handles both). A
+     * standalone chunk_alloc() chunk owns a malloc'd block (slab_idx == -1, voxels
+     * != NULL) for the bring-up/test path. */
+    Voxel   *voxels;                /* 16 KiB block, or NULL if CHUNK_UNIFORM        */
+    Voxel    uniform_word;          /* the repeated value when voxels == NULL        */
+    int32_t  slab_idx;             /* WorldStore slab index, or -1 (standalone/none) */
     int      cx, cy, cz;            /* this chunk's coords (also recoverable from key) */
     /* Cached axis-adjacent neighbour pointers (Section 2.4). The mesher reads
      * the 6 neighbour edge planes through these so a boundary face is culled
@@ -54,6 +64,17 @@ typedef struct Chunk {
  * Inputs are local 0..15; no bounds check (hot path). */
 static inline int vox_index(int lx, int ly, int lz) {
     return lx + (ly << 4) + (lz << 8);     /* lx + ly*16 + lz*256 */
+}
+
+/* 0.5 M1: read a voxel by linear index, handling sparse-air. A realized chunk
+ * (voxels != NULL) reads its block directly; a UNIFORM chunk returns its single
+ * repeated word. Use this at any site that may see a NEIGHBOUR chunk (which can
+ * be uniform-air) - the mesher/light seam reads, the CA cross-chunk reads, and
+ * persist/net encode. Hot loops over a chunk's OWN content operate on realized
+ * chunks (uniform chunks early-out of meshing/lighting/sim) and may index
+ * c->voxels[] directly. No bounds check (hot path; caller passes 0..4095). */
+static inline Voxel chunk_vox(const struct Chunk *c, int idx) {
+    return c->voxels ? c->voxels[idx] : c->uniform_word;
 }
 
 /* ---- Lifecycle ----------------------------------------------------------- */

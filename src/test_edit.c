@@ -30,6 +30,7 @@ int main(void)
     WorldStore *ws = (WorldStore *)malloc(sizeof(WorldStore));
     WorldCallbacks cb;
     cb.gen = gen_cb; cb.mesh_upload = NULL; cb.slot_free = NULL; cb.user = NULL;
+    cb.is_air = NULL;   /* 0.5 M1: dense (no sparse-air collapse) for this test */
     if (ws == NULL || world_init(ws, 777u, &cb) != 0) {
         printf("init failed\n");
         return 1;

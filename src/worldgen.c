@@ -201,3 +201,26 @@ void worldgen_fill_chunk(Chunk *c, int cx, int cy, int cz, uint64_t seed)
 
     c->flags |= CHUNK_DIRTY_MESH | CHUNK_GEN;
 }
+
+/* The nearest distance, along one axis, from the planet centre C to the chunk's
+ * world-coord span [base, base+CHUNK_DIM-1]: 0 if C is inside the span, else the
+ * gap to the nearer end. */
+static long axis_near(int base, int center)
+{
+    int lo = base, hi = base + CHUNK_DIM - 1;
+    if (center < lo) return (long)(lo - center);
+    if (center > hi) return (long)(center - hi);
+    return 0;
+}
+
+int worldgen_chunk_all_air(int cx, int cy, int cz)
+{
+    /* Min squared distance from the centre to ANY voxel in the chunk = sum of the
+     * per-axis nearest distances squared. If even that is outside R^2, every
+     * voxel is air (matches worldgen_fill_chunk's `d2 > R2 -> MAT_AIR`). */
+    const long R2 = (long)WG_PLANET_R * (long)WG_PLANET_R;
+    long nx = axis_near(cx * CHUNK_DIM, WG_PLANET_CX);
+    long ny = axis_near(cy * CHUNK_DIM, WG_PLANET_CY);
+    long nz = axis_near(cz * CHUNK_DIM, WG_PLANET_CZ);
+    return (nx * nx + ny * ny + nz * nz) > R2;
+}

@@ -138,4 +138,14 @@ int  worldgen_height(uint64_t seed, int wx, int wz);
  * byte-identical voxels[] (the regenerate-from-seed guarantee). */
 void worldgen_fill_chunk(Chunk *c, int cx, int cy, int cz, uint64_t seed);
 
+/* 0.5 M1 sparse-air: returns 1 iff chunk (cx,cy,cz) is WHOLLY AIR under the
+ * generator - i.e. even its nearest voxel to the planet centre is outside the
+ * radius (min-corner squared distance > R^2), so worldgen_fill_chunk would write
+ * all MAT_AIR. Lets world_insert skip the slab + the fill for the 72% of a
+ * resident window that is empty space (it sets the chunk uniform-air instead).
+ * Pure integer, seed-independent (one fixed asteroid), and EXACTLY consistent
+ * with worldgen_fill_chunk's d2 > R2 test, so it never mis-tags a chunk that
+ * would have held a single solid voxel. */
+int  worldgen_chunk_all_air(int cx, int cy, int cz);
+
 #endif /* WORLDGEN_H */

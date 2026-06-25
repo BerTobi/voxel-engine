@@ -21,6 +21,10 @@ static void check(const char *n, int ok) { if (ok) printf("PASS: %s\n", n); else
 static void gen_cb(Chunk *c, int cx, int cy, int cz, uint64_t seed, void *u)
 { (void)u; worldgen_fill_chunk(c, cx, cy, cz, seed); }
 
+/* 0.5 M1: sphere all-air predicate so this test exercises sparse-air like the engine. */
+static int is_air_cb(int cx, int cy, int cz, uint64_t seed, void *u)
+{ (void)seed; (void)u; return worldgen_chunk_all_air(cx, cy, cz); }
+
 static Voxel mk(uint8_t m, uint8_t f)
 { Voxel v = 0; vox_set_mat(&v, m); vox_set_fill(&v, f); vox_set_temp_code(&v, temp_encode_c(20.0)); return v; }
 
@@ -37,6 +41,7 @@ int main(void)
 
     printf("=== chunk-delta sync tests ===\n");
     c.gen = gen_cb; c.mesh_upload = NULL; c.slot_free = NULL; c.user = NULL;
+    c.is_air = is_air_cb;   /* 0.5 M1: sparse-air (sphere predicate) */
     if (world_init(&HW, seed, &c) != 0 || world_init(&CW, seed, &c) != 0) {
         printf("FAIL: world_init\n"); return 2;
     }

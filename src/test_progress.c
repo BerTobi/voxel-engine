@@ -404,6 +404,8 @@ static uint16_t setup_copper_melt_world(SimState *s, Chunk *c)
     Voxel base = 0;
 
     memset(c, 0, sizeof *c);
+    c->voxels = calloc(CHUNK_VOXELS, sizeof(Voxel)); /* 0.5 M1: voxels is a pointer */
+    c->slab_idx = -1;
     vox_set_mat(&base, MAT_COPPER);
     vox_set_fill(&base, FLUID_FULL);
     vox_set_temp_code(&base, 60u);   /* ambient: temp_encode_c(20 C) == 60 */
@@ -467,7 +469,7 @@ static void test_readonly_invariance(void)
         events_seen += prog_observe_drain(&ps, &ring);
 
         if (identical_every_tick &&
-            memcmp(c_with.voxels, c_null.voxels, sizeof c_with.voxels) != 0) {
+            memcmp(c_with.voxels, c_null.voxels, CHUNK_VOXELS * sizeof(Voxel)) != 0) {
             identical_every_tick = 0;
             first_divergence_tick = t;
         }

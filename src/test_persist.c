@@ -119,6 +119,17 @@ static Voxel with_derived_noise(Voxel v, uint8_t light, uint8_t ao, uint8_t fl)
     return v;
 }
 
+/* 0.5 M1: Chunk.voxels is a pointer now, so a stack/scratch chunk needs a backing
+ * 16 KiB block. Hand each test chunk a fresh one (leak at exit is fine in a unit
+ * test). `poison` fills the block with 0xAB so a "real load must overwrite"
+ * assertion still holds; the chunk record itself is poisoned/zeroed by the caller. */
+static void chunk_back(Chunk *c, int poison)
+{
+    c->voxels   = (Voxel *)malloc((size_t)CHUNK_VOXELS * sizeof(Voxel));
+    c->slab_idx = -1;
+    memset(c->voxels, poison ? 0xAB : 0x00, (size_t)CHUNK_VOXELS * sizeof(Voxel));
+}
+
 /* Build a UNIFORM modified chunk: every voxel identical (one material, one
  * temp, one fill), with non-zero light/ao/flags noise sprinkled on so the
  * canonicalisation is exercised. This is the best-case compression target:
@@ -129,6 +140,7 @@ static void build_uniform_chunk(Chunk *c, int cx, int cy, int cz,
     Voxel base = 0;
     int i;
     memset(c, 0, sizeof *c);
+    chunk_back(c, 0);                   /* 0.5 M1: voxels is a pointer - back it */
     c->cx = cx; c->cy = cy; c->cz = cz;
     vox_set_mat(&base, mat);
     vox_set_temp_code(&base, temp_encode_c(temp_c));
@@ -154,6 +166,7 @@ static void build_mixed_chunk(Chunk *c, int cx, int cy, int cz)
     uint8_t ambient = temp_encode_c(20.0);
     int lx, ly, lz;
     memset(c, 0, sizeof *c);
+    chunk_back(c, 0);                   /* 0.5 M1: voxels is a pointer - back it */
     c->cx = cx; c->cy = cy; c->cz = cz;
 
     for (lz = 0; lz < CHUNK_DIM; ++lz) {
@@ -208,6 +221,7 @@ static void build_worst_case_chunk(Chunk *c, int cx, int cy, int cz)
 {
     int i;
     memset(c, 0, sizeof *c);
+    chunk_back(c, 0);                   /* 0.5 M1: voxels is a pointer - back it */
     c->cx = cx; c->cy = cy; c->cz = cz;
     for (i = 0; i < CHUNK_VOXELS; ++i) {
         Voxel v = 0;
@@ -308,7 +322,7 @@ static void test_roundtrip_modified(PersistStore *ps)
     }
 
     if (ok) {
-        memset(dst, 0xAB, sizeof *dst);     /* poison: a real load must overwrite */
+        memset(dst, 0xAB, sizeof *dst); chunk_back(dst, 1);     /* poison: a real load must overwrite */
         int hit = persist_load_chunk(ps, dst, 2, 1, 3);
         if (hit != 1) {
             ok = 0; snprintf(buf, sizeof buf, "load returned %d, expected 1 (HIT)", hit);
@@ -331,7 +345,7 @@ static void test_unmodified_miss(PersistStore *ps)
     if (dst == NULL) { report("unmodified coord load returns MISS", 0, "OOM"); return; }
 
     /* A coord we never saved (and far from any saved one). */
-    memset(dst, 0xAB, sizeof *dst);
+    memset(dst, 0xAB, sizeof *dst); chunk_back(dst, 1);
     int hit = persist_load_chunk(ps, dst, 9, 0, 9);
     if (hit != 0) { ok = 0; snprintf(buf, sizeof buf, "load returned %d, expected 0 (MISS)", hit); }
     report("unmodified coord load returns 0 (MISS)", ok, buf);
@@ -357,7 +371,7 @@ static void test_uniform_compresses(PersistStore *ps)
     }
 
     if (ok) {
-        memset(dst, 0xAB, sizeof *dst);
+        memset(dst, 0xAB, sizeof *dst); chunk_back(dst, 1);
         if (persist_load_chunk(ps, dst, -1, 0, -1) != 1) {
             ok = 0; snprintf(buf, sizeof buf, "uniform reload MISS");
         } else if (!chunks_equal_canon(src, dst, buf, sizeof buf)) {
@@ -425,7 +439,7 @@ static void test_multi_chunk_region(PersistStore *ps)
     for (i = 0; i < n && ok; ++i) {
         build_uniform_chunk(src, coords[i][0], coords[i][1], coords[i][2],
                             (uint8_t)(MAT_STONE + i), 20.0 + 30.0 * i, 15);
-        memset(dst, 0xAB, sizeof *dst);
+        memset(dst, 0xAB, sizeof *dst); chunk_back(dst, 1);
         if (persist_load_chunk(ps, dst, coords[i][0], coords[i][1], coords[i][2]) != 1) {
             ok = 0; snprintf(buf, sizeof buf, "coord %d reload MISS", i);
         } else if (!chunks_equal_canon(src, dst, buf, sizeof buf)) {
@@ -436,7 +450,7 @@ static void test_multi_chunk_region(PersistStore *ps)
 
     /* Case 5: a coord in region (0,0) we never saved -> MISS. */
     ok = 1; buf[0] = '\0';
-    memset(dst, 0xAB, sizeof *dst);
+    memset(dst, 0xAB, sizeof *dst); chunk_back(dst, 1);
     if (region_coord_x(20) != 0 || region_coord_z(20) != 0) {
         report("never-saved coord in a live region loads 0", 0, "(20,*,20) not in region 0,0");
     } else {
@@ -464,7 +478,7 @@ static void test_worst_case(PersistStore *ps)
         ok = 0; snprintf(buf, sizeof buf, "save failed");
     }
     if (ok) {
-        memset(dst, 0xAB, sizeof *dst);
+        memset(dst, 0xAB, sizeof *dst); chunk_back(dst, 1);
         if (persist_load_chunk(ps, dst, 10, 1, 10) != 1) {
             ok = 0; snprintf(buf, sizeof buf, "worst-case reload MISS");
         } else if (!chunks_equal_canon(src, dst, buf, sizeof buf)) {
@@ -525,7 +539,7 @@ static void test_restart_durability(void)
         if (ps2 == NULL) {
             ok = 0; snprintf(buf, sizeof buf, "persist_open(#2) failed");
         } else {
-            memset(dst, 0xAB, sizeof *dst);
+            memset(dst, 0xAB, sizeof *dst); chunk_back(dst, 1);
             if (persist_load_chunk(ps2, dst, 7, 1, 4) != 1) {
                 ok = 0; snprintf(buf, sizeof buf, "reopened store: chunk MISS (lost on restart)");
             } else if (!chunks_equal_canon(src, dst, buf, sizeof buf)) {
@@ -602,7 +616,7 @@ static void test_nested_parent_mkdir(void)
         ok = 0; snprintf(buf, sizeof buf, "save into nested dir failed");
     }
     if (ok) {
-        memset(dst, 0xAB, sizeof *dst);
+        memset(dst, 0xAB, sizeof *dst); chunk_back(dst, 1);
         if (persist_load_chunk(ps, dst, 0, 0, 0) != 1) {
             ok = 0; snprintf(buf, sizeof buf, "reload MISS from nested dir");
         } else if (!chunks_equal_canon(src, dst, buf, sizeof buf)) {

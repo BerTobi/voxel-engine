@@ -9,9 +9,15 @@ int chunksync_serve(int cx, int cy, int cz, unsigned char *out, int cap, void *u
 {
     ChunkSyncCtx *cs = (ChunkSyncCtx *)user;
     static Chunk cur, seedc;            /* large; single-threaded engine -> static ok */
+    /* 0.5 M1: voxels is no longer inline - give these scratch chunks static backing
+     * blocks (slab_idx = -1 marks them standalone-owned, never freed). */
+    static Voxel cur_blk[CHUNK_VOXELS], seed_blk[CHUNK_VOXELS];
     const Chunk *src = NULL;
     Chunk *resident;
     int idx, count = 0, pos;
+
+    cur.voxels = cur_blk;     cur.slab_idx   = -1;
+    seedc.voxels = seed_blk;  seedc.slab_idx = -1;
 
     resident = world_get(cs->world, cx, cy, cz);
     if (resident != NULL)
@@ -29,7 +35,7 @@ int chunksync_serve(int cx, int cy, int cz, unsigned char *out, int cap, void *u
     if (src != NULL) {
         worldgen_fill_chunk(&seedc, cx, cy, cz, cs->seed);
         for (idx = 0; idx < CHUNK_VOXELS; ++idx) {
-            Voxel a = persist_canon(src->voxels[idx]);
+            Voxel a = persist_canon(chunk_vox(src, idx));   /* src may be uniform-air */
             if (a != persist_canon(seedc.voxels[idx])) {
                 if (pos + 6 > cap) break;            /* never overflow the buffer */
                 out[pos++] = (unsigned char)idx;       out[pos++] = (unsigned char)(idx >> 8);

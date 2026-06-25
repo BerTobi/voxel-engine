@@ -49,6 +49,18 @@ behind the `make check` gate; see `PLAN-0.5.md`.
   -voxel planet). No water yet — this milestone verifies the 256 m sphere is walkable. New
   `test_grain` float-precision sweep; both targets `-Wall -Wextra` clean; ASan-clean over a
   fly-across-the-pole + CA session.
+- _(M3)_ **Finite flowing water — the binary-fill CA (the headline).** Replaces the
+  partial-fill liquid model (which the prototypes proved can never settle) with **binary
+  occupancy**: water is fill `{0,15}` and a whole voxel falls along the chunk's **radial
+  "down"** (cached per-chunk toward the planet centre) and flows-to-descent laterally, so it
+  **settles** (terraced) and **conserves** exactly. A **spring** (`MAT_WATER` + `sim_set_spring`)
+  is the one inexhaustible source; the demo gains a pole-side water spring that pools in a
+  carved pocket. Rides the 0.4 heat CA's active-front + READ/COMMIT seam (single-chunk;
+  cross-chunk flow is M4). The partial-fill head field + connected-body finisher are kept
+  compiled but **gated off** (M4 replaces the finisher with a radial shell-snap and re-enables
+  it). New `test_water` (settle/conserve, radial-from-all-6-faces, spring, bounded dam-break,
+  heat+water coexistence, determinism); the old partial-fill `test_sim` fluid cases are adapted
+  to the binary invariants. Both targets clean; ASan-clean over a forge+water fly session.
 
 ## 0.4.0 — 2026-06-24 — The World Comes Alive
 

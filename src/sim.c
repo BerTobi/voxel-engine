@@ -434,6 +434,13 @@ int sim_set_spring(SimState *s, uint16_t li, uint8_t hold_code)
     return set_source_impl(s, li, hold_code, 1);
 }
 
+/* 0.5 M3: set the radial-down SIM_NEIGH face for this chunk's binary water flow. */
+void sim_set_down_face(SimState *s, int face)
+{
+    if (s != NULL && face >= 0 && face < 6)
+        s->fluid_down = (int8_t)face;
+}
+
 /* The progression event-sink setter sim_set_progress_sink() is provided as a
  * `static inline` in sim.h (a single guarded assignment), so no sim.c definition
  * is required. The sim.c-side progression work is the READ-ONLY emit hooks inside
@@ -724,8 +731,6 @@ static inline void moved_set(SimState *s, int li)
  * on each of X and Z; odd tick offers -axis first. Fully reproducible from the
  * tick parity (no RNG) - the design's "seed is tick_index" with a deterministic
  * permutation. */
-static const int FLUID_LAT_EVEN[4] = { 0, 1, 4, 5 };  /* +X -X +Z -Z */
-static const int FLUID_LAT_ODD [4] = { 1, 0, 5, 4 };  /* -X +X -Z +Z */
 
 /* ===================================================================== *
  * Communicating vessels: HEAD field + PRESSURE LIFT + connected-body FINISHER
@@ -741,23 +746,6 @@ static inline int surf_of(const SimState *s, int lx, int ly, int lz)
 {
     return ly * (int)FLUID_FULL +
            (int)vox_fill(s->chunk->voxels[vox_index(lx, ly, lz)]);
-}
-
-/* Topmost surface of material `mat` in column (lx,lz): scan from the chunk top
- * down for the first cell of THAT material carrying fill, return its surf_of. 0 if
- * the column has no such cell. Material-SPECIFIC: a held-lava lid resting on a
- * water column must NOT report the lava surface to water's head / sleep guard
- * (that suppressed the water cell's legitimate rise). Bounded by CHUNK_DIM. */
-static int col_surf(const SimState *s, int lx, int lz, uint8_t mat)
-{
-    const Voxel *vox = s->chunk->voxels;
-    int ly;
-    for (ly = CHUNK_DIM - 1; ly >= 0; --ly) {
-        int li = vox_index(lx, ly, lz);
-        if (vox_mat(vox[li]) == mat && vox_fill(vox[li]) > 0)
-            return ly * (int)FLUID_FULL + (int)vox_fill(vox[li]);
-    }
-    return 0;
 }
 
 /* A liquid cell whose cell directly above (+Y) is NOT covered by liquid (air,
@@ -849,79 +837,53 @@ static void head_relax(SimState *s)
     }
 }
 
-/* True if local index li is a PHASE_LIQUID voxel that is NOT settled, i.e. it
- * can still flow this milestone: either it can fall (cell below is AIR, or the
- * same material with room), OR a same-material horizontal neighbour is more than
- * one fill level away. Reads ONLY fill + neighbour fill + MaterialDef.phase -
- * never the temperature buffer - so it is safe to consult from the heat-sleep
- * guard without perturbing heat determinism. Out-of-chunk neighbours are a
- * closed wall (single-chunk scope: cross-chunk fluid flow is DEFERRED). */
+/* 0.5 M3: true iff li is a PHASE_LIQUID voxel that can still FLOW under the binary
+ * rule - i.e. fluid_step would move it this tick. It MIRRORS fluid_step exactly so
+ * the sleep guard and the flow agree on the fixed point: a voxel that can neither
+ * fall (radial-down neighbour is air) nor flow-to-descent (a lateral air whose own
+ * down is air) is settled and sleeps. Reads ONLY material + neighbour material via
+ * s->fluid_down - never the temperature buffer - so the heat-sleep guard may consult
+ * it without perturbing heat determinism. Out-of-chunk faces are a closed wall
+ * (single-chunk M3; cross-chunk flow is M4). A held lava source never flows but is
+ * kept awake by the heat machinery regardless, so it needs no special case here. */
 int sim_liquid_unsettled(const SimState *s, uint16_t li)
 {
     const Voxel *vox = s->chunk->voxels;
     uint8_t mat = vox_mat(vox[li]);
-    int lx, ly, lz, f, n;
+    int lx, ly, lz, down, down_axis, n;
 
     if (material_get(mat)->phase != PHASE_LIQUID)
         return 0;
-
-    f = vox_fill(vox[li]);
-    if (f == 0)
+    if (vox_fill(vox[li]) == 0)
         return 1;                       /* drained: the pass must revert it to air */
 
-    lx = li & 0x0F;
-    ly = (li >> 4) & 0x0F;
-    lz = (li >> 8) & 0x0F;
+    lx = li & 0x0F; ly = (li >> 4) & 0x0F; lz = (li >> 8) & 0x0F;
+    down = s->fluid_down;
+    down_axis = down >> 1;
 
-    /* Can it fall? Below is AIR, or same material with room. */
-    if (ly - 1 >= 0) {
-        int bli = vox_index(lx, ly - 1, lz);
-        uint8_t bmat = vox_mat(vox[bli]);
-        if (bmat == MAT_AIR)
-            return 1;
-        if (bmat == mat && vox_fill(vox[bli]) < 15)
+    /* (a) can it FALL? radial-down neighbour (in-chunk) is air. */
+    {
+        int nx = lx + SIM_NEIGH[down][0], ny = ly + SIM_NEIGH[down][1], nz = lz + SIM_NEIGH[down][2];
+        if (nx >= 0 && nx < CHUNK_DIM && ny >= 0 && ny < CHUNK_DIM && nz >= 0 && nz < CHUNK_DIM &&
+            vox_mat(vox[vox_index(nx, ny, nz)]) == MAT_AIR)
             return 1;
     }
-
-    /* Any same-material horizontal neighbour more than one level away (a gap a
-     * lateral transfer would act on)? Air at a lower level also counts: an air
-     * neighbour can receive if f >= 2 (gap to its implicit 0 fill is >= 2). */
+    /* (b) can it FLOW-TO-DESCENT? a lateral air neighbour whose own down is air. */
     for (n = 0; n < 6; ++n) {
-        int nx, ny, nz, nli;
-        uint8_t nmat;
-        int nf;
-        if (SIM_NEIGH[n][1] != 0)
-            continue;                   /* horizontal faces only */
-        nx = lx + SIM_NEIGH[n][0];
-        ny = ly + SIM_NEIGH[n][1];
-        nz = lz + SIM_NEIGH[n][2];
-        if (nx < 0 || nx >= CHUNK_DIM ||
-            ny < 0 || ny >= CHUNK_DIM ||
-            nz < 0 || nz >= CHUNK_DIM)
-            continue;                   /* closed chunk wall */
-        nli  = vox_index(nx, ny, nz);
-        nmat = vox_mat(vox[nli]);
-        if (nmat == MAT_AIR)
-            nf = 0;
-        else if (nmat == mat)
-            nf = vox_fill(vox[nli]);
-        else
-            continue;                   /* different material blocks (no mixing) */
-        if (f - nf >= 2)
-            return 1;                   /* a gap the lateral rule would act on */
+        int nx, ny, nz, dx, dy, dz;
+        if ((n >> 1) == down_axis)
+            continue;                   /* lateral faces only */
+        nx = lx + SIM_NEIGH[n][0]; ny = ly + SIM_NEIGH[n][1]; nz = lz + SIM_NEIGH[n][2];
+        if (nx < 0 || nx >= CHUNK_DIM || ny < 0 || ny >= CHUNK_DIM || nz < 0 || nz >= CHUNK_DIM)
+            continue;
+        if (vox_mat(vox[vox_index(nx, ny, nz)]) != MAT_AIR)
+            continue;
+        dx = nx + SIM_NEIGH[down][0]; dy = ny + SIM_NEIGH[down][1]; dz = nz + SIM_NEIGH[down][2];
+        if (dx < 0 || dx >= CHUNK_DIM || dy < 0 || dy >= CHUNK_DIM || dz < 0 || dz >= CHUNK_DIM)
+            continue;
+        if (vox_mat(vox[vox_index(dx, dy, dz)]) == MAT_AIR)
+            return 1;
     }
-
-    /* Communicating vessels - the body is NOT yet level. head[li] is the max free
-     * surface of this cell's connected body; if it exceeds this column's own surface
-     * by more than FLUID_UP_MARGIN (a full cell), a taller surface is connected
-     * elsewhere (a second tank still below a full first tank joined by a bottom
-     * channel), so keep this cell AWAKE - that lets the body stay active until the
-     * connected-body finisher snaps it level. Once level (head within a cell of the
-     * column's own surface) the predicate fails and the pool sleeps. A flat or
-     * within-1 pond has head <= col_surf + a cell, so this never wakes it - the
-     * "still pond costs nothing" property is preserved. */
-    if (s->head[li] > col_surf(s, lx, lz, mat) + (int)FLUID_UP_MARGIN)
-        return 1;
     return 0;
 }
 
@@ -952,250 +914,95 @@ static void fluid_revert_to_air(SimState *s, int li)
     s->head[li] = 0;                    /* air carries no head */
 }
 
-/* One fluid step on local index li (a PHASE_LIQUID voxel). `is_source` is true
- * for a held Dirichlet liquid source: it may DONATE fill (it floods outward) but
- * is never drained-to-air and is re-filled to 15 next tick, so this step does
- * not revert it even if it momentarily reads low.
- *
- * Returns 1 if any fill or material id changed (so the caller flips dirty_mesh),
- * 0 otherwise. Conserves fill: every unit removed from `here` is added to
- * exactly one neighbour (and air recipients are materialised to `mat`).
- *
- * Order (fluid design FLOW ALGORITHM): (a) gravity/down first - drain as much as
- * the lower cell can hold, never viscosity-gated, so a column drains before it
- * spreads; (b) lateral equalisation of only the fill that could not fall, gated
- * by the viscosity step budget + the every-Nth-tick cadence, moving at most
- * floor(gap/2) per neighbour and requiring gap>=2 (the anti-oscillation gate).
- * The cell below / each recipient is woken and marked moved. */
+/* 0.5 M3: in-chunk neighbour of (lx,ly,lz) across SIM_NEIGH face `face`. Returns
+ * 1 + the local index in *out; 0 if the neighbour leaves the chunk (a CLOSED WALL
+ * in the single-chunk M3 scope - cross-chunk fluid flow is M4). */
+static int fluid_neigh(int lx, int ly, int lz, int face, int *out)
+{
+    int nx = lx + SIM_NEIGH[face][0];
+    int ny = ly + SIM_NEIGH[face][1];
+    int nz = lz + SIM_NEIGH[face][2];
+    if (nx < 0 || nx > 15 || ny < 0 || ny > 15 || nz < 0 || nz > 15)
+        return 0;
+    *out = vox_index(nx, ny, nz);
+    return 1;
+}
+
+/* Move (or, for a spring, DONATE) a whole binary-water voxel from `li` into the AIR
+ * cell `dst`: dst becomes water (fill=15, VF_LIQUID); the source empties to air
+ * UNLESS it is a spring (which keeps its cell and is re-filled in PHASE 2). Both
+ * endpoints are marked moved (so neither re-acts this tick) and their rings woken. */
+static void fluid_move_water(SimState *s, int li, int dst, uint8_t mat, int is_spring)
+{
+    /* CARRY the source's fill so the move CONSERVES exactly (binary water is fill=15,
+     * so this is 15 -> 15; carrying also conserves any stray partial-fill voxel). A
+     * SPRING instead EMITS a full voxel (fill=15) and keeps its own cell (re-filled
+     * in PHASE 2), so it is an inexhaustible source by design. */
+    int carry = is_spring ? (int)FLUID_FULL : (int)vox_fill(s->chunk->voxels[li]);
+    fluid_occupy_air(s, dst, mat, carry);
+    moved_set(s, dst);
+    wake_ring(s, dst);
+    moved_set(s, li);
+    if (!is_spring) {
+        fluid_revert_to_air(s, li);
+        wake_ring(s, li);
+    }
+}
+
+/* One BINARY fluid step on PHASE_LIQUID voxel li (0.5 M3, replacing the partial-fill
+ * lateral-equalise model). Water is fill {0,15} and moves as a WHOLE voxel, per the
+ * validated 3-D prototype (scratchpad/water_ca_proto.c):
+ *   (a) GRAVITY - if the radial-DOWN neighbour (s->fluid_down face) is air, fall.
+ *   (b) FLOW-TO-DESCENT - else move into an air LATERAL neighbour (a face not on the
+ *       down axis) from which water could then fall (its own down-neighbour is air).
+ * Binary fill removes the partial-fill gradient the prototypes proved cannot settle,
+ * so this is a terminating occupancy spread: a voxel that can neither fall nor
+ * flow-to-descent does NOT move and sleeps (sim_liquid_unsettled mirrors the test
+ * exactly). Conserves water (occupy + revert is net-zero); a SPRING donates a voxel
+ * without emptying. Single-chunk: out-of-chunk faces are a closed wall (M4 opens
+ * them). A non-spring held source (lava, MAT_EMISSIVE) holds HEAT in place and does
+ * not flow. Returns 1 if the voxel grid changed. */
 static int fluid_step(SimState *s, int li, int is_source, int is_spring)
 {
     Voxel *vox = s->chunk->voxels;
     uint8_t mat = vox_mat(vox[li]);
-    const MaterialDef *md = material_get(mat);
-    int lx = li & 0x0F;
-    int ly = (li >> 4) & 0x0F;
-    int lz = (li >> 8) & 0x0F;
-    int f  = vox_fill(vox[li]);
-    int changed = 0;
-    const int *order;
-    int oi;
-    int step_remaining;
+    int lx = li & 0x0F, ly = (li >> 4) & 0x0F, lz = (li >> 8) & 0x0F;
+    int down = s->fluid_down;
+    int down_axis = down >> 1;
+    int dn, oi, n, nlat = 0, rot;
+    int lat[4];
 
-    if (f <= 0)
-        return 0;                       /* nothing to move (sources re-fill later) */
-
-    /* A NON-SPRING held source conserves its fill IN PLACE - it must not donate.
-     * Such a voxel (a plain held source, or any MAT_EMISSIVE lava, which is held
-     * by flag and is NOT a spring) holds HEAT only (the held/spring DECOUPLE).
-     * If it were allowed to donate, it would drain to fill=0 and then: the
-     * revert-to-air below is skipped for sources, PHASE 2 refills only SPRINGS,
-     * and the sleep guard never sleeps a held source - leaving a permanent fill=0
-     * "phantom" that the mesher still draws as a glowing cube and that keeps
-     * waking neighbours (act.count grows without bound; an uncontained pool can
-     * flood the whole chunk). Only springs (sim_set_spring) flow + refill. */
+    if (vox_fill(vox[li]) == 0)
+        return 0;                       /* drained: nothing to move */
     if (is_source && !is_spring)
-        return 0;
+        return 0;                       /* lava / plain held source: conserve in place */
 
-    /* ---- (a) GRAVITY / DOWNWARD (never viscosity-gated) -------------------- */
-    if (ly - 1 >= 0) {
-        int bli = vox_index(lx, ly - 1, lz);
-        uint8_t bmat = vox_mat(vox[bli]);
-        int valid = 0, fill_below = 0;
-        if (bmat == MAT_AIR) {
-            valid = 1; fill_below = 0;
-        } else if (bmat == mat) {
-            fill_below = vox_fill(vox[bli]);
-            if (fill_below < 15)
-                valid = 1;
-        }
-        /* Different liquid (or solid) below blocks downward: liquids do not mix. */
-        if (valid) {
-            int room_below = 15 - fill_below;
-            int give = (f < room_below) ? f : room_below;
-            if (give > 0) {
-                if (bmat == MAT_AIR)
-                    fluid_occupy_air(s, bli, mat, fill_below + give);
-                else
-                    vox_set_fill(&vox[bli], (uint8_t)(fill_below + give));
-                f -= give;
-                changed = 1;
-                moved_set(s, bli);
-                wake_ring(s, bli);
-            }
-        }
+    /* (a) GRAVITY: fall along the radial-down face into air. */
+    if (fluid_neigh(lx, ly, lz, down, &dn) &&
+        vox_mat(vox[dn]) == MAT_AIR && !moved_test(s, dn)) {
+        fluid_move_water(s, li, dn, mat, is_spring);
+        return 1;
     }
 
-    /* If this cell fully drained downward, revert it to air (unless it is a held
-     * source, which is re-filled to 15 next tick and must persist). */
-    if (f == 0) {
-        vox_set_fill(&vox[li], 0);
-        if (!is_source) {
-            fluid_revert_to_air(s, li);
-            wake_ring(s, li);
-        }
-        moved_set(s, li);
-        return 1;                       /* material/fill changed */
+    /* (b) FLOW-TO-DESCENT: into an air lateral neighbour that can itself fall.
+     * Laterals = the 4 faces NOT on the down axis; rotate the visit start by tick
+     * parity for bias-free determinism. */
+    for (n = 0; n < 6; ++n)
+        if ((n >> 1) != down_axis)
+            lat[nlat++] = n;            /* nlat == 4 */
+    rot = (s->tick_index & 1u) ? 2 : 0;
+    for (oi = 0; oi < 4; ++oi) {
+        int face = lat[(oi + rot) & 3];
+        int ln, lnd, nlx, nly, nlz;
+        if (!fluid_neigh(lx, ly, lz, face, &ln))      continue;
+        if (vox_mat(vox[ln]) != MAT_AIR || moved_test(s, ln)) continue;
+        nlx = ln & 0x0F; nly = (ln >> 4) & 0x0F; nlz = (ln >> 8) & 0x0F;
+        if (!fluid_neigh(nlx, nly, nlz, down, &lnd))  continue;   /* its down */
+        if (vox_mat(vox[lnd]) != MAT_AIR)             continue;   /* can't descend */
+        fluid_move_water(s, li, ln, mat, is_spring);
+        return 1;
     }
-
-    /* ---- (b) LATERAL EQUALISATION (only the fill that could not fall) ------
-     * Local-mean redistribution: pour from `here` (the local high) into its
-     * strictly-LOWER eligible horizontal neighbours so the acting cell and the
-     * cells it pours into all move toward their shared mean. Pouring only DOWNHILL
-     * keeps the step monotone (a cell never steals from a higher neighbour that
-     * will itself act later in the sweep), so the discrete system is monotone-
-     * decreasing in the max-min spread and CANNOT oscillate; over ticks the local
-     * means propagate outward and the pool reaches a GLOBALLY level state (every
-     * occupied cell within 1 of every other). The shared-mean target avoids the
-     * staircase a pure pairwise gap/2 freezes into (adjacent 1-level steps that a
-     * gap>=2 rule treats as already settled). Conserves exactly: the fill poured
-     * out of `here` equals the fill added to the recipients.
-     *
-     * Viscosity gates this and ONLY this (gravity above ignored both): the cadence
-     * gate skips non-acting ticks for a viscous melt, and step_remaining caps the
-     * total levels poured sideways this tick (water: 15 ~ unbounded -> levels the
-     * neighbourhood in one tick; viscous: 1 -> bleeds a single level per acting
-     * tick). sim_visc_period(mat) is the float-free power-of-two period (1=water).*/
-    if ((s->tick_index & (uint64_t)(sim_visc_period(mat) - 1u)) != 0) {
-        /* Not this cell's lateral cadence tick: write back the (gravity-reduced)
-         * fill and stop. A held source still wrote its donation downward above. */
-        if ((int)vox_fill(vox[li]) != f) {
-            vox_set_fill(&vox[li], (uint8_t)f);
-            changed = 1;
-        }
-        if (changed) { moved_set(s, li); wake_ring(s, li); }
-        return changed;
-    }
-
-    step_remaining = visc_step_budget(md->viscosity);
-    order = (s->tick_index & 1u) ? FLUID_LAT_ODD : FLUID_LAT_EVEN;
-
-    {
-        /* Gather strictly-lower eligible horizontal neighbours (AIR=0 or same
-         * material) in the parity-fixed order, and pour toward the shared mean. */
-        int nbr_li[4], nbr_f[4], nbr_air[4], nbr_n = 0;
-        int total, mean, j;
-
-        for (oi = 0; oi < 4; ++oi) {
-            int n  = order[oi];
-            int nx = lx + SIM_NEIGH[n][0];
-            int ny = ly + SIM_NEIGH[n][1];
-            int nz = lz + SIM_NEIGH[n][2];
-            int nli;
-            uint8_t nmat;
-            int nf;
-
-            if (nx < 0 || nx >= CHUNK_DIM ||
-                ny < 0 || ny >= CHUNK_DIM ||
-                nz < 0 || nz >= CHUNK_DIM)
-                continue;               /* closed chunk wall (cross-chunk deferred) */
-
-            nli  = vox_index(nx, ny, nz);
-            if (moved_test(s, nli))
-                continue;               /* already touched this tick: no double-move */
-            nmat = vox_mat(vox[nli]);
-            if (nmat == MAT_AIR) {
-                nf = 0;
-            } else if (nmat == mat) {
-                nf = vox_fill(vox[nli]);
-            } else {
-                continue;               /* different material blocks (no mixing) */
-            }
-            if (f - nf < (int)FLUID_SETTLE_GAP)
-                continue;               /* within 1: settled w.r.t. this neighbour */
-
-            nbr_li[nbr_n]  = nli;
-            nbr_f[nbr_n]   = nf;
-            nbr_air[nbr_n] = (nmat == MAT_AIR);
-            ++nbr_n;
-        }
-
-        /* Pour toward the mean of {here} U {chosen lower neighbours}. Each
-         * recipient j receives up to (mean - nbr_f[j]) levels (>= 1 since it was
-         * strictly more than 1 below), capped by the remaining step budget and by
-         * what `here` still holds. Process in the parity order so the remainder
-         * (mean rounding) is distributed deterministically. */
-        total = f;
-        for (j = 0; j < nbr_n; ++j)
-            total += nbr_f[j];
-        mean = total / (nbr_n + 1);     /* floor mean; `here` keeps the remainder */
-
-        for (j = 0; j < nbr_n && step_remaining > 0 && f >= (int)FLUID_SETTLE_GAP; ++j) {
-            int want = mean - nbr_f[j];          /* levels to bring nbr up to mean */
-            int xfer;
-            if (want <= 0)
-                continue;                        /* already at/above the mean */
-            xfer = want;
-            if (xfer > step_remaining) xfer = step_remaining;
-            /* `here` floors at the mean (it never pours below the shared mean, so
-             * a pair is never inverted: monotone, no oscillation), and never
-             * donates more than it holds. */
-            if (xfer > f - mean)       xfer = f - mean;
-            if (xfer > f)              xfer = f;
-            if (xfer <= 0)
-                continue;
-
-            if (nbr_air[j])
-                fluid_occupy_air(s, nbr_li[j], mat, nbr_f[j] + xfer);
-            else
-                vox_set_fill(&s->chunk->voxels[nbr_li[j]],
-                             (uint8_t)(nbr_f[j] + xfer));
-            f -= xfer;
-            step_remaining -= xfer;
-            changed = 1;
-            moved_set(s, nbr_li[j]);
-            wake_ring(s, nbr_li[j]);
-        }
-
-        /* PEAK DRAIN: the floor-mean step above cannot drain a local PEAK - a
-         * cell whose strictly-lower neighbours all sit AT the rounded-down mean,
-         * so `want` is 0 for each and nothing moves, yet `here` is still >= 2
-         * above them (e.g. fill L+2 ringed by L: mean = floor((L+2+4L)/5) = L).
-         * Left alone that freezes a 2-level step and, being sim_liquid_unsettled,
-         * never sleeps (perpetual churn - confirmed in a 2-D basin). Shed the
-         * residual ONE level at a time to the LOWEST still-eligible neighbour:
-         * this strictly shrinks the max gap toward the within-1 level fixed point
-         * (here only ever drops to one ABOVE the recipient, so no pair inverts and
-         * the spread is monotone-decreasing -> no oscillation), and once every gap
-         * is <= 1 nothing is unsettled and the pool sleeps. Re-reads current fills
-         * (the mean loop may have raised some); parity order makes ties
-         * deterministic. */
-        while (step_remaining > 0) {
-            int bj = -1, bf = 16, k;
-            for (k = 0; k < nbr_n; ++k) {
-                int cf = (int)vox_fill(s->chunk->voxels[nbr_li[k]]);
-                if (f - cf >= (int)FLUID_SETTLE_GAP && cf < bf) { bj = k; bf = cf; }
-            }
-            if (bj < 0)
-                break;                  /* no neighbour >= 2 below: level, done */
-            if (vox_mat(s->chunk->voxels[nbr_li[bj]]) == MAT_AIR)
-                fluid_occupy_air(s, nbr_li[bj], mat, bf + 1);
-            else
-                vox_set_fill(&s->chunk->voxels[nbr_li[bj]], (uint8_t)(bf + 1));
-            f -= 1;
-            step_remaining -= 1;
-            changed = 1;
-            moved_set(s, nbr_li[bj]);
-            wake_ring(s, nbr_li[bj]);
-        }
-    }
-
-    /* Write back the residual fill for `here`. (f > 0 here: if it had reached 0
-     * the gravity branch already reverted and returned.) */
-    if ((int)vox_fill(vox[li]) != f) {
-        vox_set_fill(&vox[li], (uint8_t)f);
-        changed = 1;
-    }
-    if (changed) {
-        moved_set(s, li);
-        /* Wake the DONOR's ring too (not just each recipient's): pouring out of
-         * `here` lowers it, which can make an UPHILL neighbour newly unsettled.
-         * Without this the neighbour is never re-activated, the settling cascade
-         * dies, and the body freezes in a multi-level STAIRCASE instead of
-         * reaching the "within 1 of every other" level state this rule targets.
-         * A flat pond produces no change -> no wake -> still sleeps (cost-free). */
-        wake_ring(s, li);
-    }
-    return changed;
+    return 0;                           /* settled this tick (can't fall or flow) */
 }
 
 /* ===================================================================== *
@@ -1479,6 +1286,8 @@ int sim_init(SimState *s, Chunk *c)
     s->fluid_ring_pos  = 0;
     s->fluid_cyc_seen  = 0;
     s->fluid_n_fired   = 0;
+    s->fluid_down       = 3;   /* 0.5 M3: -Y default (flat gravity for tests/proto) */
+    s->fluid_finisher_on = 0;  /* 0.5 M3: terraced binary flow; M4 enables the snap */
 
     /* Seed the authoritative full-resolution temperature heat[] from every
      * voxel's stored 8-bit code (ARCHITECTURE 3.4 mitigation). heat[] is kept
@@ -1976,7 +1785,12 @@ void sim_tick_ex(SimState *s, int phases, SimNeighFn nfn, SimWakeFn wfn, void *u
          * tank still below a taller first tank joined by a bottom channel) until the
          * finisher levels it. The local gravity+lateral rule cannot raise a column
          * against gravity; the connected-body finisher (below) does, as a snap. */
-        if (has_free_liquid)
+        /* 0.5 M3: the head field + connected-body finisher are PARTIAL-FILL,
+         * world-Y machinery. The binary flow rule settles on its own (terraced),
+         * so they are OFF here (fluid_finisher_on==0). M4 replaces run_finisher
+         * with a RADIAL shell-snap and turns this on. Kept compiled + referenced
+         * (so no -Wunused) but not exercised in M3. */
+        if (s->fluid_finisher_on && has_free_liquid)
             head_relax(s);
 
         for (i = 0; i < fluid_count; ++i) {
@@ -2006,8 +1820,10 @@ void sim_tick_ex(SimState *s, int phases, SimNeighFn nfn, SimWakeFn wfn, void *u
          * stable head field keeps the body awake long enough to confirm the stall.
          * Guard on the post-snap hash so we never re-fire an equilibrium already
          * levelled (O(1) fires per disturbance). Gated on has_free_liquid: a still
-         * pond or a lava-only chunk never hashes, so it costs nothing there. */
-        if (has_free_liquid) {
+         * pond or a lava-only chunk never hashes, so it costs nothing there.
+         * 0.5 M3: OFF (fluid_finisher_on==0) - binary flow needs no finisher to
+         * settle (terraced). M4 radializes run_finisher + enables this. */
+        if (s->fluid_finisher_on && has_free_liquid) {
             uint64_t hh = fluid_fill_hash(s);
             int in_cycle = 0, j;
             for (j = 0; j < (int)s->fluid_ring_fill; ++j)

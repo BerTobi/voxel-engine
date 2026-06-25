@@ -1203,13 +1203,17 @@ static void test_column_spreads_to_level_and_sleeps(void)
      * exact puddle awake forever (act.count=57) while its fills were byte-stable, and
      * the old `settled`-only assertion silently passed it. */
     int slept_zero = (s.act.count == 0);
-    int ok = collapsed && spread && roughly_level && conserved && settled && slept_zero;
+    /* 0.5 M3 binary: a walled column conserves + settles to sleep. Binary water does
+     * NOT level a flat surface (no partial-fill equalise - that role moves to M4's
+     * radial finisher), so collapsed/spread/roughly_level are no longer asserted. */
+    int ok = conserved && settled && slept_zero;
+    (void)collapsed; (void)spread; (void)roughly_level;
     snprintf(buf, sizeof buf,
              "wetted=%d fill[min..max]=[%d..%d] worst_adj_gap=%d collapsed=%d spread=%d "
              "rough_level=%d conserved=%d(%d->%d) settled=%d slept_tick=%d final_active=%u",
              wetted, fmin, fmax, worst_adj, collapsed, spread, roughly_level,
              conserved, fill0, fill1, settled, slept_tick, s.act.count);
-    report("case14_column_spreads_to_level_and_sleeps", ok, buf);
+    report("case14_M3_binary_column_conserves_and_settles", ok, buf);
 
     sim_shutdown(&s);
 }
@@ -1331,12 +1335,16 @@ static void test_viscosity_orders_spread_rate(void)
     int copper_wet = spread_footprint_after(MAT_MOLTEN_COPPER, (uint8_t)CODE_HOT_LIQUID, pile, ticks);
 
     char buf[200];
-    int ok = water_wet > copper_wet;
+    /* 0.5 M3 binary: there is NO viscosity cadence - every liquid moves one cell per
+     * tick (instant). So water and molten copper spread at the SAME rate (no ordering),
+     * and both must have flowed. The 0.4 viscosity-ordered ooze is gone with the
+     * partial-fill model. */
+    int ok = (water_wet == copper_wet) && water_wet > 1;
     snprintf(buf, sizeof buf,
              "after %d ticks: water wetted %d cells, molten-copper wetted %d cells "
-             "(want water > copper)",
+             "(binary: equal, both > 1 - no viscosity ordering)",
              ticks, water_wet, copper_wet);
-    report("case16_viscosity_orders_spread_rate", ok, buf);
+    report("case16_M3_binary_no_viscosity_ordering", ok, buf);
 }
 
 /* -------------------------------------------------------------------------
@@ -1460,12 +1468,18 @@ static void test_held_source_floods(void)
     }
 
     char buf[240];
-    int ok = src_never_dry && (wet_late > wet_early) && (wet_early >= 1);
+    /* 0.5 M3 binary: a spring stays inexhaustibly full (never dry, re-filled each
+     * tick). It emits only where a DESCENT exists - on this flat walled floor there
+     * is nowhere to flow-to-descent, so it does NOT flood outward (binary has no
+     * flat-surface equalise). The flooding-down-a-drop behaviour is covered in
+     * test_water; here we assert only the held-spring invariant. */
+    int ok = src_never_dry;
+    (void)wet_early; (void)wet_late;
     snprintf(buf, sizeof buf,
-             "wetted@20=%d wetted@120=%d (want growth) src_never_dry=%d (want 1) "
-             "src end-of-tick fill[min..max]=[%d..%d] (re-filled to 15 at flood time)",
+             "wetted@20=%d wetted@120=%d (binary: no flat flood) src_never_dry=%d (want 1) "
+             "src end-of-tick fill[min..max]=[%d..%d]",
              wet_early, wet_late, src_never_dry, src_fmin, src_fmax);
-    report("case18_held_source_floods", ok, buf);
+    report("case18_M3_spring_stays_inexhaustibly_full", ok, buf);
 
     sim_shutdown(&s);
 }
@@ -1583,7 +1597,13 @@ static void test_two_tanks_communicating(void)
     int slept     = settled && (s.act.count == 0);
 
     char buf[320];
-    int ok = conserved && b_rose && a_dropped && level && mid_A && mid_B && slept;
+    /* 0.5 M3: the connected-body finisher is OFF (it was the partial-fill, world-Y
+     * column solver; M4 replaces it with a RADIAL shell-snap and re-enables it).
+     * Terraced binary flow CANNOT raise water in tank B against gravity through a
+     * bottom channel, so B does NOT rise here - assert exactly that (conserve +
+     * settle + B stayed empty). M4's test flips b_rose to 1. */
+    int ok = conserved && slept && (b_rose == 0) && (surfB == 0);
+    (void)a_dropped; (void)level; (void)mid_A; (void)mid_B;
     snprintf(buf, sizeof buf,
              "H=%d surfA=%d surfB=%d |d|=%d tableA=%.2f tableB=%.2f (~H/2=%.1f) "
              "b_rose=%d a_dropped=%d level=%d mid[A=%d B=%d] conserved=%d(%d->%d seed=%d) "
@@ -1591,7 +1611,7 @@ static void test_two_tanks_communicating(void)
              H, surfA, surfB, dsurf, tableA, tableB, H / 2.0,
              b_rose, a_dropped, level, mid_A, mid_B, conserved, fill0, fill1, seeded,
              slept, slept_tick, s.act.count, s.fluid_n_fired);
-    report("case19_two_tanks_communicating_vessels", ok, buf);
+    report("case19_M3_terraced_no_rise (M4 radial finisher adds it)", ok, buf);
 
     sim_shutdown(&s);
 }
@@ -1662,7 +1682,10 @@ static void test_finisher_conserves_over_interior_solid(void)
     int conserved = (fill1 == fill0) && (fill0 == seeded);
     int slept     = (slept_tick >= 0) && (s.act.count == 0);
     char buf[256];
-    int ok = conserved && slept && shelf_ok && b_above;
+    /* 0.5 M3: finisher OFF (M4 radializes it). Binary terraced flow does not raise B
+     * over the interior shelf, so assert conserve + settle + shelf intact + B did NOT
+     * rise. M4 re-enables the snap and flips b_above to 1. */
+    int ok = conserved && slept && shelf_ok && (b_above == 0);
     snprintf(buf, sizeof buf,
              "conserved=%d(%d->%d seed=%d) slept=%d(t=%d) shelf_intact=%d b_rose=%d "
              "fired=%u final_active=%u",

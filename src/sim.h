@@ -526,6 +526,18 @@ typedef struct {
     uint16_t    fluid_ring_pos;         /* next write slot (mod RING_N)             */
     uint16_t    fluid_cyc_seen;         /* consecutive in-cycle ticks               */
     uint16_t    fluid_n_fired;          /* distinct snapped equilibria remembered   */
+
+    /* ---- 0.5 fluid: binary-fill flow + radial gravity (M3) ---- *
+     * fluid_down is the SIM_NEIGH face index (0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z) that
+     * points "down" (radially toward the planet centre) for THIS chunk - cached
+     * per-chunk by main.c from the chunk centre vs WG_PLANET_C*. Default 3 (-Y), the
+     * flat-gravity fallback the tests + the proto use. Binary water (fill {0,15})
+     * moves WHOLE voxels along this face + flow-to-descent laterally.
+     * fluid_finisher_on gates the partial-fill head/connected-body finisher (the
+     * world-Y column solver): OFF in M3 (the binary flow rule settles on its own,
+     * terraced); M4 replaces the finisher with a radial shell-snap and turns it on. */
+    int8_t      fluid_down;             /* radial-down SIM_NEIGH face (default 3 = -Y) */
+    uint8_t     fluid_finisher_on;      /* 0 in M3 (terraced); M4 enables the snap    */
     /* ---- OPTIONAL progression event sink (ARCHITECTURE Section 9, READ-ONLY) -*
      * A single BORROWED pointer to a ProgressSink (a ProgressRing) the sim only
      * ever PUSHES to, on emergent transitions it ALREADY computes (a melt/freeze
@@ -702,6 +714,12 @@ int  sim_set_source(SimState *s, uint16_t li, uint8_t hold_code);
  * deliberate spring; plain held sources (e.g. lava) hold HEAT ONLY via
  * sim_set_source and do NOT flood (their fill is conserved). */
 int  sim_set_spring(SimState *s, uint16_t li, uint8_t hold_code);
+
+/* 0.5 M3: set this chunk's radial-DOWN face (SIM_NEIGH index 0..5) for the binary
+ * water flow - the face whose direction is most "toward the planet centre" at this
+ * chunk's position. main.c computes it per-chunk; out-of-range is ignored. Default
+ * after sim_init is 3 (-Y), the flat-gravity fallback for tests / the prototype. */
+void sim_set_down_face(SimState *s, int face);
 
 /* Attach (or detach) the OPTIONAL progression event sink (ARCHITECTURE Section
  * 9). `sink` is a BORROWED ProgressSink* (a ProgressRing the caller owns); the

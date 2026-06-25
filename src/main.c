@@ -116,6 +116,11 @@
 #define HOME_CY           63    /* 0.5 M2: crust chunk under the new pole (surface cy 64 at R=512) */
 #define HOME_CZ           0
 
+/* 0.5 M3: chunk-local index of the demo water spring (top of the carved pocket). */
+#define DEMO_SPRING_LX    3
+#define DEMO_SPRING_LY    14
+#define DEMO_SPRING_LZ    3
+
 /* Local-Y the camera aims at (the forge's lava level), offset by the HOME chunk's
  * world origin to give DEMO_WORLD_Y. The carved cavity + lava pool sit around
  * this row (local y 10..12 -> world-Y 122..124), so the default look point lands
@@ -570,6 +575,21 @@ static SimState *worldca_find(SimState *forge, const Chunk *c)
     return NULL;
 }
 
+/* 0.5 M3: the SIM_NEIGH face pointing radially INWARD (toward the planet centre)
+ * at chunk (cx,cy,cz)'s centre - the binary water "down" for that chunk. SIM_NEIGH:
+ * 0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z. A chunk at +X of the centre (dx>0) flows toward
+ * -X = face 1, etc. At the spawn pole (chunk above the centre in Y) this is 3 (-Y). */
+static int chunk_down_face(int cx, int cy, int cz)
+{
+    long dx = (long)cx * CHUNK_DIM + CHUNK_DIM / 2 - WG_PLANET_CX;
+    long dy = (long)cy * CHUNK_DIM + CHUNK_DIM / 2 - WG_PLANET_CY;
+    long dz = (long)cz * CHUNK_DIM + CHUNK_DIM / 2 - WG_PLANET_CZ;
+    long ax = dx < 0 ? -dx : dx, ay = dy < 0 ? -dy : dy, az = dz < 0 ? -dz : dz;
+    if (ax >= ay && ax >= az) return dx > 0 ? 1 : 0;
+    if (ay >= az)             return dy > 0 ? 3 : 2;
+    return dz > 0 ? 5 : 4;
+}
+
 /* Bind a fresh SimState to chunk c (woken by cross-chunk heat) and add it to the
  * active set; returns the already-bound sim if any, NULL if the cap is hit or
  * alloc/init fails. The sink is installed so a woken chunk's discoveries surface. */
@@ -582,6 +602,7 @@ static SimState *worldca_wake_chunk(SimState *forge, Chunk *c, ProgressSink *sin
     if (ns == NULL) return NULL;
     ns->chunk = NULL;
     if (sim_init(ns, c) != 0) { free(ns); return NULL; }
+    sim_set_down_face(ns, chunk_down_face(c->cx, c->cy, c->cz));   /* 0.5 M3: radial water down */
     sim_set_progress_sink(ns, sink);
     if (getenv("VOXEL_DEBUG_EDITS"))
         fprintf(stderr, "CA: woke chunk (%d,%d,%d) [cross-chunk heat]\n",
@@ -736,6 +757,18 @@ static void demo_decorate(Chunk *c)
      * player can MAKE heat, in 0.5, this is the loop's other half.) */
     chunk_set(c, 6, 14, 8, copper);
     chunk_set(c, 10, 14, 8, copper);
+
+    /* 0.5 M3 - the headline: a WATER SPRING in the opposite corner, well clear of
+     * the lava. Carve a pocket (x2..5, z2..5, y8..15) into the crust and stand a
+     * held water spring at its top; binary water falls radially (down = -Y at the
+     * pole) one cell/tick and POOLS on the pocket floor (y7, un-carved crust) -
+     * finite flowing + pooling water, conserved except at the inexhaustible spring.
+     * Registered via sim_set_spring at the demo sim_init site (DEMO_SPRING_* below). */
+    for (x = 2; x <= 5; ++x)
+        for (z = 2; z <= 5; ++z)
+            for (y = 8; y <= 15; ++y)
+                chunk_set(c, x, y, z, air);
+    chunk_set(c, DEMO_SPRING_LX, DEMO_SPRING_LY, DEMO_SPRING_LZ, make_liquid(MAT_WATER));
 }
 
 /* True iff HOME already carries the forge (decorated this run, or LOADED from a
@@ -1697,6 +1730,12 @@ int main(void)
                 fprintf(stderr, "main: sim_init failed\n");
                 /* Non-fatal: leave sim unbound and continue without the demo. */
                 sim->chunk = NULL;
+            } else {
+                sim_set_down_face(sim, chunk_down_face(home->cx, home->cy, home->cz));
+                /* 0.5 M3: register the demo water spring (only on the decorated HOME). */
+                if (home->cx == HOME_CX && home->cy == HOME_CY && home->cz == HOME_CZ)
+                    sim_set_spring(sim, (uint16_t)vox_index(DEMO_SPRING_LX, DEMO_SPRING_LY,
+                                   DEMO_SPRING_LZ), temp_encode_c(20.0));
             }
             /* Install the progression sink AFTER sim_init (which reset progress to
              * NULL): the sim now PUSHES emergent transitions into our ring so the
@@ -2133,6 +2172,8 @@ int main(void)
                 if (sim_init(sim, home) != 0) {
                     fprintf(stderr, "main: sim_init re-attach failed\n");
                     sim->chunk = NULL;   /* stay detached; demo just won't run   */
+                } else {
+                    sim_set_down_face(sim, chunk_down_face(home->cx, home->cy, home->cz));
                 }
                 /* Re-install the progression sink after re-attach (sim_init reset
                  * progress to NULL): the re-bound HOME resumes emitting into our

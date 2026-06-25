@@ -75,8 +75,9 @@ int main(void)
 
         len   = chunksync_serve(CX, CY, CZ, buf, (int)NET_CHUNK_MAX, &hctx);
         count = buf[12] | (buf[13] << 8);
-        check("3 edits serialize to count 3", count == 3);
-        check("delta length matches count",   len == 14 + 3 * 6);
+        /* 0.5 RLE: 3 non-adjacent edits of distinct materials -> 3 runs of len 1. */
+        check("3 scattered edits serialize to 3 runs", count == 3);
+        check("delta length matches runs (8 B each)",  len == 14 + 3 * 8);
 
         chunksync_apply(buf, len, &cctx);
 
@@ -89,22 +90,52 @@ int main(void)
         check("unedited voxel untouched on client", world_get_voxel(&CW, ux, uy, uz) == before_un);
     }
 
-    /* (3) worst case: rewrite an ENTIRE chunk -> 4096-voxel delta still fits + applies */
+    /* (3) the RLE WIN: rewrite an ENTIRE chunk to UNIFORM water -> one run, ~22 B.
+     * This is the dam-break/flood case (a chunk of same-temp water): the old per-
+     * voxel format was 14 + 4096*6 = 24590 B; RLE collapses it to 14 + 8 = 22 B. */
     {
         const int BX = 0, BY = 8, BZ = 1;
         int lx, ly, lz, mism = 0;
         if (world_get(&HW, BX, BY, BZ) != NULL && world_get(&CW, BX, BY, BZ) != NULL) {
             for (lz = 0; lz < 16; ++lz) for (ly = 0; ly < 16; ++ly) for (lx = 0; lx < 16; ++lx)
-                world_edit_voxel(&HW, BX*16+lx, BY*16+ly, BZ*16+lz, mk(MAT_COPPER, 15));
+                world_edit_voxel(&HW, BX*16+lx, BY*16+ly, BZ*16+lz, mk(MAT_WATER, 15));
             len   = chunksync_serve(BX, BY, BZ, buf, (int)NET_CHUNK_MAX, &hctx);
             count = buf[12] | (buf[13] << 8);
-            check("full-chunk delta count == 4096", count == 4096);
-            check("full-chunk delta fits NET_CHUNK_MAX", len == 14 + 4096 * 6 && len <= (int)NET_CHUNK_MAX);
+            check("uniform-flood chunk RLEs to ONE run", count == 1);
+            check("flood delta is 22 B (was 24590)", len == 14 + 8);
             chunksync_apply(buf, len, &cctx);
             for (lz = 0; lz < 16 && !mism; ++lz) for (ly = 0; ly < 16 && !mism; ++ly) for (lx = 0; lx < 16 && !mism; ++lx)
                 if (persist_canon(world_get_voxel(&CW, BX*16+lx, BY*16+ly, BZ*16+lz)) !=
                     persist_canon(world_get_voxel(&HW, BX*16+lx, BY*16+ly, BZ*16+lz))) mism = 1;
-            check("full chunk applied voxel-for-voxel", !mism);
+            check("flooded chunk applied voxel-for-voxel", !mism);
+        } else {
+            check("flood chunk resident", 0);
+        }
+    }
+
+    /* (4) RLE WORST CASE (buffer safety): a chunk where no two index-consecutive
+     * voxels share a canon word -> 4096 single-voxel runs. This is the largest a
+     * delta can ever be; it MUST still fit NET_CHUNK_MAX (the serializer truncates
+     * on overflow -> a dropped voxel would desync the client), and apply exactly. */
+    {
+        const int BX = 0, BY = 8, BZ = 0;     /* the center chunk: always resident */
+        int lx, ly, lz, idx, mism = 0;
+        if (world_get(&HW, BX, BY, BZ) != NULL && world_get(&CW, BX, BY, BZ) != NULL) {
+            for (lz = 0; lz < 16; ++lz) for (ly = 0; ly < 16; ++ly) for (lx = 0; lx < 16; ++lx) {
+                idx = lx + ly*16 + lz*256;
+                world_edit_voxel(&HW, BX*16+lx, BY*16+ly, BZ*16+lz,
+                                 mk((idx & 1) ? MAT_IRON : MAT_COPPER, 15));
+            }
+            len   = chunksync_serve(BX, BY, BZ, buf, (int)NET_CHUNK_MAX, &hctx);
+            count = buf[12] | (buf[13] << 8);
+            check("alternating chunk -> 4096 runs", count == 4096);
+            check("worst-case delta fits NET_CHUNK_MAX (no truncation)",
+                  len == 14 + 4096 * 8 && len <= (int)NET_CHUNK_MAX);
+            chunksync_apply(buf, len, &cctx);
+            for (lz = 0; lz < 16 && !mism; ++lz) for (ly = 0; ly < 16 && !mism; ++ly) for (lx = 0; lx < 16 && !mism; ++lx)
+                if (persist_canon(world_get_voxel(&CW, BX*16+lx, BY*16+ly, BZ*16+lz)) !=
+                    persist_canon(world_get_voxel(&HW, BX*16+lx, BY*16+ly, BZ*16+lz))) mism = 1;
+            check("worst-case chunk applied voxel-for-voxel", !mism);
         } else {
             check("worst-case chunk resident", 0);
         }

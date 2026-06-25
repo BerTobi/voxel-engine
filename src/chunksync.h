@@ -8,8 +8,16 @@
  * EDITS (the delta from the seed) are sent. The host serializes the voxels of a
  * chunk that differ from its seed value; the client applies them onto its own
  * seed-regenerated chunk. Wire payload (little-endian, the MSG_CDATA body):
- *   i32 cx | i32 cy | i32 cz | u16 count | count * (u16 local-index, u32 voxel)
- * count 0 == "untouched, the seed copy is already correct".
+ *   i32 cx | i32 cy | i32 cz | u16 nruns | nruns * (u16 start, u16 len, u32 voxel)
+ * nruns 0 == "untouched, the seed copy is already correct".
+ *
+ * 0.5 (proto 4): the delta is RLE'd. Each record covers a run of `len` index-
+ * CONSECUTIVE voxels [start, start+len) that all carry the same canon word. A
+ * water flood (a chunk of uniform same-temp water) collapses to a single run;
+ * scattered heat edits stay one run each. The applier expands runs voxel-by-voxel,
+ * so per-voxel apply cost is unchanged - the win is purely on the wire (a flooded
+ * 4096-voxel chunk: 24 KB -> 22 B). The serializer never fragments; NET_CHUNK_MAX
+ * is sized for the worst case (4096 single-voxel runs) so it cannot truncate.
  */
 #ifndef CHUNKSYNC_H
 #define CHUNKSYNC_H

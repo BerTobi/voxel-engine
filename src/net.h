@@ -29,12 +29,16 @@
 #define NET_MAX_PLAYERS      4u           /* host (id 0) + up to 3 clients      */
 #define NET_DEFAULT_PORT     9001         /* used when host/connect omits :port */
 #define NET_MAGIC            0x314E5856u   /* 'V''X''N''1' LE - handshake sentinel */
-#define NET_PROTOCOL_VERSION 3u           /* bump on ANY wire-format change (3: 0.4 host CA stream) */
+#define NET_PROTOCOL_VERSION 4u           /* bump on ANY wire-format change (4: 0.5 RLE chunk-delta) */
 
 /* Max bytes of a serialized chunk delta (the MSG_CDATA payload main.c builds).
- * Worst case is a fully-rewritten 16^3 chunk: 4096 * (u16 index + u32 voxel) +
- * a small header. net.c sizes its frame buffers to hold one of these. */
-#define NET_CHUNK_MAX        28672u
+ * 0.5: the delta is RLE'd into runs of (u16 start, u16 len, u32 voxel) = 8 B each
+ * (see chunksync.h). A fully-flooded/uniform chunk collapses to ONE run (22 B);
+ * the WORST case is a chunk where no two index-consecutive voxels share a canon
+ * word (e.g. a fine heat gradient) -> 4096 runs = 14 + 4096*8 = 32782 B. The
+ * serializer never fragments, so the buffer MUST fit that worst case or it would
+ * truncate (drop voxels -> client desync). net.c sizes its frame buffers to this. */
+#define NET_CHUNK_MAX        36864u       /* >= 14 + 4096*8 (32782), with headroom */
 
 /* ======================================================================== *
  *  PUBLIC API  (consumed by main.c and test_net.c)                          *

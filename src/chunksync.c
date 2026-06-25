@@ -30,48 +30,67 @@ int chunksync_serve(int cx, int cy, int cz, unsigned char *out, int cap, void *u
     out[0]=(unsigned char)cx;  out[1]=(unsigned char)(cx>>8);  out[2]=(unsigned char)(cx>>16);  out[3]=(unsigned char)(cx>>24);
     out[4]=(unsigned char)cy;  out[5]=(unsigned char)(cy>>8);  out[6]=(unsigned char)(cy>>16);  out[7]=(unsigned char)(cy>>24);
     out[8]=(unsigned char)cz;  out[9]=(unsigned char)(cz>>8);  out[10]=(unsigned char)(cz>>16); out[11]=(unsigned char)(cz>>24);
-    pos = 14;                           /* out[12..13] = count, patched below */
+    pos = 14;                           /* out[12..13] = nruns, patched below */
 
+    /* 0.5: RLE the delta-from-seed. A voxel is "changed" if its canon word differs
+     * from the seed's; we coalesce a maximal run of index-CONSECUTIVE changed voxels
+     * that all carry the SAME canon word into one (start,len,voxel) record. Water
+     * floods (a chunk of same-temp water) collapse to a single run; scattered heat
+     * edits stay one run each. Iteration is in vox_index order so a run is just a
+     * contiguous index range, which the applier expands trivially. */
     if (src != NULL) {
         worldgen_fill_chunk(&seedc, cx, cy, cz, cs->seed);
-        for (idx = 0; idx < CHUNK_VOXELS; ++idx) {
+        idx = 0;
+        while (idx < CHUNK_VOXELS) {
             Voxel a = persist_canon(chunk_vox(src, idx));   /* src may be uniform-air */
-            if (a != persist_canon(seedc.voxels[idx])) {
-                if (pos + 6 > cap) break;            /* never overflow the buffer */
-                out[pos++] = (unsigned char)idx;       out[pos++] = (unsigned char)(idx >> 8);
-                out[pos++] = (unsigned char)a;         out[pos++] = (unsigned char)(a >> 8);
-                out[pos++] = (unsigned char)(a >> 16); out[pos++] = (unsigned char)(a >> 24);
-                ++count;
+            int start, run;
+            if (a == persist_canon(seedc.voxels[idx])) { ++idx; continue; }  /* unchanged */
+            start = idx; run = 1; ++idx;
+            while (idx < CHUNK_VOXELS) {                     /* extend the run */
+                Voxel b = persist_canon(chunk_vox(src, idx));
+                if (b != a || b == persist_canon(seedc.voxels[idx])) break;
+                ++run; ++idx;
             }
+            if (pos + 8 > cap) break;            /* never overflow (buffer sized for worst case) */
+            out[pos++] = (unsigned char)start;     out[pos++] = (unsigned char)(start >> 8);
+            out[pos++] = (unsigned char)run;       out[pos++] = (unsigned char)(run >> 8);
+            out[pos++] = (unsigned char)a;         out[pos++] = (unsigned char)(a >> 8);
+            out[pos++] = (unsigned char)(a >> 16); out[pos++] = (unsigned char)(a >> 24);
+            ++count;
         }
     }
-    out[12] = (unsigned char)count; out[13] = (unsigned char)(count >> 8);
+    out[12] = (unsigned char)count; out[13] = (unsigned char)(count >> 8);  /* nruns */
     return pos;
 }
 
 void chunksync_apply(const unsigned char *data, int len, void *user)
 {
     ChunkSyncCtx *cs = (ChunkSyncCtx *)user;
-    int cx, cy, cz, count, i, pos;
+    int cx, cy, cz, nruns, r, pos;
     if (len < 14) return;
     cx = (int)((uint32_t)data[0] | ((uint32_t)data[1] << 8) | ((uint32_t)data[2] << 16) | ((uint32_t)data[3] << 24));
     cy = (int)((uint32_t)data[4] | ((uint32_t)data[5] << 8) | ((uint32_t)data[6] << 16) | ((uint32_t)data[7] << 24));
     cz = (int)((uint32_t)data[8] | ((uint32_t)data[9] << 8) | ((uint32_t)data[10] << 16) | ((uint32_t)data[11] << 24));
-    count = (int)(data[12] | (data[13] << 8));
+    nruns = (int)(data[12] | (data[13] << 8));
     pos = 14;
-    if (count == 0) return;                          /* untouched: seed copy is correct */
-    if (pos + count * 6 > len) return;               /* malformed length */
-    for (i = 0; i < count; ++i) {
-        int idx = data[pos] | (data[pos + 1] << 8);
-        uint32_t v = (uint32_t)data[pos + 2] | ((uint32_t)data[pos + 3] << 8) |
-                     ((uint32_t)data[pos + 4] << 16) | ((uint32_t)data[pos + 5] << 24);
-        pos += 6;
-        if (idx < 0 || idx >= CHUNK_VOXELS) continue;
-        /* vox_index = lx + ly*16 + lz*256 (chunk.c) -> invert to local x/y/z. A
-         * not-currently-resident chunk just no-ops (re-requested on next regen). */
-        world_edit_voxel(cs->world,
-                         cx * CHUNK_DIM + (idx & 15),
-                         cy * CHUNK_DIM + ((idx >> 4) & 15),
-                         cz * CHUNK_DIM + ((idx >> 8) & 15), (Voxel)v);
+    if (nruns == 0) return;                          /* untouched: seed copy is correct */
+    if (pos + nruns * 8 > len) return;               /* malformed length */
+    for (r = 0; r < nruns; ++r) {                    /* 0.5: expand each RLE run */
+        int start = data[pos] | (data[pos + 1] << 8);
+        int run   = data[pos + 2] | (data[pos + 3] << 8);
+        uint32_t v = (uint32_t)data[pos + 4] | ((uint32_t)data[pos + 5] << 8) |
+                     ((uint32_t)data[pos + 6] << 16) | ((uint32_t)data[pos + 7] << 24);
+        int k;
+        pos += 8;
+        for (k = 0; k < run; ++k) {
+            int idx = start + k;
+            if (idx < 0 || idx >= CHUNK_VOXELS) continue;
+            /* vox_index = lx + ly*16 + lz*256 (chunk.c) -> invert to local x/y/z. A
+             * not-currently-resident chunk just no-ops (re-requested on next regen). */
+            world_edit_voxel(cs->world,
+                             cx * CHUNK_DIM + (idx & 15),
+                             cy * CHUNK_DIM + ((idx >> 4) & 15),
+                             cz * CHUNK_DIM + ((idx >> 8) & 15), (Voxel)v);
+        }
     }
 }

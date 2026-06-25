@@ -109,7 +109,7 @@ WIN_LDFLAGS := -static -static-libgcc -Wl,--gc-sections -mwindows
 WIN_LIBS    := -lopengl32 -lgdi32 -luser32 -lws2_32
 
 # ---- Targets -----------------------------------------------------------------
-.PHONY: all linux win test testsim testworld testpersist testprogress testraycast testedit testplayer testnet testchunksync testdeterminism testgrain testwater testsparse check version archive clean
+.PHONY: all linux win test testsim testworld testpersist testprogress testraycast testedit testplayer testnet testchunksync testwaternet testdeterminism testgrain testwater testsparse check version archive clean
 
 # Default target: native dev build.
 all: linux
@@ -222,6 +222,17 @@ testchunksync: | $(BUILD)
 		$(SRC)/persist.c $(SRC)/chunksync.c $(SRC)/test_chunksync.c -lm
 	$(BUILD)/chunksync_test
 
+# 0.5 M5: two-peer WATER render-fidelity. A host + client NetState over loopback;
+# the host floods a chunk with water, serves it through the REAL RLE chunksync codec,
+# pushes it over the socket, and the client's chunksync_apply must reconstruct the
+# water. Proves the host-authoritative water-streaming path end-to-end (no GL).
+# apt: build-essential
+testwaternet: | $(BUILD)
+	$(CC) $(CFLAGS) -o $(BUILD)/water_net_test \
+		$(SRC)/material.c $(SRC)/chunk.c $(SRC)/worldgen.c $(SRC)/world.c \
+		$(SRC)/persist.c $(SRC)/chunksync.c $(NET) $(NET_LINUX) $(SRC)/test_water_net.c -lm
+	$(BUILD)/water_net_test
+
 # 0.4 M0: the GL-free CA DETERMINISM harness. Drives sim_tick directly (no GL,
 # no platform, no sockets) and asserts byte-level reproducibility of the
 # single-machine CA via sim_state_hash, compiled in ONLY here via
@@ -266,7 +277,7 @@ testsparse: | $(BUILD)
 # aborts on the first suite whose binary exits non-zero (each test's exit code is
 # its failure count). This is the mechanically-enforced "full suite green" floor
 # every 0.4 milestone leans on - replaces the honour-system "run them all".
-check: test testsim testworld testpersist testprogress testraycast testedit testplayer testnet testchunksync testdeterminism testgrain testwater testsparse
+check: test testsim testworld testpersist testprogress testraycast testedit testplayer testnet testchunksync testwaternet testdeterminism testgrain testwater testsparse
 	@echo "=== make check: ALL SUITES PASSED ==="
 
 # Create the build directory on demand (order-only prerequisite).

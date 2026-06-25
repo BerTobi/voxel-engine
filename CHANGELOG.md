@@ -72,6 +72,20 @@ behind the `make check` gate; see `PLAN-0.5.md`.
   binary fine voxels settle natively and the river-focused foundation doesn't need it — see the
   design note. `world_pin` (keeping an active water chunk from eviction mid-flow) is also a 0.6
   follow-up; the deposit apply is already crash-safe without it._
+- _(M5)_ **Multiplayer sees the living water — host-authoritative water streaming.** A client
+  now watches the host's rivers flow without simulating anything itself: the WorldCA (heat +
+  water) runs **only** on the host/single-player (clients run zero CA), and every CA-touched
+  chunk is streamed to clients as a delta-from-seed. Because the wire already carries the **full
+  voxel word**, the water `fill` field rides the existing channel for free. The delta is now
+  **run-length encoded** (`NET_PROTOCOL_VERSION` 3→4): consecutive same-value voxels collapse to
+  one `(start, len, voxel)` record, so a flooded 4096-voxel chunk — the dam-break worst case —
+  drops from **~24 KB to 22 B** on the wire, which is what keeps a flowing river inside a home
+  uplink's budget. `NET_CHUNK_MAX` is resized so the RLE worst case (a chunk where no two
+  neighbouring voxels match, e.g. a fine heat gradient) still fits without truncation. New
+  `test_water_net` drives a real two-peer loopback — host floods a chunk, serves it through the
+  real RLE codec, pushes it over the socket, and the client's `chunksync_apply` reconstructs the
+  water voxel-for-voxel; `test_chunksync` gains the flood-to-one-run and worst-case-no-truncation
+  cases. (0.4↔0.5 peers were already refused at the handshake by the M2 `gen_version` bump.)
 
 ## 0.4.0 — 2026-06-24 — The World Comes Alive
 

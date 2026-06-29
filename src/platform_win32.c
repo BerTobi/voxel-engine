@@ -34,6 +34,7 @@
 
 #include <stddef.h>
 #include <string.h>   /* memset - not reliably declared by <windows.h> */
+#include <stdio.h>    /* freopen/fprintf/setvbuf - diagnostics to a log file */
 
 /* ---- Backend state ------------------------------------------------------- */
 static HINSTANCE g_hinst        = NULL;     /* module instance for the class    */
@@ -42,6 +43,28 @@ static HDC       g_hdc          = NULL;     /* its device context (owns pixfmt) 
 static HGLRC     g_hglrc        = NULL;     /* the GL render context            */
 static HMODULE   g_opengl32     = NULL;     /* opengl32.dll, for GL1.1 getproc  */
 static int       g_should_close = 0;
+
+/* ---- Diagnostics (a -mwindows GUI app has NO console, so stderr is lost) --- *
+ * Redirect stderr to a log file next to the exe, UNBUFFERED so the last line
+ * written survives an abrupt exit/crash - the only way to see WHY a startup fails
+ * on the XP target. Idempotent-ish (a second call just re-opens). */
+void plat_diag_init(void)
+{
+    /* freopen returns NULL if it can't open (e.g. read-only dir); harmless - stderr
+     * just stays as-is (discarded). _IONBF: write every fprintf straight through. */
+    if (freopen("voxel_log.txt", "w", stderr) != NULL)
+        setvbuf(stderr, NULL, _IONBF, 0);
+}
+
+/* Surface a fatal startup error the user cannot miss: a modal dialog (no console to
+ * print to) + the log file. */
+void plat_fatal_message(const char *msg)
+{
+    fprintf(stderr, "FATAL: %s\n", msg ? msg : "(null)");
+    fflush(stderr);
+    MessageBoxA(NULL, msg ? msg : "Unknown startup error",
+                "Voxel Engine - startup error", MB_OK | MB_ICONERROR);
+}
 
 /* Fullscreen: save the windowed style + rect to restore on toggle-off. */
 static int       g_fullscreen   = 0;
@@ -432,6 +455,20 @@ int plat_create_window(int w, int h, const char *title)
         DestroyWindow(g_hwnd);
         g_hwnd = NULL;
         return 1;
+    }
+
+    /* Log the GL driver identity (glGetString is GL 1.1 core, always linked) - the
+     * single most useful XP datum: "1.1.0 ... GDI Generic" means the NVIDIA driver
+     * is absent and Windows fell back to its SOFTWARE GL 1.1 (no shaders -> gl_load
+     * will fail), vs "2.1.x NVIDIA" = a real driver. NULL-guarded (a dead context
+     * returns NULL). */
+    {
+        const char *ven = (const char *)glGetString(GL_VENDOR);
+        const char *ren = (const char *)glGetString(GL_RENDERER);
+        const char *ver = (const char *)glGetString(GL_VERSION);
+        fprintf(stderr, "GL_VENDOR   = %s\nGL_RENDERER = %s\nGL_VERSION  = %s\n",
+                ven ? ven : "(null)", ren ? ren : "(null)", ver ? ver : "(null)");
+        fflush(stderr);
     }
 
     ShowWindow(g_hwnd, SW_SHOW);

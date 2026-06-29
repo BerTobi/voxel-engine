@@ -114,6 +114,18 @@ static int keysym_to_plat(KeySym ks)
     }
 }
 
+/* Diagnostics already go to the terminal's stderr on the dev box - no redirect
+ * needed (the Win32 backend redirects to a log file because a GUI app has no
+ * console). No-op so main() can call it unconditionally. */
+void plat_diag_init(void) { }
+
+/* Fatal startup error -> stderr (the terminal). The Win32 backend additionally
+ * pops a MessageBox because there is no console there. */
+void plat_fatal_message(const char *msg)
+{
+    fprintf(stderr, "FATAL: %s\n", msg ? msg : "(null)");
+}
+
 int plat_create_window(int w, int h, const char *title)
 {
     static int visual_attribs[] = {
@@ -298,6 +310,15 @@ int plat_create_window(int w, int h, const char *title)
         XCloseDisplay(g_dpy);
         g_dpy = NULL;
         return 1;
+    }
+
+    /* Log the GL driver identity (parity with the Win32 backend's XP diagnostic). */
+    {
+        const char *ven = (const char *)glGetString(GL_VENDOR);
+        const char *ren = (const char *)glGetString(GL_RENDERER);
+        const char *ver = (const char *)glGetString(GL_VERSION);
+        fprintf(stderr, "GL_VENDOR   = %s\nGL_RENDERER = %s\nGL_VERSION  = %s\n",
+                ven ? ven : "(null)", ren ? ren : "(null)", ver ? ver : "(null)");
     }
 
     /* Set the initial viewport explicitly (the context is current now). The

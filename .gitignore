@@ -7,6 +7,9 @@
 # Runtime save data (per-seed region files; not source)
 /saves/
 
+# Win32 diagnostic log (written next to the exe by plat_diag_init)
+voxel_log.txt
+
 # Editor / OS cruft
 *~
 *.swp

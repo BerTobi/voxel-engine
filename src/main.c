@@ -1615,25 +1615,43 @@ int main(void)
     if (shot_frame < 1)
         shot_frame = 1;
 
+    /* Route diagnostics somewhere visible BEFORE anything logs: on the Win32 GUI
+     * target there is no console, so this redirects stderr to voxel_log.txt next to
+     * the exe (the only way to debug a startup failure on XP). No-op on the dev box. */
+    plat_diag_init();
+
     /* Startup banner (Factorio-style): identify the build on the console. */
     fprintf(stderr, "%s\n", VOXEL_TITLE);
 
     /* ---- 1. Window + GL 2.1 context -------------------------------------- */
     if (plat_create_window(win_w, win_h, VOXEL_TITLE) != 0) {
-        fprintf(stderr, "main: plat_create_window failed\n");
+        plat_fatal_message("Could not create the window or an OpenGL context.\n"
+                           "The graphics driver may be missing or OpenGL is unavailable.");
         return 1;
     }
 
     /* ---- 2. Load the post-1.1 GL entry points through the platform ------- */
     rc = gl_load(plat_gl_getproc);
     if (rc != 0) {
-        fprintf(stderr, "main: gl_load failed at entry point #%d\n", rc);
+        char msg[512];
+        /* gl_load_failed_name (gl_loader.h) is the human-readable symbol that the
+         * driver did not provide - usually the smoking gun (a software/GL-1.1 driver
+         * has no shader/VBO entry points). See GL_VERSION in voxel_log.txt. */
+        snprintf(msg, sizeof msg,
+                 "OpenGL 2.0 is required but your driver does not provide it.\n"
+                 "Missing entry point: %s (#%d).\n\n"
+                 "On Windows XP this means the NVIDIA graphics driver is not "
+                 "installed - the system fell back to software OpenGL 1.1.\n"
+                 "See GL_VERSION in voxel_log.txt next to the game.",
+                 gl_load_failed_name ? gl_load_failed_name : "(unknown)", rc);
+        plat_fatal_message(msg);
         return 1;
     }
 
     /* ---- 3. Renderer: shaders, atlas, once-per-run GL state -------------- */
     if (render_init() != 0) {
-        fprintf(stderr, "main: render_init failed\n");
+        plat_fatal_message("Renderer init failed (shader compile/link or texture "
+                           "upload).\nSee voxel_log.txt next to the game for details.");
         return 1;
     }
 

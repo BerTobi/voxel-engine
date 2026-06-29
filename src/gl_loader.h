@@ -137,4 +137,9 @@ extern PFN_glActiveTexture              glActiveTexture;
  * failed to resolve, so the caller can report which entry point is missing. */
 int gl_load(void *(*getproc)(const char *name));
 
+/* The human-readable name of the entry point that failed to resolve in the most
+ * recent gl_load() call (NULL on success). Lets the caller report e.g.
+ * "glCreateShader missing" rather than just an index. Defined in gl_loader.c. */
+extern const char *gl_load_failed_name;
+
 #endif /* GL_LOADER_H */

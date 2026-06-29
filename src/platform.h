@@ -11,6 +11,21 @@
 #ifndef PLATFORM_H
 #define PLATFORM_H
 
+/* Route engine diagnostics (stderr) to a place the user can actually SEE on this
+ * platform, before anything else in main(). On Win32 a -mwindows GUI app has NO
+ * console, so stderr is discarded - this redirects it to "voxel_log.txt" next to
+ * the exe (UNBUFFERED, so the last line survives a crash), which is the only way to
+ * debug a startup failure on the XP target. On X11/dev it is a no-op (the terminal
+ * already shows stderr). Safe to call once at the very top of main(). */
+void   plat_diag_init(void);
+
+/* Surface a FATAL startup error to the user in a way they cannot miss, and log it.
+ * On Win32: a modal MessageBox (the GUI app has no console) + the log. On X11:
+ * stderr. Use for the unrecoverable init failures (no window / no GL / no shaders)
+ * so the app explains itself instead of just vanishing (which reads as "it crashed").
+ * Does not exit; the caller still returns/cleans up. */
+void   plat_fatal_message(const char *msg);
+
 /* Create the window + a GL 2.1 context and make it current.
  * Returns 0 on success, non-zero on failure. */
 int    plat_create_window(int w, int h, const char *title);

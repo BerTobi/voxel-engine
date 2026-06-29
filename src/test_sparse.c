@@ -37,6 +37,7 @@ int main(void)
     cb.gen = gen_cb;
     cb.is_air = air_cb;                 /* sphere sparse-air predicate */
     if (ws == NULL || world_init(ws, 1u, &cb) != 0) { printf("init failed\n"); return 2; }
+    world_set_view_radius(ws, WORLD_RADIUS);   /* 0.5: assert against the MAX window */
 
     printf("== test_sparse (0.5 M1 sparse-air storage) ==\n");
 

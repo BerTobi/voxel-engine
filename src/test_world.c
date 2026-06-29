@@ -124,6 +124,10 @@ static WorldStore *make_store(uint64_t seed)
         free(ws);
         return NULL;
     }
+    /* 0.5: view distance is runtime-adjustable; the window-count + coverage tests
+     * below assert against WORLD_WINDOW_CHUNKS / WORLD_RADIUS (the MAX), so exercise
+     * the store at the maximum radius rather than the smaller runtime default. */
+    world_set_view_radius(ws, WORLD_RADIUS);
     return ws;
 }
 
@@ -805,13 +809,15 @@ static void test_long_walk(void)
                 fcz = world_to_chunk(fz);
                 /* Drive a FIXED count of stream_update frames at the new
                  * position: the first does the move (evict trailing curtain,
-                 * enqueue leading curtain), the rest drain it. A 26-chunk
-                 * curtain drains in ~4 frames at budget 8; 16 is headroom.
+                 * enqueue leading curtain), the rest drain it. A leading curtain is
+                 * WORLD_DIAM*WORLD_BAND_H chunks; at WORLD_GEN_BUDGET/frame it drains
+                 * in that/budget frames, so scale the count to the (max-radius) window
+                 * + headroom (a fixed 16 under-drained the radius-8 curtain of 153).
                  * NOTE: we cannot loop on resident_count here - it is already
                  * WORLD_WINDOW_CHUNKS from the previous window, so a count-guard
                  * would skip the move entirely. We always step, then test
                  * MEMBERSHIP (the sound convergence predicate). */
-                for (drain = 0; drain < 16; ++drain)
+                for (drain = 0; drain < (WORLD_DIAM * WORLD_BAND_H) / WORLD_GEN_BUDGET + 12; ++drain)
                     world_stream_update(fs, fx, TEST_PY, fz);
 
                 if (world_resident_count(fs) != (uint32_t)WORLD_WINDOW_CHUNKS) {

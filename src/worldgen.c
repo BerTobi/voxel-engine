@@ -240,6 +240,177 @@ int worldgen_radial_offset(int dx, int dy, int dz)
     return off;
 }
 
+/* v5 DRAINAGE relief: identical machinery to worldgen_radial_offset, but sampled on
+ * the continent-scale WG_RELIEF5_* lattice (256 vox base, +/-28 vox amplitude) so the
+ * surface swings widely - broad highlands and broad ocean basins with long slopes.
+ * Pole-flattened to 0 within sqrt(WG_POLE_FLAT_R2) of the Y axis (dry spawn). */
+int worldgen_radial_offset_v5(int dx, int dy, int dz)
+{
+    int64_t d2 = (int64_t)dx * dx + (int64_t)dy * dy + (int64_t)dz * dz;
+    int64_t horiz2;
+    int32_t d, sx, sy, sz, acc = 0, wtot = 0, band, off;
+    uint32_t oct;
+    if (d2 == 0) return 0;
+    d = wg_isqrt(d2);
+    if (d == 0) return 0;
+    sx = (int32_t)((int64_t)dx * WG_PLANET_R / d);   /* per-direction surface point */
+    sy = (int32_t)((int64_t)dy * WG_PLANET_R / d);
+    sz = (int32_t)((int64_t)dz * WG_PLANET_R / d);
+    for (oct = 0u; oct < WG_RELIEF5_OCTAVES; ++oct) {
+        uint32_t lp = (WG_RELIEF5_PERIOD_LOG2 > oct) ? (WG_RELIEF5_PERIOD_LOG2 - oct) : 0u;
+        int32_t  w  = (int32_t)(1u << (WG_RELIEF5_OCTAVES - 1u - oct));
+        acc  += wg_octave3(WG_RELIEF_SEED, sx, sy, sz, lp) * w;
+        wtot += w;
+    }
+    band = acc / wtot;                                           /* [-2048,2047] */
+    off  = (int32_t)(((int64_t)band * WG_RELIEF5_AMP) >> 11);    /* +/- WG_RELIEF5_AMP */
+    horiz2 = (int64_t)dx * dx + (int64_t)dz * dz;                /* pole-flatten */
+    if (horiz2 < WG_POLE_FLAT_R2)
+        off = (int32_t)((int64_t)off * horiz2 / WG_POLE_FLAT_R2);
+    return off;
+}
+
+/* v6 = v5 drainage relief with a river-VALLEY network incised into it. Along the
+ * zero-contours of a separate value-noise field (|noise| < WG_VALLEY_HALFWIDTH), the
+ * surface is cut DOWN by a V-profiled depth that ramps DEEPER toward the basins (where
+ * the base offset is low), so the valley FLOOR plunges far steeper than the gentle base
+ * - the steep, confined channel the water CA needs. Pole-flattened (no valley cuts the
+ * dry spawn). Result <= off5 everywhere (valleys only carve down). Pure integer. */
+int worldgen_radial_offset_v6(int dx, int dy, int dz)
+{
+    int     off5 = worldgen_radial_offset_v5(dx, dy, dz);
+    int64_t d2 = (int64_t)dx * dx + (int64_t)dy * dy + (int64_t)dz * dz;
+    int64_t horiz2;
+    int32_t d, sx, sy, sz, vn, av, depth = 0;
+    if (d2 == 0) return off5;
+    d = wg_isqrt(d2);
+    if (d == 0) return off5;
+    sx = (int32_t)((int64_t)dx * WG_PLANET_R / d);
+    sy = (int32_t)((int64_t)dy * WG_PLANET_R / d);
+    sz = (int32_t)((int64_t)dz * WG_PLANET_R / d);
+    vn = wg_octave3(WG_VALLEY_SEED, sx, sy, sz, WG_VALLEY_PERIOD_LOG2);   /* [-2048,2047] */
+    av = (vn < 0) ? -vn : vn;
+    if (av < WG_VALLEY_HALFWIDTH) {
+        int dh = WG_VALLEY_VREF - off5;                  /* deeper toward low basins */
+        int d0 = WG_VALLEY_FLOOR + (dh > 0 ? dh : 0);
+        if (d0 > WG_VALLEY_MAXD) d0 = WG_VALLEY_MAXD;
+        depth = d0 * (WG_VALLEY_HALFWIDTH - av) / WG_VALLEY_HALFWIDTH;   /* V-taper */
+    }
+    horiz2 = (int64_t)dx * dx + (int64_t)dz * dz;        /* no valleys in the flat spawn zone */
+    if (horiz2 < WG_POLE_FLAT_R2)
+        depth = (int32_t)((int64_t)depth * horiz2 / WG_POLE_FLAT_R2);
+    return off5 - depth;
+}
+
+/* gen v5 (current): DRAINAGE terrain - the sphere with continent-scale relief
+ * (worldgen_radial_offset_v5), a WG_DIRT_DEPTH dirt crust, AIR above. The displaced
+ * surface lies in the shell [R-AMP5-DIRT, R+AMP5]; the relief noise is evaluated only
+ * there (deep core unconditional STONE, far space AIR). DRY - no water (the sea is a
+ * live overlay in main.c, kept out of worldgen so this stays a pure regenerate-from-
+ * seed function). Pure integer + seed-independent: byte-identical across targets. */
+static void gen_fill_v5(Chunk *c, int cx, int cy, int cz)
+{
+    uint8_t ambient = temp_encode_c(WG_AMBIENT_C);
+    int lx, ly, lz;
+    const long Rhi  = (long)WG_PLANET_R + WG_RELIEF5_AMP;
+    const long Rhi2 = Rhi * Rhi;
+    const long Rlo  = (long)WG_PLANET_R - WG_RELIEF5_AMP - WG_DIRT_DEPTH;
+    const long Rlo2 = (Rlo > 0) ? Rlo * Rlo : 0;
+
+    c->cx = cx;
+    c->cy = cy;
+    c->cz = cz;
+
+    for (lz = 0; lz < CHUNK_DIM; ++lz) {
+        long dz = (long)(cz * CHUNK_DIM + lz) - WG_PLANET_CZ;
+        for (ly = 0; ly < CHUNK_DIM; ++ly) {
+            long dy = (long)(cy * CHUNK_DIM + ly) - WG_PLANET_CY;
+            for (lx = 0; lx < CHUNK_DIM; ++lx) {
+                long dx = (long)(cx * CHUNK_DIM + lx) - WG_PLANET_CX;
+                long d2 = dx * dx + dy * dy + dz * dz;
+                Voxel v = 0;
+                uint8_t mat;
+
+                if (d2 <= Rlo2) {
+                    mat = MAT_STONE;
+                } else if (d2 > Rhi2) {
+                    mat = MAT_AIR;
+                } else {
+                    int  off  = worldgen_radial_offset_v5((int)dx, (int)dy, (int)dz);
+                    long Re   = (long)WG_PLANET_R + off;
+                    long Re2  = Re * Re;
+                    long Rde  = Re - WG_DIRT_DEPTH;
+                    long Rde2 = (Rde > 0) ? Rde * Rde : 0;
+                    if (d2 > Re2)        mat = MAT_AIR;
+                    else if (d2 > Rde2)  mat = MAT_DIRT;
+                    else                 mat = MAT_STONE;
+                }
+
+                vox_set_mat(&v, mat);
+                if (mat != MAT_AIR) vox_set_fill(&v, 15);
+                vox_set_temp_code(&v, ambient);
+                c->voxels[vox_index(lx, ly, lz)] = v;
+            }
+        }
+    }
+
+    c->flags |= CHUNK_DIRTY_MESH | CHUNK_GEN;
+}
+
+/* gen v6 (current): v5 drainage relief with river VALLEYS incised
+ * (worldgen_radial_offset_v6). Same structure as gen_fill_v5; the only differences are
+ * the offset call and the LOWER core bound (valleys cut down to R-AMP5-MAXD, so the
+ * unconditional-stone shell must start below that or a valley floor would be mis-filled
+ * as stone). Rhi is unchanged (valleys never raise the surface). Dry + pure-integer. */
+static void gen_fill_v6(Chunk *c, int cx, int cy, int cz)
+{
+    uint8_t ambient = temp_encode_c(WG_AMBIENT_C);
+    int lx, ly, lz;
+    const long Rhi  = (long)WG_PLANET_R + WG_RELIEF5_AMP;
+    const long Rhi2 = Rhi * Rhi;
+    const long Rlo  = (long)WG_PLANET_R - WG_RELIEF5_AMP - WG_VALLEY_MAXD - WG_DIRT_DEPTH;
+    const long Rlo2 = (Rlo > 0) ? Rlo * Rlo : 0;
+
+    c->cx = cx;
+    c->cy = cy;
+    c->cz = cz;
+
+    for (lz = 0; lz < CHUNK_DIM; ++lz) {
+        long dz = (long)(cz * CHUNK_DIM + lz) - WG_PLANET_CZ;
+        for (ly = 0; ly < CHUNK_DIM; ++ly) {
+            long dy = (long)(cy * CHUNK_DIM + ly) - WG_PLANET_CY;
+            for (lx = 0; lx < CHUNK_DIM; ++lx) {
+                long dx = (long)(cx * CHUNK_DIM + lx) - WG_PLANET_CX;
+                long d2 = dx * dx + dy * dy + dz * dz;
+                Voxel v = 0;
+                uint8_t mat;
+
+                if (d2 <= Rlo2) {
+                    mat = MAT_STONE;
+                } else if (d2 > Rhi2) {
+                    mat = MAT_AIR;
+                } else {
+                    int  off  = worldgen_radial_offset_v6((int)dx, (int)dy, (int)dz);
+                    long Re   = (long)WG_PLANET_R + off;
+                    long Re2  = Re * Re;
+                    long Rde  = Re - WG_DIRT_DEPTH;
+                    long Rde2 = (Rde > 0) ? Rde * Rde : 0;
+                    if (d2 > Re2)        mat = MAT_AIR;
+                    else if (d2 > Rde2)  mat = MAT_DIRT;
+                    else                 mat = MAT_STONE;
+                }
+
+                vox_set_mat(&v, mat);
+                if (mat != MAT_AIR) vox_set_fill(&v, 15);
+                vox_set_temp_code(&v, ambient);
+                c->voxels[vox_index(lx, ly, lz)] = v;
+            }
+        }
+    }
+
+    c->flags |= CHUNK_DIRTY_MESH | CHUNK_GEN;
+}
+
 /* Fill chunk c's voxels[] for chunk coords (cx,cy,cz) from `seed`: the
  * deterministic gen(seed, coords) -> Chunk of Section 7/8. A spherical asteroid
  * whose surface RADIUS is displaced per direction by worldgen_radial_offset
@@ -355,14 +526,16 @@ static uint32_t g_gen_version = WG_GEN_VERSION;   /* the active world's generato
 
 void worldgen_select_version(uint32_t v) { g_gen_version = v; }
 uint32_t worldgen_active_version(void)   { return g_gen_version; }
-int worldgen_version_supported(uint32_t v) { return v == 3u || v == 4u; }
+int worldgen_version_supported(uint32_t v) { return v >= 3u && v <= 6u; }
 
 void worldgen_fill_chunk(Chunk *c, int cx, int cy, int cz, uint64_t seed)
 {
     (void)seed;   /* one fixed asteroid; generation is seed-independent */
     switch (g_gen_version) {
         case 3u:           gen_fill_v3(c, cx, cy, cz); break;
-        case 4u: default:  gen_fill_v4(c, cx, cy, cz); break;
+        case 4u:           gen_fill_v4(c, cx, cy, cz); break;
+        case 5u:           gen_fill_v5(c, cx, cy, cz); break;
+        case 6u: default:  gen_fill_v6(c, cx, cy, cz); break;
     }
 }
 
@@ -382,10 +555,11 @@ int worldgen_chunk_all_air(int cx, int cy, int cz)
     /* Min squared distance from the centre to ANY voxel in the chunk = sum of the
      * per-axis nearest distances squared. If even that is beyond the MAXIMUM
      * possible surface radius, every voxel is air. Must be conservative against the
-     * peak (a v4 relief ridge reaches R+AMP) or sparse-air would drop real terrain;
-     * v3 (smooth) has no relief so its max surface is exactly R. Dispatch on the
-     * active world's generator version, matching worldgen_fill_chunk. */
-    const long Rhi = (long)WG_PLANET_R + ((g_gen_version >= 4u) ? WG_RELIEF_AMP : 0);
+     * peak (a v5 ridge reaches R+AMP5, a v4 ridge R+AMP) or sparse-air would drop
+     * real terrain; v3 (smooth) has no relief so its max surface is exactly R.
+     * Dispatch on the active world's generator version, matching worldgen_fill_chunk. */
+    const long Rhi = (long)WG_PLANET_R + ((g_gen_version >= 5u) ? WG_RELIEF5_AMP
+                                        : (g_gen_version >= 4u) ? WG_RELIEF_AMP : 0);
     const long Rhi2 = Rhi * Rhi;
     long nx = axis_near(cx * CHUNK_DIM, WG_PLANET_CX);
     long ny = axis_near(cy * CHUNK_DIM, WG_PLANET_CY);

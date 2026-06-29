@@ -103,25 +103,33 @@ int main(void)
         check("surface displacement never exceeds +AMP (all-air predicate is safe)", !over);
     }
 
-    /* (7) per-world generator VERSIONING: the build retains v3 (smooth) + v4 (relief);
-     * each generates deterministically, and they differ at the surface (relief is not
-     * smooth) - which is the whole point of pinning (a v3 world keeps loading smooth). */
+    /* (7) per-world generator VERSIONING: the build retains v3 (smooth) + v4 (small
+     * relief) + v5 (drainage); each generates deterministically, and all three differ
+     * at the surface - which is the whole point of pinning (a v3 world keeps loading
+     * smooth, a v4 world its rolling hills, even now v5 is the default). */
     {
         Chunk *c = malloc(sizeof *c);
         Voxel *v4buf = malloc((size_t)CHUNK_VOXELS * sizeof(Voxel));
-        if (c == NULL || v4buf == NULL) { check("alloc version-test buffers", 0); }
+        Voxel *v5buf = malloc((size_t)CHUNK_VOXELS * sizeof(Voxel));
+        if (c == NULL || v4buf == NULL || v5buf == NULL) { check("alloc version-test buffers", 0); }
         else {
             c->voxels = malloc((size_t)CHUNK_VOXELS * sizeof(Voxel));
             c->slab_idx = -1;
             if (c->voxels == NULL) { check("alloc version-test chunk", 0); }
             else {
-                check("v3 + v4 supported, others rejected",
+                check("v3..v6 supported, others rejected",
                       worldgen_version_supported(3) && worldgen_version_supported(4)
-                      && !worldgen_version_supported(2) && !worldgen_version_supported(99));
-                worldgen_select_version(4);
+                      && worldgen_version_supported(5) && worldgen_version_supported(6)
+                      && !worldgen_version_supported(2) && !worldgen_version_supported(7));
+                worldgen_select_version(5);
                 worldgen_fill_chunk(c, 32, 32, 0, 0);   /* equatorial surface: relief active */
-                check("worldgen_active_version reflects the selection", worldgen_active_version() == 4u);
+                check("worldgen_active_version reflects the selection", worldgen_active_version() == 5u);
+                memcpy(v5buf, c->voxels, (size_t)CHUNK_VOXELS * sizeof(Voxel));
+                worldgen_select_version(4);
+                worldgen_fill_chunk(c, 32, 32, 0, 0);   /* same chunk, small-relief generator */
                 memcpy(v4buf, c->voxels, (size_t)CHUNK_VOXELS * sizeof(Voxel));
+                check("v5 (drainage) differs from v4 (relief) at the surface",
+                      memcmp(v5buf, c->voxels, (size_t)CHUNK_VOXELS * sizeof(Voxel)) != 0);
                 worldgen_select_version(3);
                 worldgen_fill_chunk(c, 32, 32, 0, 0);   /* same chunk, smooth generator */
                 check("v3 (smooth) differs from v4 (relief) at the surface",
@@ -130,7 +138,56 @@ int main(void)
                 free(c->voxels);
             }
         }
-        free(v4buf); free(c);
+        free(v5buf); free(v4buf); free(c);
+    }
+
+    /* (8) v5 DRAINAGE relief: bounded to [-AMP5,+AMP5], deterministic, pole-flat, and
+     * with a BIGGER swing than v4's small relief (the whole point - water needs basins
+     * to collect in and highlands to drain from). Pure integer, like v4. */
+    {
+        const int R = WG_PLANET_R;
+        int dx, dz, ok_bound = 1, ok_det = 1, v5max = 0, v4max = 0;
+        for (dx = -R; dx <= R; dx += 23) {
+            for (dz = -R; dz <= R; dz += 23) {
+                int o5 = worldgen_radial_offset_v5(dx, R / 3, dz);
+                int a5 = o5 < 0 ? -o5 : o5, a4;
+                if (a5 > WG_RELIEF5_AMP) ok_bound = 0;
+                if (worldgen_radial_offset_v5(dx, R / 3, dz) != o5) ok_det = 0;
+                if (a5 > v5max) v5max = a5;
+                a4 = worldgen_radial_offset(dx, R / 3, dz);
+                a4 = a4 < 0 ? -a4 : a4;
+                if (a4 > v4max) v4max = a4;
+            }
+        }
+        check("v5 offset stays within [-AMP5, +AMP5]", ok_bound);
+        check("v5 offset is deterministic (pure function)", ok_det);
+        check("v5 relief is 0 on the +Y pole axis (dry spawn)",
+              worldgen_radial_offset_v5(0, R, 0) == 0);
+        check("v5 drainage swings deeper than v4 (basins to collect water)", v5max > v4max);
+    }
+
+    /* (9) v6 river VALLEYS: the incised offset is <= v5 EVERYWHERE (valleys only cut
+     * down, never raise), STRICTLY below v5 somewhere (valleys exist), deterministic,
+     * pole-flat (no valley cuts the dry spawn), and never deeper than the band cap. */
+    {
+        const int R = WG_PLANET_R;
+        int dx, dz, ok_le = 1, ok_det = 1, ok_cap = 1, cut = 0;
+        for (dx = -R; dx <= R; dx += 19) {
+            for (dz = -R; dz <= R; dz += 19) {
+                int o5 = worldgen_radial_offset_v5(dx, R / 4, dz);
+                int o6 = worldgen_radial_offset_v6(dx, R / 4, dz);
+                if (o6 > o5) ok_le = 0;                       /* valleys never raise */
+                if (o6 < o5) cut = 1;                         /* a valley here       */
+                if (o5 - o6 > WG_VALLEY_MAXD) ok_cap = 0;     /* incision band-capped */
+                if (worldgen_radial_offset_v6(dx, R / 4, dz) != o6) ok_det = 0;
+            }
+        }
+        check("v6 valley offset is <= v5 everywhere (valleys only carve down)", ok_le);
+        check("v6 incises valleys somewhere (offset strictly below v5)", cut);
+        check("v6 incision never exceeds WG_VALLEY_MAXD (band-safe)", ok_cap);
+        check("v6 offset is deterministic (pure function)", ok_det);
+        check("v6 keeps the +Y pole flat (no valley in the dry spawn)",
+              worldgen_radial_offset_v6(0, R, 0) == 0);
     }
 
     printf("=== %d failure(s) ===\n", g_fail);

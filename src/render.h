@@ -27,6 +27,13 @@
  * already done. Returns 0 on success, non-zero on failure. */
 int  render_init(void);
 
+/* Set the view-distance fog band (world-space depth): geometry fades from `start`
+ * to full sky at `end`. The caller ties `end` to the streaming window radius so the
+ * fog reaches full just inside the loaded edge (chunks fade rather than pop). Cheap
+ * (two uniform writes on each chunk program); call whenever the view distance
+ * changes. Safe before render_init (records the values; applied once programs exist). */
+void render_set_fog(float start, float end);
+
 /* Upload (or re-upload) a chunk's mesh into the given slot's VBO/IBO, recording
  * its world origin (cx,cy,cz in chunk coords -> the shader's u_chunk_origin).
  * Uses pooled buffer handles + glBufferData orphaning, never per-remesh

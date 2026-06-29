@@ -129,6 +129,8 @@ typedef struct {
     GLint  u_sun;
     GLint  u_sun_tint;
     GLint  u_atlas;          /* sampler2D, texture unit 0                  */
+    GLint  u_fog_start;      /* view-distance fog: depth where fade begins */
+    GLint  u_fog_end;        /* ... and where it reaches full sky (adjustable) */
 } Program;
 
 static Program    g_opaque;
@@ -158,6 +160,11 @@ static GLuint     g_ui_vbo           = 0;   /* dynamic NDC tris (font + menu rec
 static float      g_frame_mvp[16];
 static int        g_frame_have_mvp = 0;
 static float      g_frame_sun = 1.0f;
+
+/* Current view-distance fog band (world-space depth). Defaults match the radius-6
+ * window (~92 vox); render_set_fog updates them + pushes to both chunk programs. */
+static float      g_fog_start = 55.0f;
+static float      g_fog_end   = 92.0f;
 
 /* Per-frame u_sun_tint, derived from the live sun in render_begin and shared by
  * both passes (opaque sets it; render_end's liquid pass reuses it, like
@@ -272,6 +279,8 @@ static const char *VS_OPAQUE =
     "uniform vec3  u_chunk_origin;\n"
     "uniform float u_atlas_cols;\n"   /* = 16.0, shared grid constant */
     "uniform float u_sun;\n"
+    "uniform float u_fog_start;\n"    /* view-distance fog start (depth), set by render_set_fog */
+    "uniform float u_fog_end;\n"      /* ... and full-fog depth; both adjustable at runtime       */
     "attribute vec3  a_pos;\n"        /* px,py,pz : 0..16 chunk-local */
     "attribute float a_mat;\n"        /* atlas tile id 0..255         */
     "attribute float a_face;\n"       /* liquid fill-height TOP-DROP, 1/16 voxel; 0 for opaque */
@@ -295,12 +304,11 @@ static const char *VS_OPAQUE =
      * 1000 far plane so distant chunks FADE into the sky colour rather than pop
      * at the clip plane. The central demo (a few tens of voxels out) stays
      * unfogged. The FS mixes the final colour toward the matching sky colour. */
-    /* 0.5 M2: at the 0.5 m grain the resident window is radius-6 = 96 voxels, so fog
-     * ramps to full by ~92 voxels (~46 m) to hide the streaming edge - the old
-     * 140..340 was sized for the R=64 ball that fit entirely in view. */
-    "    const float FOG_START = 55.0;\n"
-    "    const float FOG_END   = 92.0;\n"
-    "    v_fog = clamp((gl_Position.w - FOG_START) / (FOG_END - FOG_START), 0.0, 1.0);\n"
+    /* 0.5: fog start/end are UNIFORMS (render_set_fog) so the view distance is
+     * adjustable at runtime - they track the streaming window radius (fog reaches
+     * full a little inside the loaded edge so chunks fade rather than pop in). The
+     * max() guards a degenerate start==end. */
+    "    v_fog = clamp((gl_Position.w - u_fog_start) / max(u_fog_end - u_fog_start, 1.0), 0.0, 1.0);\n"
     /* Reconstruct atlas UV from tile id + corner using the shared grid const.
      * col = mod(mat,16); row = floor(mat/16); uv = (corner + (col,row))/cols. */
     "    float inv = 1.0 / u_atlas_cols;\n"
@@ -499,6 +507,8 @@ static void cache_uniform_locations(Program *p)
     p->u_mvp          = glGetUniformLocation(p->program, "u_mvp");
     p->u_chunk_origin = glGetUniformLocation(p->program, "u_chunk_origin");
     p->u_atlas_cols   = glGetUniformLocation(p->program, "u_atlas_cols");
+    p->u_fog_start    = glGetUniformLocation(p->program, "u_fog_start");
+    p->u_fog_end      = glGetUniformLocation(p->program, "u_fog_end");
     p->u_sun          = glGetUniformLocation(p->program, "u_sun");
     p->u_sun_tint     = glGetUniformLocation(p->program, "u_sun_tint");
     p->u_atlas        = glGetUniformLocation(p->program, "u_atlas");
@@ -714,6 +724,12 @@ int render_init(void)
         glUseProgram(g_opaque.program);          /* leave opaque current */
     }
 
+    /* Seed the fog uniforms to the default view distance (radius-6 window). MUST be
+     * set explicitly: an unset uniform defaults to 0, and 0..0 fog would clamp every
+     * fragment to full sky. render_set_fog is called again at runtime when the player
+     * changes the view distance. */
+    render_set_fog(g_fog_start, g_fog_end);
+
     /* All slots start empty (both streams). */
     for (i = 0; i < MAX_RENDER_CHUNKS; ++i) {
         g_slots[i].vbo             = 0;
@@ -832,6 +848,26 @@ void render_free_slot(int slot)
     s = &g_slots[slot];
     s->index_count     = 0;
     s->liq_index_count = 0;
+}
+
+void render_set_fog(float start, float end)
+{
+    g_fog_start = start;
+    g_fog_end   = end;
+    /* The program!=0 guards below make this safe before render_init builds them
+     * (it just records the values); render_init calls us once they exist. */
+    if (g_opaque.program != 0) {
+        glUseProgram(g_opaque.program);
+        if (g_opaque.u_fog_start >= 0) glUniform1f(g_opaque.u_fog_start, start);
+        if (g_opaque.u_fog_end   >= 0) glUniform1f(g_opaque.u_fog_end,   end);
+    }
+    if (g_liquid.program != 0) {
+        glUseProgram(g_liquid.program);
+        if (g_liquid.u_fog_start >= 0) glUniform1f(g_liquid.u_fog_start, start);
+        if (g_liquid.u_fog_end   >= 0) glUniform1f(g_liquid.u_fog_end,   end);
+    }
+    if (g_opaque.program != 0)
+        glUseProgram(g_opaque.program);  /* leave opaque current */
 }
 
 void render_begin(const float *mvp4x4, float sun)

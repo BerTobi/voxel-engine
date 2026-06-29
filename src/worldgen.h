@@ -51,7 +51,9 @@
 /* Bump on ANY change to generated output (Section 8 versioning). A save written
  * by an older version is "from an older generator" and must not silently
  * regenerate differently (the doc's default: refuse to load on mismatch). */
-#define WG_GEN_VERSION   4u   /* 4: 0.5 radial terrain relief (hills/basins); 3 was smooth R=512 */
+#define WG_GEN_VERSION   6u   /* 6: 0.5 DRAINAGE terrain + incised river VALLEYS (steep channels
+                               * the water CA can flow down); 5 was smooth drainage; 4 small
+                               * relief; 3 the smooth R=512 ball */
 
 /* ---- Surface band (binding; the WorldStore vertical band brackets this) ---- *
  * The heightmap surface lives entirely within [WG_HEIGHT_MIN, WG_HEIGHT_MAX]
@@ -112,6 +114,50 @@
 #define WG_RELIEF_SEED       0x5C0FFEE5u /* fixed: one asteroid, terrain seed-independent     */
 #define WG_POLE_FLAT_R2      2304   /* flatten relief within sqrt(2304)=48 vox (24 m) of the Y axis */
 
+/* ---- DRAINAGE terrain (0.5 gen v5: continents, ocean basins, a sea level) ---- *
+ * v4's relief is small rolling hills (+/-20 vox over a 32 m lattice) - good texture,
+ * but no LARGE-scale structure, so water just pools in the nearest local dip rather
+ * than draining a long way. v5 keeps the same pure-integer 3-D value-noise machinery
+ * but at a CONTINENT scale: a 256 m base lattice (period 2^8) with bigger amplitude,
+ * so the surface radius swings widely - broad HIGHLANDS (surface well above R) and
+ * broad ocean BASINS (surface well below R) with long connecting slopes. That gives
+ * water a real downhill path AND somewhere low to collect. A SEA LEVEL radius
+ * (WG_SEA_R) sits a little below the mean R, so the spawn pole (relief-flattened to
+ * 0 -> surface == R) is dry LAND above the waterline while the basins are below it.
+ * Still seed-independent (one fixed asteroid) and integer end-to-end (cross-platform
+ * byte-identical, like v4). Amplitude (+/-WG_RELIEF5_AMP) stays inside the resident
+ * vertical band (world.h WORLD_BAND_HALF=4 -> +/-64 vox), so a basin floor and the
+ * highland beside it are both resident. */
+#define WG_RELIEF5_AMP        40    /* max in/out surface displacement, voxels (x0.5m = 20 m) */
+#define WG_RELIEF5_PERIOD_LOG2 8u   /* continent lattice = 2^8 = 256 vox (128 m)              */
+#define WG_RELIEF5_OCTAVES    2u    /* 256 + 128 vox features (broad continents + coastlines) */
+/* Sea level: a radius a little under the mean R. Terrain whose displaced surface is
+ * BELOW this is an ocean basin (its air, up to this radius, is where the sea fills);
+ * surface ABOVE it is dry land. R-6 leaves the pole-flat spawn (surface == R) a
+ * comfortable 6 vox (3 m) above the waterline so the forge never floods, and makes
+ * ~25% of the planet ocean (broad basins ~11 m deep at the lowest). The SEA itself
+ * is NOT generated here (worldgen stays a pure, dry, regenerate-from-seed function);
+ * a live overlay in main.c fills basin air up to a rising level (capped at WG_SEA_R). */
+#define WG_SEA_R             (WG_PLANET_R - 6)   /* ocean surface radius (506 vox)            */
+
+/* ---- River VALLEYS (0.5 gen v6: steep incised channels for the water CA) ----- *
+ * v5's drainage relief is smooth + gentle (~1:5 grade), too shallow for binary-fill
+ * water to flow - a spring just pools on the flat runs (measured). v6 INCISES a
+ * network of valleys into it: along the zero-contours of a separate value-noise
+ * field (which form connected curves winding across the surface), the surface is cut
+ * DOWN by a V-profiled depth. Crucially the depth ramps DEEPER where the base terrain
+ * is lower (toward the basins), so a valley FLOOR plunges from the highlands down to
+ * the sea far steeper than the gentle base - giving the CA a confined, steep path
+ * with frequent 1-vox steps to cascade down. Depth is band-capped (WG_VALLEY_MAXD)
+ * so a valley floor never drops out of the resident vertical band. Pure integer +
+ * seed-independent like the rest of worldgen. */
+#define WG_VALLEY_SEED         0x5EA12345u  /* fixed: valley network is seed-independent     */
+#define WG_VALLEY_PERIOD_LOG2  7u           /* valley-network lattice = 2^7 = 128 vox spacing */
+#define WG_VALLEY_HALFWIDTH    420          /* |noise| band (of 2048) counted as in-valley    */
+#define WG_VALLEY_FLOOR        3            /* minimum incision depth at a valley centre      */
+#define WG_VALLEY_VREF         14           /* base offset above which valleys vanish (peaks) */
+#define WG_VALLEY_MAXD         20           /* max incision (band-safe: <(64-AMP5_effective)) */
+
 /* ---- Value-noise lattice (binding; cheap integer hills) -------------------- *
  * Heights are sampled on a coarse square lattice of period WG_NOISE_PERIOD
  * world-voxels (a power of two so the in-cell interpolation fraction is a mask,
@@ -157,6 +203,20 @@ int  worldgen_height(uint64_t seed, int wx, int wz);
  * FLAT_R2) out. worldgen_fill_chunk adds this to WG_PLANET_R to place the crust.
  * Exposed for the worldgen unit test. */
 int  worldgen_radial_offset(int dx, int dy, int dz);
+
+/* v5 DRAINAGE variant of the above: the continent-scale surface displacement (the
+ * amount the terrain pushes the sphere surface out (+) / in (-)) in that direction,
+ * in [-WG_RELIEF5_AMP, +WG_RELIEF5_AMP]. Same pure-integer, pole-flattened, per-
+ * direction height-field shape as worldgen_radial_offset, just at the larger
+ * WG_RELIEF5_* lattice/amplitude. gen_fill_v5 adds it to WG_PLANET_R; exposed for
+ * the worldgen unit test. */
+int  worldgen_radial_offset_v5(int dx, int dy, int dz);
+
+/* v6 DRAINAGE + VALLEYS variant: worldgen_radial_offset_v5 with a river-valley network
+ * INCISED into it (see WG_VALLEY_* above). Same pure-integer, per-direction height-field
+ * shape; the result is <= the v5 offset everywhere (valleys only cut down). gen_fill_v6
+ * adds it to WG_PLANET_R; exposed for the worldgen unit test + the terrain sampler. */
+int  worldgen_radial_offset_v6(int dx, int dy, int dz);
 
 /* ---- Per-world generator versioning (cross-version save compatibility) ----- *
  * A world is pinned to the generator version it was created with (stored in its

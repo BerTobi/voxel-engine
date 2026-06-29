@@ -526,6 +526,18 @@ static uint64_t g_last_edit_tick = 0;   /* world_tick of the most recent edit (h
  * Set per session from the net mode; gates the edit-time sim wake in edit_and_notify. */
 static int g_local_ca = 1;
 
+/* ---- Rising SEA overlay state (0.5 gen v5 drainage prototype) ------------- *
+ * The sea is a LIVE overlay (see sea_fill_update below), driven by a single global
+ * "sea level" radius that rises over time. These track the last-applied level + the
+ * player chunk it was applied at, so the window is re-filled only when the level
+ * rises or the player crosses into new (un-filled) chunks - not every frame. */
+static int g_sea_on = 0;     /* sea overlay active this session (v5 + host/SP)     */
+static int g_sea_r  = -1;    /* sea radius last filled to (-1 = never; forces fill)*/
+static int g_sea_cx = 0, g_sea_cy = 0, g_sea_cz = 0;  /* player chunk at last fill */
+static uint64_t g_sea_clock = 0;  /* per-FRAME clock driving the rise (independent of
+                                   * the forge CA, so the sea keeps rising even when the
+                                   * player roams to the coast, away from any active sim) */
+
 /* ---- 0.4 M3b: the world-wide CA active set ------------------------------- *
  * The heat CA is no longer a single bound chunk. The forge `sim` (main, below)
  * is the PRIMARY chunk; g_xsim[] holds ADDITIONAL chunks woken by cross-chunk
@@ -865,6 +877,182 @@ static int home_is_decorated(const Chunk *c)
 
 /* ===================================================================== */
 
+/* ---- Rising SEA overlay (0.5 gen v5 drainage prototype) ------------------ *
+ * The v5 generator makes DRY drainage terrain (continents + ocean basins, see
+ * worldgen.c). The SEA is a LIVE OVERLAY computed here, deliberately NOT baked into
+ * worldgen (which must stay a pure regenerate-from-seed function). A single "sea
+ * level" RADIUS rises over time from below the deepest basin (a fully DRY planet)
+ * up to WG_SEA_R; each step a pass over the resident window turns basin AIR whose
+ * distance from the planet centre is within the current sea radius into static
+ * MAT_WATER. Because the asteroid is a solid height-field sphere (no overhangs or
+ * caves), "air within the sea radius" is EXACTLY the open basin/ocean volume, so the
+ * fill never floods an enclosed pocket - and the dry pole spawn / forge sit above
+ * WG_SEA_R, so they are never touched. The water is NOT woken into the CA (a static
+ * sea costs zero ticks) and NOT flagged CHUNK_MODIFIED (it is a pure function of
+ * (terrain, sea level), recomputed each session like worldgen itself) - so it never
+ * bloats a save, and a channel the player digs below sea level simply floods on the
+ * next pass.
+ *
+ * PROTOTYPE SCOPE: single-player / host only (gated on g_local_ca); the sea level is
+ * session-local (a fresh world fills from dry as you watch) and not yet persisted or
+ * MP-synced - both are noted follow-ups. */
+#define SEA_FRAMES_PER_VOX 60u   /* frames per +1 vox of rise (~1-2 s; basins start to
+                                  * flood ~15 s in, full ocean ~1 min, at 30-60 fps)   */
+
+/* The sea-level RADIUS at frame-clock `clk`: rises linearly from the dry floor
+ * (one amplitude below R, beneath the deepest basin) up to WG_SEA_R, then holds.
+ * VOXEL_SEA_FILL (0..100) PINS it to a fraction for reproducible headless captures. */
+static int sea_level_radius(uint64_t clk)
+{
+    int lo = WG_PLANET_R - WG_RELIEF5_AMP;   /* below the deepest basin -> fully dry */
+    int hi = WG_SEA_R;
+    const char *pin = getenv("VOXEL_SEA_FILL");
+    if (pin != NULL && pin[0] != '\0') {
+        long p = atol(pin);
+        if (p < 0)   p = 0;
+        if (p > 100) p = 100;
+        return lo + (int)((long)(hi - lo) * p / 100);
+    }
+    {
+        long r = (long)lo + (long)(clk / SEA_FRAMES_PER_VOX);
+        return (r > (long)hi) ? hi : (int)r;
+    }
+}
+
+/* |distance| along one axis from centre `center` to the voxel span [base, base+15]:
+ * 0 if the centre is inside, else the gap to the nearer end (the chunk's NEAREST
+ * approach to the planet centre on that axis). */
+static long sea_axis_near(int base, int center)
+{
+    int lo = base, hi = base + CHUNK_DIM - 1;
+    if (center < lo) return (long)(lo - center);
+    if (center > hi) return (long)(center - hi);
+    return 0;
+}
+
+/* Fill submerged basin AIR in the resident window with static water up to the sea
+ * radius `sea_r`, remeshing each chunk that changes. Idempotent (cells already water
+ * or solid are skipped) so it is safe to call every trigger; returns the number of
+ * chunks changed (0 == the window is already up to date for this level). HOME (the
+ * hand-decorated forge) is skipped outright - it sits above WG_SEA_R, but skipping it
+ * also keeps the sea overlay and the live forge CA cleanly disjoint. */
+static int sea_fill_update(WorldStore *ws, StreamCtx *sctx, int sea_r)
+{
+    long     sea_r2 = (long)sea_r * (long)sea_r;
+    int      changed_chunks = 0;
+    uint32_t n = world_resident_count(ws), ci;
+
+    for (ci = 0; ci < n; ++ci) {
+        Chunk *c = world_resident_at(ws, ci);
+        long bx, by, bz, nx, ny, nz;
+        int  lx, ly, lz, changed = 0;
+
+        if (c->cx == HOME_CX && c->cy == HOME_CY && c->cz == HOME_CZ)
+            continue;                              /* never flood the forge */
+
+        bx = (long)c->cx * CHUNK_DIM;
+        by = (long)c->cy * CHUNK_DIM;
+        bz = (long)c->cz * CHUNK_DIM;
+        nx = sea_axis_near((int)bx, WG_PLANET_CX);
+        ny = sea_axis_near((int)by, WG_PLANET_CY);
+        nz = sea_axis_near((int)bz, WG_PLANET_CZ);
+        if (nx * nx + ny * ny + nz * nz > sea_r2)
+            continue;                              /* whole chunk above the sea surface */
+        if (world_realize(ws, c) != 0)
+            continue;                              /* need a real block to write water  */
+
+        for (lz = 0; lz < CHUNK_DIM; ++lz) {
+            long dz  = bz + lz - WG_PLANET_CZ, dz2 = dz * dz;
+            for (ly = 0; ly < CHUNK_DIM; ++ly) {
+                long dy = by + ly - WG_PLANET_CY, dyz2 = dz2 + dy * dy;
+                for (lx = 0; lx < CHUNK_DIM; ++lx) {
+                    long  dx = bx + lx - WG_PLANET_CX;
+                    long  d2 = dyz2 + dx * dx;
+                    int   idx;
+                    Voxel v;
+                    if (d2 > sea_r2)
+                        continue;                  /* above the sea surface */
+                    idx = vox_index(lx, ly, lz);
+                    v   = c->voxels[idx];
+                    if (vox_mat(v) != MAT_AIR)
+                        continue;                  /* terrain, or already sea water */
+                    vox_set_mat(&v, MAT_WATER);
+                    vox_set_fill(&v, 15);
+                    vox_set_flags(&v, vox_flags(v) | VF_LIQUID);
+                    c->voxels[idx] = v;
+                    changed = 1;
+                }
+            }
+        }
+        if (changed) {
+            c->flags |= CHUNK_DIRTY_MESH;
+            cb_mesh_upload(c, world_render_slot(ws, c), sctx);
+            c->flags &= (uint8_t)~CHUNK_DIRTY_MESH;
+            ++changed_chunks;
+        }
+    }
+    return changed_chunks;
+}
+
+/* Surface world-Y at column (wx,wz): the first SOLID (non-air) voxel scanning down
+ * from top_y. Returns <= WG_PLANET_CY if the column is all air (e.g. not resident).
+ * Used by the river demo to place a spring just above the ground + measure slope. */
+static int surface_y_at(WorldStore *ws, int wx, int wz, int top_y)
+{
+    int yy;
+    for (yy = top_y; yy > WG_PLANET_CY; --yy)
+        if (vox_mat(world_get_voxel(ws, wx, yy, wz)) != MAT_AIR)
+            break;
+    return yy;
+}
+
+/* River-demo telemetry: scan resident chunks for MAT_WATER and report the count +
+ * world-space bounding box, so the water's SPREAD (a tight pool vs a long descending
+ * river) is measurable rather than guessed from a screenshot. Debug only. */
+static void water_stats_log(WorldStore *ws, uint64_t tick)
+{
+    long count = 0;
+    int  minx = 1<<30, maxx = -(1<<30), miny = 1<<30, maxy = -(1<<30), minz = 1<<30, maxz = -(1<<30);
+    uint32_t n = world_resident_count(ws), ci;
+    for (ci = 0; ci < n; ++ci) {
+        Chunk *c = world_resident_at(ws, ci);
+        int lx, ly, lz;
+        if (c->voxels == NULL) continue;            /* uniform-air: no water */
+        for (lz = 0; lz < CHUNK_DIM; ++lz)
+        for (ly = 0; ly < CHUNK_DIM; ++ly)
+        for (lx = 0; lx < CHUNK_DIM; ++lx) {
+            if (vox_mat(c->voxels[vox_index(lx,ly,lz)]) != MAT_WATER) continue;
+            { int wx = c->cx*CHUNK_DIM+lx, wy = c->cy*CHUNK_DIM+ly, wz = c->cz*CHUNK_DIM+lz;
+              ++count;
+              if (wx < minx) minx = wx;
+              if (wx > maxx) maxx = wx;
+              if (wy < miny) miny = wy;
+              if (wy > maxy) maxy = wy;
+              if (wz < minz) minz = wz;
+              if (wz > maxz) maxz = wz; }
+        }
+    }
+    if (count == 0) { fprintf(stderr, "  water: NONE\n"); return; }
+    fprintf(stderr, "  water: %ld cells  x[%d..%d] y[%d..%d] z[%d..%d]  (spanX=%d dropY=%d spanZ=%d)\n",
+            count, minx,maxx, miny,maxy, minz,maxz, maxx-minx, maxy-miny, maxz-minz);
+    (void)tick;
+}
+
+/* ---- Adjustable view distance (0.5) -------------------------------------- *
+ * The window radius (chunks the streamer keeps resident) is the HARD limit on how
+ * far you can see; the fog must finish JUST inside that loaded edge or chunks pop in
+ * at the boundary. apply_view_distance sets BOTH together: clamp the radius via the
+ * store, then pull the fog band in to match. Returns the clamped radius (chunks). */
+static int apply_view_distance(WorldStore *ws, int radius)
+{
+    int   r    = world_set_view_radius(ws, radius);
+    float edge = (float)(r * CHUNK_DIM);   /* the loaded window edge, world voxels   */
+    float end  = edge - 6.0f;              /* fog reaches full sky a touch inside it  */
+    float start = end * 0.55f;             /* begin fading past mid-view              */
+    render_set_fog(start, end);
+    return r;
+}
+
 /* Read a float world-coordinate from the environment, or fall back to a
  * default. Used by VOXEL_CAM_X / VOXEL_CAM_Z for headless camera placement. */
 static float env_float(const char *name, float fallback)
@@ -980,6 +1168,8 @@ static void draw_pause_menu(float aspect, int sel, int fullscreen_on)
     }
     render_text(-0.40f, -0.36f, 0.04f, aspect, 0.65f, 0.65f, 0.70f, 1.0f,
                 "Up/Down + Enter    Esc resumes");
+    render_text(-0.40f, -0.42f, 0.035f, aspect, 0.55f, 0.60f, 0.68f, 1.0f,
+                "In game: Up/Down sets view distance");
 }
 
 /* ---- 0.3 connect screen (startup + quit-to-menu): Single / Host / Join / Quit *
@@ -1601,6 +1791,17 @@ int main(void)
     if (net != NULL && net_mode(net) == NET_CLIENT)
         seed = net_seed(net);
     g_local_ca = (net == NULL || net_mode(net) != NET_CLIENT);   /* host/SP simulate; client renders */
+    /* Rising-sea overlay: only on a v5 DRAINAGE world, only where we own the world
+     * state (host/SP), and unless explicitly disabled. Reset the applied level so the
+     * first frame fills the window from the current (dry) start. */
+    /* The artificial sea overlay is now OPT-IN (default OFF): the emergent model is a
+     * placed SPRING whose water finds its own way downhill to the basins (the player
+     * was unconvinced by a sea that just rises on its own). VOXEL_SEA_FILL=N pins a
+     * static sea (debug/comparison); VOXEL_SEA_AUTO turns the rise back on. */
+    g_sea_on = g_local_ca && (worldgen_active_version() >= 5u)
+                          && (getenv("VOXEL_SEA_FILL") != NULL || getenv("VOXEL_SEA_AUTO") != NULL);
+    g_sea_r     = -1;
+    g_sea_clock = 0;
     /* cb_gen (on a client) enqueues chunk-sync requests here; init before world_prime. */
     stream_ctx.net       = net;
     stream_ctx.req_head  = 0;
@@ -1647,6 +1848,15 @@ int main(void)
                             "ephemeral this run\n", save_dir);
         else
             world_set_persist(world, persist);
+    }
+
+    /* 0.5: apply the initial view distance (window radius + matching fog) BEFORE the
+     * prime, so the first window loads at the chosen radius. VOXEL_VIEW_RADIUS overrides
+     * the default for headless captures; live sessions adjust it with Up/Down. */
+    {
+        const char *vr = getenv("VOXEL_VIEW_RADIUS");
+        apply_view_distance(world, (vr != NULL && vr[0] != '\0')
+                                   ? atoi(vr) : world_view_radius(world));
     }
 
     /* 0.5 M2: prime the window around the spawn pole's Y (= the surface, CY+R) so
@@ -1736,6 +1946,15 @@ int main(void)
     cam_pos.x    = cam_look_x;
     cam_pos.y    = (float)(WG_PLANET_CY + WG_PLANET_R) + M2V(3.0f);  /* spawn 3 m above the pole */
     cam_pos.z    = cam_look_z;
+    /* Headless framing: VOXEL_CAM_Y overrides the eye height (parallel to CAM_X/Z),
+     * so a capture can sit high for an orbital overview of the drainage terrain/sea
+     * rather than only at the pole surface. Live walk sessions ignore it (gravity
+     * settles the body) - it just seeds the first frame. */
+    {
+        const char *cy_env = getenv("VOXEL_CAM_Y");
+        if (cy_env != NULL && cy_env[0] != '\0')
+            cam_pos.y = (float)atof(cy_env);
+    }
 
     /* Player body: FLY is forced under VOXEL_SHOT (headless captures must not get
      * gravity/collision); a live session walks. Seed the feet so the EYE lands
@@ -1876,6 +2095,7 @@ int main(void)
     frame_prev_ms = plat_time_ms();
 
     int sel_mat = 0;   /* placement-material index into PLACE_MATS (0 = stone) */
+    int river_placed = 0;  /* VOXEL_RIVER_DEMO: one-shot slope-spring placement */
 
     /* 0.3 pause menu. ESC toggles `paused`: the scene freezes + the cursor is
      * freed + the menu draws over the frozen frame. VOXEL_MENU=1 starts paused so
@@ -1946,6 +2166,21 @@ int main(void)
                 paused = !paused;
                 menu_sel = 0;
                 plat_set_mouse_capture(paused ? 0 : 1);
+            }
+            if (!paused) {
+                /* 0.5: live VIEW DISTANCE control. Up = farther, Down = nearer (the
+                 * window radius + matching fog). Free keys during play (Up/Down only
+                 * navigate the pause menu). A brief toast shows the new distance so
+                 * the control is discoverable. Edge-triggered. */
+                int dvr = 0;
+                if (up_now   && !up_prev)   dvr = +1;
+                if (down_now && !down_prev) dvr = -1;
+                if (dvr != 0) {
+                    int r = apply_view_distance(world, world_view_radius(world) + dvr);
+                    snprintf(toast_line, sizeof toast_line,
+                             "View distance: %d m  (%d)", (int)V2M((float)(r * CHUNK_DIM)), r);
+                    toast_until = frame_start + 2500.0;
+                }
             }
             if (paused) {
                 if (up_now   && !up_prev)    menu_sel = (menu_sel + 3) % 4;  /* up   */
@@ -2219,6 +2454,28 @@ int main(void)
          * nothing. */
         world_stream_update(world, cam_pos.x, cam_pos.y, cam_pos.z);
 
+        /* --- Rising SEA overlay (v5 drainage worlds; host/SP) ------------- *
+         * After the window settles, re-fill submerged basin air up to the current
+         * sea level. The level rises with the world clock; re-fill ONLY when it
+         * rises OR the player crosses into new chunks (newly streamed basins need
+         * filling) - a stationary player at a steady level costs one cheap compare.
+         * Runs before drawing so the frame shows the current waterline. */
+        if (g_sea_on) {
+            int sea_r;
+            ++g_sea_clock;                       /* advance the sea every frame */
+            sea_r = sea_level_radius(g_sea_clock);
+            {
+            int pcx = (int)floorf(cam_pos.x / (float)CHUNK_DIM);
+            int pcy = (int)floorf(cam_pos.y / (float)CHUNK_DIM);
+            int pcz = (int)floorf(cam_pos.z / (float)CHUNK_DIM);
+            if (sea_r != g_sea_r || pcx != g_sea_cx || pcy != g_sea_cy || pcz != g_sea_cz) {
+                g_sea_r = sea_r;
+                g_sea_cx = pcx; g_sea_cy = pcy; g_sea_cz = pcz;
+                sea_fill_update(world, &stream_ctx, sea_r);
+            }
+            }
+        }
+
         /* 0.3: send a bounded batch of chunk-sync requests (client only). The ring
          * was just filled by cb_gen for any chunks this stream step generated; the
          * host replies and net_poll patches them in over the next frames. Bounded
@@ -2280,6 +2537,53 @@ int main(void)
                     sim_set_progress_sink(sim, prog_ring);
                     g_world_tick = sim->tick_index;  /* M3a: WorldClock adopts the rebound sim tick (0) */
                 }
+            }
+        }
+
+        /* --- EMERGENT RIVER demo (VOXEL_RIVER_DEMO; v5; host/SP) ---------- *
+         * One-shot: drop an inexhaustible SPRING on the western descent slope (just
+         * outside the flat pole zone, above the natural sea basin). Its water then
+         * finds its OWN way downhill via the real CA (gravity + flow-to-descent +
+         * cross-chunk flow), rivering toward the basin and pooling there - the
+         * emergent answer to "a spring finding a path to the sea", instead of a sea
+         * that rises on its own. Placed via edit_and_notify so the spring's chunk is
+         * woken into the WorldCA active set (the forge `sim` is the root, so it must
+         * be bound first). VOXEL_RIVER_X/Z override the spring's offset from the pole
+         * (world voxels); the column is scanned for its surface so the spring sits
+         * just above the ground. Best with a larger VOXEL_VIEW_RADIUS so the downhill
+         * path stays resident. */
+        if (!river_placed && sim->chunk != NULL && g_local_ca
+                && worldgen_active_version() >= 5u && getenv("VOXEL_RIVER_DEMO") != NULL) {
+            const char *rze = getenv("VOXEL_RIVER_Z");
+            const char *sxe = getenv("VOXEL_RIVER_SCAN_X0");   /* scan start (offset from pole) */
+            int rz   = WG_PLANET_CZ + ((rze && rze[0]) ? atoi(rze) : 0);
+            int x0   = WG_PLANET_CX + ((sxe && sxe[0]) ? atoi(sxe) : -50);   /* just outside the flat */
+            int x, top = WG_PLANET_CY + WG_PLANET_R;
+            int best_x = 0, best_drop = 0, prev = surface_y_at(world, x0, rz, top);
+            /* Walk WEST looking for the steepest 4-cell step-DOWN: a spring on its
+             * high lip has a lateral neighbour that can descend, so it actually flows
+             * (vs the gentle near-pole terrain where it would sit inert). */
+            for (x = x0; x > x0 - 180; x -= 4) {
+                int sy = surface_y_at(world, x, rz, top);
+                if (sy <= WG_PLANET_CY) break;          /* ran off the resident window */
+                if (prev - sy > best_drop) { best_drop = prev - sy; best_x = x + 4; }
+                prev = sy;
+            }
+            if (best_x != 0 && best_drop >= 2) {
+                int ry = surface_y_at(world, best_x, rz, top);
+                int sy = ry + 1, scx = floordiv16(best_x), scy = floordiv16(sy), scz = floordiv16(rz);
+                Chunk *sc;
+                edit_and_notify(world, sim, best_x, sy, rz, make_liquid(MAT_WATER_SOURCE));
+                sc = world_get(world, scx, scy, scz);
+                fprintf(stderr, "river demo: spring at (%d,%d,%d) surf=%d  steepest 4-cell "
+                        "drop=%d vox  west-nbr-down=%d  active=%s\n",
+                        best_x, sy, rz, ry, best_drop,
+                        vox_mat(world_get_voxel(world, best_x - 1, sy - 1, rz)),
+                        (sc != NULL && worldca_find(sim, sc) != NULL) ? "yes" : "NO");
+                river_placed = 1;
+            } else {
+                fprintf(stderr, "river demo: no steep spot found west of x=%d (gentle terrain)\n", x0);
+                river_placed = 1;   /* don't retry every frame */
             }
         }
 
@@ -2358,6 +2662,13 @@ int main(void)
                     sim_tick_ex(act[i], SIM_PHASE_COMMIT, NULL, NULL, NULL);
                 ++g_world_tick;
                 ++ticks;
+                /* River-demo telemetry: watch the active-chunk count against the
+                 * WORLDCA_MAX_XSIMS cap (a long river/large fill could saturate it). */
+                if (river_placed && (g_world_tick % 300u) == 0u) {
+                    fprintf(stderr, "river demo: tick %llu  active chunks=%d/%d\n",
+                            (unsigned long long)g_world_tick, g_nxsim, WORLDCA_MAX_XSIMS);
+                    water_stats_log(world, g_world_tick);
+                }
                 for (i = 0; i < wctx.n_wake; ++i) {  /* deferred cross-chunk wakes */
                     Chunk *nc = wctx.wake_chunk[i];
                     if (world_get(world, nc->cx, nc->cy, nc->cz) != nc)

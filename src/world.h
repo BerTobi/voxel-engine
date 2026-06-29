@@ -139,8 +139,16 @@ typedef struct {
  * on the leading edge and an equal curtain leaves the trailing edge. The
  * per-frame budget (Section 6) spreads that work over a few frames; behind the
  * G70's fog the late-arriving chunks are invisible (Section 7 streaming lead). */
-#define WORLD_RADIUS     6                       /* Chebyshev radius, chunks   */
-#define WORLD_DIAM       (2 * WORLD_RADIUS + 1)  /* 13                         */
+/* 0.5: view distance is now RUNTIME-adjustable (the player asked for it). WORLD_RADIUS
+ * is the compile-time MAXIMUM (it sizes the slab/render/hash pools, so it cannot grow
+ * at runtime); the active window uses ws->view_radius in [2, WORLD_RADIUS], defaulting
+ * to WORLD_VIEW_RADIUS_DEFAULT. Raising the MAX grows the reserved pools (more RAM) +
+ * must stay under MAX_RENDER_CHUNKS: at 8, (2*8+1)^2 * 9 = 2601 chunks < 4096 slots, ok;
+ * lower it for the tightest XP-target build. The DEFAULT keeps the grain study's
+ * budgeted radius-6 window (1521 chunks) unless the player turns view distance up. */
+#define WORLD_RADIUS     8                       /* MAX Chebyshev radius, chunks  */
+#define WORLD_VIEW_RADIUS_DEFAULT 6              /* runtime default (grain budget)*/
+#define WORLD_DIAM       (2 * WORLD_RADIUS + 1)  /* 17 at the max                 */
 
 /* 0.5 M2: the resident vertical band now FOLLOWS THE PLAYER. At R=64 the whole
  * ball fit a fixed cy 0..8 band; at R=512 (256 m) the planet is 64 chunks across
@@ -173,8 +181,9 @@ typedef struct {
  * The pool is reserved ONCE at world_init (Section 7 "reserve big and early"):
  * one calloc of WORLD_POOL_SLOTS * sizeof(Chunk). On the XP target this single
  * contiguous block is grabbed before the heap fragments. */
-#define WORLD_POOL_SLACK  256u  /* >= 2 leading curtains = 2*WORLD_DIAM*WORLD_BAND_H
-                                 * = 2*13*9 = 234 (band is 9 layers for the R=64 ball) */
+#define WORLD_POOL_SLACK  (2u * WORLD_DIAM * WORLD_BAND_H)  /* 2 leading curtains
+                                 * (=306 at the radius-8 max); scales with the max so a
+                                 * curtain-plus always fits during a budgeted move */
 #define WORLD_POOL_SLOTS  (WORLD_WINDOW_CHUNKS + WORLD_POOL_SLACK)  /* 1521+256 = 1777 */
 
 /* SLAB SUB-POOL (0.5 M1 sparse-air storage). A Chunk RECORD (~96 B: coords,
@@ -365,6 +374,7 @@ struct WorldStore {
     int         have_center;             /* 0 until the first world_stream_update */
     int         center_cx, center_cz;    /* player chunk the current window centres on */
     int         center_cy;               /* 0.5 M2: player chunk-Y the band follows    */
+    int         view_radius;             /* 0.5: active Chebyshev radius [2..WORLD_RADIUS] */
 
     uint64_t    seed;                    /* world is a function of this (Section 7) */
     WorldCallbacks cb;                   /* gen / mesh-upload / slot-free        */
@@ -530,6 +540,16 @@ void world_reset_to_seed(WorldStore *ws, int cx, int cy, int cz);
  * player's chunk-Y (the planet's surface sits at high Y at R=512), so all three
  * coords drive the resident window. */
 void world_stream_update(WorldStore *ws, float player_x, float player_y, float player_z);
+
+/* Set the active view distance (Chebyshev window radius, chunks): clamped to
+ * [2, WORLD_RADIUS]. Takes effect on the next world_stream_update (the window grows
+ * or shrinks to the new radius, streaming/evicting the difference under budget). The
+ * reserved pools are sized for WORLD_RADIUS, so this never reallocates. Returns the
+ * clamped radius actually set. */
+int  world_set_view_radius(WorldStore *ws, int radius);
+
+/* The active view radius (chunks). */
+int  world_view_radius(const WorldStore *ws);
 
 /* Force-fill the ENTIRE window around (player_x, player_y, player_z) synchronously,
  * ignoring the per-frame budget: generate + mesh every in-range chunk now.

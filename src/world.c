@@ -688,8 +688,31 @@ int world_init(WorldStore *ws, uint64_t seed, const WorldCallbacks *cb)
     ws->genq_head = ws->genq_tail = 0;
     ws->remeshq_head = ws->remeshq_tail = 0;
     ws->have_center = 0;
+    ws->view_radius = WORLD_VIEW_RADIUS_DEFAULT;   /* 0.5: runtime-adjustable view distance */
 
     return 0;
+}
+
+/* Set the active view radius, clamped to [2, WORLD_RADIUS] (the pool-sizing max).
+ * The change is picked up by the next world_stream_update: forcing have_center=0
+ * makes that call re-evaluate the whole window against the new radius (shrinking ->
+ * evict the now-out-of-range ring; growing -> enqueue the new ring), all under the
+ * normal per-frame budget. Returns the clamped value. */
+int world_set_view_radius(WorldStore *ws, int radius)
+{
+    if (ws == NULL) return 0;
+    if (radius < 2)            radius = 2;
+    if (radius > WORLD_RADIUS) radius = WORLD_RADIUS;
+    if (radius != ws->view_radius) {
+        ws->view_radius = radius;
+        ws->have_center = 0;        /* force a full window re-evaluation next stream */
+    }
+    return ws->view_radius;
+}
+
+int world_view_radius(const WorldStore *ws)
+{
+    return (ws != NULL) ? ws->view_radius : WORLD_VIEW_RADIUS_DEFAULT;
 }
 
 /* Inject (or detach with NULL) the optional persistence handle. Separate from
@@ -811,7 +834,7 @@ static void evict_out_of_range(WorldStore *ws, int center_cx, int center_cy, int
         Chunk *c = &ws->pool[ws->resident[i]];
         int dy = c->cy - center_cy; if (dy < 0) dy = -dy;
         /* 0.5 M2: out of range horizontally OR outside the player-following band */
-        if (cheby(c->cx, c->cz, center_cx, center_cz) > WORLD_RADIUS ||
+        if (cheby(c->cx, c->cz, center_cx, center_cz) > ws->view_radius ||
             dy > WORLD_BAND_HALF) {
             world_evict(ws, c->cx, c->cy, c->cz);
             /* a swap-remove pulled another resident into slot i; re-test it */
@@ -843,8 +866,8 @@ static void enqueue_in_range(WorldStore *ws, int center_cx, int center_cy, int c
     ws->genq_head = ws->genq_tail = 0;
 
     for (cy = center_cy - WORLD_BAND_HALF; cy <= center_cy + WORLD_BAND_HALF; ++cy) {
-        for (dz = -WORLD_RADIUS; dz <= WORLD_RADIUS; ++dz) {
-            for (dx = -WORLD_RADIUS; dx <= WORLD_RADIUS; ++dx) {
+        for (dz = -ws->view_radius; dz <= ws->view_radius; ++dz) {
+            for (dx = -ws->view_radius; dx <= ws->view_radius; ++dx) {
                 int cx = center_cx + dx;
                 int cz = center_cz + dz;
                 if (world_get(ws, cx, cy, cz) != NULL)

@@ -973,8 +973,24 @@ void world_stream_update(WorldStore *ws, float player_x, float player_y, float p
     /* A stationary player with no pending work falls straight through the drain
      * (both queues empty) and costs nothing. */
 
-    drain_gen(ws, WORLD_GEN_BUDGET);
-    drain_remesh(ws, WORLD_REMESH_BUDGET);
+    /* SCALE the per-frame budget with the view radius. A one-chunk move brings in a
+     * leading curtain of (2*view_radius+1)*WORLD_BAND_H chunks; the fixed WORLD_*_BUDGET
+     * (8/16, tuned for the old 26-chunk curtain) drains the R=512 / large-view curtains
+     * far too slowly, so chunks lag behind the moving window and show as GAPS/holes
+     * inside the view distance (and a view-distance GROW re-enqueues a whole ring).
+     * Draining a curtain in ~3 frames keeps the window filled during normal movement
+     * and fills a grow in ~1 s; the extra meshing only costs while streaming (a moving
+     * or just-grown window), and only as much as the view distance the player chose -
+     * stationary stays free. remesh gets 2x (each gen dirties itself + boundary seams). */
+    {
+        int curtain  = (2 * ws->view_radius + 1) * WORLD_BAND_H;
+        int gen_b    = curtain / 6;            /* drain a move's curtain in ~6 frames */
+        int remesh_b = gen_b * 2;
+        if (gen_b    < WORLD_GEN_BUDGET)    gen_b    = WORLD_GEN_BUDGET;
+        if (remesh_b < WORLD_REMESH_BUDGET) remesh_b = WORLD_REMESH_BUDGET;
+        drain_gen(ws, gen_b);
+        drain_remesh(ws, remesh_b);
+    }
 }
 
 void world_prime(WorldStore *ws, float player_x, float player_y, float player_z)

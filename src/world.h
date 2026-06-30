@@ -105,9 +105,9 @@ typedef struct {
  * smaller window (it must stay <= MAX_RENDER_CHUNKS render slots), so the hash
  * is sized to match. Bump WORLD_HASH_CAP (still a power of two, still
  * >= WORLD_WINDOW_CHUNKS / 0.7) when the window grows toward the shipping size. */
-#define WORLD_HASH_CAP   65536u  /* holds the radius-32 ceiling window (38025) at load
-                                  * 0.58; power-of-two (probe mask). 64K*16 B = 1 MiB
-                                  * fixed - cheap, so the hash never needs runtime sizing */
+#define WORLD_HASH_CAP   131072u /* holds the radius-32 x band-13 ceiling window (54925)
+                                  * at load 0.42; power-of-two (probe mask). 128K*16 B =
+                                  * 2 MiB fixed - cheap, so the hash never needs sizing */
 
 /* ======================================================================== *
  *  3. THE LOADED WINDOW + SLAB POOL geometry                                *
@@ -175,8 +175,18 @@ typedef struct {
  * (world-Y) regardless of the local radial "up"; being player-centred it still
  * covers the surface anywhere, just anisotropically (a full isotropic 3-D box is
  * a 0.6 refinement if the player roams far from the spawn pole). */
-#define WORLD_BAND_HALF  4                       /* layers above/below center_cy */
-#define WORLD_BAND_H     (2 * WORLD_BAND_HALF + 1)            /* 9 layers      */
+/* 0.5 (256 m view distance): the band is now 6 (±96 vox) not 4. WHY: the window is a
+ * player-centred CYLINDER (horizontal Chebyshev radius x this vertical band) but the
+ * world is a SPHERE, so across a large view radius the surface CURVES DOWN below a
+ * short band and the far ring drops out of residency - showing as holes/floating
+ * chunks INSIDE the view distance. Band 6 keeps the surface resident out to ~radius 16
+ * (~128 m), about the planet's visible horizon, so the visible range has no gaps;
+ * beyond the horizon the surface curving away (sky) is correct, not a bug. Cost: the
+ * window is ~44% taller (more underground layers near the pole), paid at every radius.
+ * A radius-coupled / asymmetric band (cheap near, tall far) is the efficient 0.6
+ * refinement; 6 is the simple fix that covers the useful range. */
+#define WORLD_BAND_HALF  6                       /* layers above/below center_cy */
+#define WORLD_BAND_H     (2 * WORLD_BAND_HALF + 1)            /* 13 layers     */
 #define WORLD_WINDOW_CHUNKS (WORLD_DIAM * WORLD_DIAM * WORLD_BAND_H) /* 1521    */
 
 /* SLAB POOL (Section 7 "Fixed-Size Slab Pool, No Per-Chunk malloc"). A single

@@ -152,10 +152,12 @@ typedef struct {
  * counter lets them find the playable radius on the real hardware. */
 #define WORLD_RADIUS     32                      /* MAX Chebyshev radius (256 m)  */
 #define WORLD_VIEW_RADIUS_DEFAULT 6              /* initial active radius (light) */
-#define WORLD_VIEW_RADIUS_MAX_DEFAULT 10         /* default session CEILING (no env): the
-                                                  * proven ~68 MiB pool, so a plain launch
-                                                  * never regresses. VOXEL_VIEW_RADIUS raises
-                                                  * it up to WORLD_RADIUS (256 m), RAM allowing. */
+#define WORLD_VIEW_RADIUS_MAX_DEFAULT 10         /* INITIAL session pool size (no env): the
+                                                  * proven ~68 MiB, so a plain launch never
+                                                  * regresses. NOT a cap - world_set_view_radius
+                                                  * GROWS the pool on demand (Up key) up to
+                                                  * WORLD_RADIUS / 256 m as RAM allows; an
+                                                  * explicit VOXEL_VIEW_RADIUS just pre-sizes it. */
 #define WORLD_DIAM       (2 * WORLD_RADIUS + 1)  /* 65 at the ceiling             */
 /* Window-chunk count for an arbitrary Chebyshev radius r (the player-following band
  * is WORLD_BAND_H layers tall). Used to size the runtime slab pool to the chosen view

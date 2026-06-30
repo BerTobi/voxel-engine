@@ -454,7 +454,7 @@ static void test_readonly_invariance(void)
     sim_set_progress_sink(&s_null, NULL);
 
     /* Pre-condition: the two worlds start byte-identical. */
-    if (memcmp(c_with.voxels, c_null.voxels, sizeof c_with.voxels) != 0) {
+    if (memcmp(c_with.voxels, c_null.voxels, CHUNK_VOXELS * sizeof(Voxel)) != 0) {
         identical_every_tick = 0;
         first_divergence_tick = 0;
     }

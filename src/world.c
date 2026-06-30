@@ -634,6 +634,19 @@ void world_reset_to_seed(WorldStore *ws, int cx, int cy, int cz)
  *  Lifecycle                                                               *
  * ======================================================================== */
 
+/* Voxel-slab slots needed to cover a view-radius-r window PLUS a churn curtain of
+ * slack (so a budgeted move never momentarily exceeds the pool), capped at the
+ * compile-ceiling index-array size. The single allocation that scales with view
+ * distance; shared by world_init (initial size) and world_set_view_radius (grow). */
+static uint32_t world_slab_slots_for(int r)
+{
+    long diam = 2L * (long)r + 1;
+    long need = diam * diam * WORLD_BAND_H + 2L * diam * WORLD_BAND_H;  /* window + 2 curtains */
+    if (need > (long)WORLD_SLAB_SLOTS) need = (long)WORLD_SLAB_SLOTS;
+    if (need < 1) need = 1;
+    return (uint32_t)need;
+}
+
 int world_init(WorldStore *ws, uint64_t seed, const WorldCallbacks *cb, int view_radius_max)
 {
     uint32_t i, slab_slots;
@@ -652,9 +665,7 @@ int world_init(WorldStore *ws, uint64_t seed, const WorldCallbacks *cb, int view
     if (view_radius_max < 2)            view_radius_max = 2;
     if (view_radius_max > WORLD_RADIUS) view_radius_max = WORLD_RADIUS;
     ws->view_radius_max = view_radius_max;
-    slab_slots = (uint32_t)(WORLD_WINDOW_AT(view_radius_max)
-                            + 2 * (2 * view_radius_max + 1) * WORLD_BAND_H);  /* +2 curtains */
-    if (slab_slots > WORLD_SLAB_SLOTS) slab_slots = WORLD_SLAB_SLOTS;  /* never exceed the index array */
+    slab_slots = world_slab_slots_for(view_radius_max);
     ws->slab_slots = slab_slots;
 
     /* one big contiguous CHUNK-RECORD pool, reserved once and never grown.
@@ -712,17 +723,59 @@ int world_init(WorldStore *ws, uint64_t seed, const WorldCallbacks *cb, int view
     return 0;
 }
 
-/* Set the active view radius, clamped to [2, ws->view_radius_max] (the session ceiling
- * the slab pool was sized for - going past it would exhaust the slab pool). The change
- * is picked up by the next world_stream_update: forcing have_center=0 makes that call
- * re-evaluate the whole window against the new radius (shrinking -> evict the now-out-
- * of-range ring; growing -> enqueue the new ring), all under the normal per-frame
- * budget. Returns the clamped value. */
+/* Set the active view radius. GROWS the slab pool ON DEMAND: a request beyond the
+ * current ceiling (ws->view_radius_max) reallocates ws->slabs bigger to fit it (up to
+ * the compile WORLD_RADIUS), so the player can keep raising view distance with no fixed
+ * cap - until a realloc fails (out of RAM), at which point the radius stays where it is
+ * (the hardware decides the limit, not an arbitrary number). The pool is grow-ONLY
+ * (lowering the radius keeps the larger pool, so the player can raise it again free).
+ *
+ * Growing reallocs the one big voxel block, which MAY MOVE it, so every realized
+ * resident chunk's voxels pointer is re-derived from its (stable) slab index against
+ * the new base. Safe because this is called between frames (from the input handler):
+ * the sim/mesher re-read chunk->voxels each tick, never caching a raw slab pointer.
+ *
+ * The change is picked up by the next world_stream_update (have_center=0 forces a full
+ * window re-evaluation under the normal per-frame budget). Returns the radius actually
+ * set (== the request, or the unchanged ceiling if the grow ran out of memory). */
 int world_set_view_radius(WorldStore *ws, int radius)
 {
     if (ws == NULL) return 0;
-    if (radius < 2)                   radius = 2;
-    if (radius > ws->view_radius_max) radius = ws->view_radius_max;
+    if (radius < 2)            radius = 2;
+    if (radius > WORLD_RADIUS) radius = WORLD_RADIUS;   /* hard compile ceiling (index arrays) */
+
+    if (radius > ws->view_radius_max) {                 /* need a bigger slab pool */
+        uint32_t need = world_slab_slots_for(radius);
+        if (need > ws->slab_slots) {
+            Voxel *p = (Voxel *)realloc(ws->slabs,
+                                        (size_t)need * CHUNK_VOXELS * sizeof(Voxel));
+            if (p == NULL) {
+                /* Out of memory: cannot grow. Hold the radius at the current ceiling
+                 * (the slab pool is unchanged + still valid). */
+                radius = ws->view_radius_max;
+            } else {
+                if (p != ws->slabs) {                   /* block moved: rebase live voxels */
+                    uint32_t k;
+                    ws->slabs = p;
+                    for (k = 0; k < ws->resident_count; ++k) {
+                        Chunk *c = &ws->pool[ws->resident[k]];
+                        if (c->voxels != NULL && c->slab_idx >= 0)
+                            c->voxels = ws->slabs
+                                      + (size_t)c->slab_idx * CHUNK_VOXELS;
+                    }
+                }
+                /* The newly-added slabs [old..need) join the free stack. (Raw/uninit
+                 * is fine: world_realize fills a popped slab before any read.) */
+                { uint32_t s; for (s = need; s-- > ws->slab_slots; )
+                    ws->slab_free[ws->slab_free_top++] = s; }
+                ws->slab_slots = need;
+                ws->view_radius_max = radius;
+            }
+        } else {
+            ws->view_radius_max = radius;               /* pool already covers it */
+        }
+    }
+
     if (radius != ws->view_radius) {
         ws->view_radius = radius;
         ws->have_center = 0;        /* force a full window re-evaluation next stream */

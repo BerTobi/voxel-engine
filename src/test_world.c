@@ -380,7 +380,8 @@ static void test_worldgen_determinism(void)
         for (i = 0; i < n && ok2; ++i) {
             worldgen_fill_chunk(a, cc[i][0], cc[i][1], cc[i][2], seed);
             worldgen_fill_chunk(b, cc[i][0], cc[i][1], cc[i][2], seed);
-            if (memcmp(a->voxels, b->voxels, sizeof a->voxels) != 0) {
+            if (memcmp(a->voxels, b->voxels,
+                       (size_t)CHUNK_VOXELS * sizeof(Voxel)) != 0) {
                 ok2 = 0; snprintf(d2, sizeof d2,
                     "voxels differ for chunk (%d,%d,%d)",
                     cc[i][0], cc[i][1], cc[i][2]);
@@ -1004,6 +1005,61 @@ static void test_stationary_stable(void)
     free_store(ws);
 }
 
+/* Case 9 - view distance GROWS the slab pool on demand (0.5, 256 m). Init at the
+ * small TEST_VIEW_R, prime, then raise the view radius past the init ceiling: the pool
+ * must realloc bigger, the window must expand to the new radius, and - the risky part -
+ * existing resident chunks' voxels must survive the realloc-move (the rebase). Record a
+ * resident chunk's voxel before the grow and re-read it after; a bad rebase shows up as
+ * a changed value here or a wild pointer under ASan. */
+static void test_grow_view_distance(void)
+{
+    WorldStore *ws = make_store(0x6604Eull);   /* inits at TEST_VIEW_R */
+    int ok = 1; char buf[160]; buf[0] = '\0';
+    float px = 8.0f, pz = 8.0f;
+    const int GROW_R = 16;                      /* > TEST_VIEW_R: forces a pool grow */
+    int ccx, ccy, ccz, newr, i;
+    uint32_t slab_before, slab_after, win_after, k;
+    Voxel before = 0; Chunk *probe;
+
+    if (ws == NULL) { report("view distance grows on demand (pool realloc + rebase)", 0,
+        "store alloc failed"); return; }
+
+    world_prime(ws, px, TEST_PY, pz);
+    slab_before = ws->slab_slots;
+    ccx = world_to_chunk(px); ccy = (int)TEST_CCY; ccz = world_to_chunk(pz);
+    probe = world_get(ws, ccx, ccy, ccz);       /* a realized (solid crust) resident */
+    if (probe != NULL) before = chunk_vox(probe, vox_index(8, 8, 8));
+
+    newr = world_set_view_radius(ws, GROW_R);   /* GROW: realloc + rebase live voxels */
+    slab_after = ws->slab_slots;
+
+    for (i = 0; i < WORLD_WINDOW_AT(GROW_R) / WORLD_GEN_BUDGET + 256; ++i)
+        world_stream_update(ws, px, TEST_PY, pz);
+    win_after = world_resident_count(ws);
+
+    /* Touch every realized resident's voxels post-grow: a bad rebase = a wild read. */
+    for (k = 0; k < world_resident_count(ws); ++k) {
+        Chunk *c = world_resident_at(ws, k);
+        (void)chunk_vox(c, vox_index(0, 0, 0));
+        (void)chunk_vox(c, vox_index(15, 15, 15));
+    }
+    probe = world_get(ws, ccx, ccy, ccz);
+
+    if (newr != GROW_R) {
+        ok = 0; snprintf(buf, sizeof buf, "grow set radius %d, wanted %d", newr, GROW_R);
+    } else if (slab_after <= slab_before) {
+        ok = 0; snprintf(buf, sizeof buf, "slab pool did not grow (%u -> %u)",
+                         slab_before, slab_after);
+    } else if (win_after != (uint32_t)WORLD_WINDOW_AT(GROW_R)) {
+        ok = 0; snprintf(buf, sizeof buf, "window after grow=%u, expected %d",
+                         win_after, WORLD_WINDOW_AT(GROW_R));
+    } else if (probe != NULL && chunk_vox(probe, vox_index(8, 8, 8)) != before) {
+        ok = 0; snprintf(buf, sizeof buf, "rebase corrupted a chunk's voxels");
+    }
+    report("view distance grows on demand (pool realloc + rebase)", ok, buf);
+    free_store(ws);
+}
+
 /* ---- Runner -------------------------------------------------------------- */
 int main(void)
 {
@@ -1021,6 +1077,7 @@ int main(void)
     test_long_walk();
     test_slab_baseline();
     test_stationary_stable();
+    test_grow_view_distance();
 
     if (g_failures == 0)
         printf("=== ALL TESTS PASSED ===\n");

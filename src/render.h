@@ -18,7 +18,11 @@
 /* A small fixed slot table; one VBO per resident chunk. Sized for the visible
  * working set, not the whole 10,000-chunk window (most chunks are culled,
  * underground, or empty). The shipping engine keys slots off chunk residency. */
-#define MAX_RENDER_CHUNKS 8192   /* covers the radius-10 window (3969) + churn curtain */
+#define MAX_RENDER_CHUNKS 40960  /* covers the radius-32 CEILING window (38025) + churn
+                                  * curtain. A render slot is a few handles + counts, so
+                                  * this fixed array is ~2 MiB - cheap; the big runtime
+                                  * cost is the voxel slab pool, sized to the actual view
+                                  * distance at world_init, not this ceiling. */
 
 /* Initialise the renderer: compile + link the opaque (and liquid) shaders,
  * build the placeholder material atlas (1024x1024 RGBA8, 16x16 grid of 64x64

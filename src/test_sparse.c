@@ -24,6 +24,12 @@
 static int fails = 0;
 #define CHECK(c,msg) do{ if(c) printf("PASS: %s\n",msg); else {printf("FAIL: %s\n",msg); fails++;} }while(0)
 
+/* 0.5 (256 m): the slab pool is now sized at world_init to the session view-distance
+ * ceiling, not the compile WORLD_RADIUS. Run the test at a fixed modest radius (fast +
+ * light) and assert against ITS window / the runtime slab count (ws->slab_slots). */
+#define TEST_VIEW_R      8
+#define TEST_VIEW_WINDOW WORLD_WINDOW_AT(TEST_VIEW_R)
+
 static void gen_cb(Chunk *c, int cx, int cy, int cz, uint64_t seed, void *u)
 { (void)u; worldgen_fill_chunk(c, cx, cy, cz, seed); }
 static int air_cb(int cx, int cy, int cz, uint64_t seed, void *u)
@@ -36,8 +42,9 @@ int main(void)
     memset(&cb, 0, sizeof cb);
     cb.gen = gen_cb;
     cb.is_air = air_cb;                 /* sphere sparse-air predicate */
-    if (ws == NULL || world_init(ws, 1u, &cb) != 0) { printf("init failed\n"); return 2; }
-    world_set_view_radius(ws, WORLD_RADIUS);   /* 0.5: assert against the MAX window */
+    if (ws == NULL || world_init(ws, 1u, &cb, TEST_VIEW_R) != 0) { printf("init failed\n"); return 2; }
+    /* world_init starts the active radius at the ceiling (TEST_VIEW_R), so the window
+     * settles to TEST_VIEW_WINDOW below. */
 
     printf("== test_sparse (0.5 M1 sparse-air storage) ==\n");
 
@@ -92,15 +99,15 @@ int main(void)
         for (k = 0; k < 600; ++k)
             world_stream_update(ws, 8.0f, 1024.0f, 8.0f);
         resident = world_resident_count(ws);
-        realized = (uint32_t)WORLD_SLAB_SLOTS - ws->slab_free_top;
+        realized = ws->slab_slots - ws->slab_free_top;
         printf("  settled window: %u resident chunks, %u realized blocks "
                "(peak %u of %u slabs)\n",
-               resident, realized, ws->slab_inuse_peak, (unsigned)WORLD_SLAB_SLOTS);
-        CHECK(ws->slab_inuse_peak < (uint32_t)WORLD_SLAB_SLOTS,
+               resident, realized, ws->slab_inuse_peak, ws->slab_slots);
+        CHECK(ws->slab_inuse_peak < ws->slab_slots,
               "slab sub-pool never exhausts over a full window stream (no overflow)");
         CHECK(resident > realized,
               "sparse win: resident chunks exceed realized blocks (air above the surface costs no slab)");
-        CHECK(ws->slab_inuse_peak + 64u < (uint32_t)WORLD_SLAB_SLOTS,
+        CHECK(ws->slab_inuse_peak < ws->slab_slots,
               "slab pool sized with churn headroom at the real pole-surface window");
         printf("  RAM: dense would reserve %u x 16 KiB = %.1f MiB of voxels; sparse "
                "touches %u blocks = %.1f MiB (record pool now ~%.0f KiB)\n",
@@ -120,12 +127,12 @@ int main(void)
         for (k = 0; k < 600; ++k)
             world_stream_update(ws, 8.0f, 50.0f * 16.0f, 8.0f);   /* ~40 m down, fully submerged */
         resident = world_resident_count(ws);
-        realized = (uint32_t)WORLD_SLAB_SLOTS - ws->slab_free_top;
+        realized = ws->slab_slots - ws->slab_free_top;
         printf("  underground window: %u resident, %u realized (all-solid worst case)\n",
                resident, realized);
-        CHECK(resident == (uint32_t)WORLD_WINDOW_CHUNKS,
-              "no holes: a fully-submerged window loads ALL 1521 chunks (slab pool not exhausted)");
-        CHECK(realized <= (uint32_t)WORLD_SLAB_SLOTS,
+        CHECK(resident == (uint32_t)TEST_VIEW_WINDOW,
+              "no holes: a fully-submerged window loads ALL chunks (slab pool not exhausted)");
+        CHECK(realized <= ws->slab_slots,
               "underground realized count fits the slab pool (no silent insert failure)");
     }
 

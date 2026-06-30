@@ -42,7 +42,7 @@ int main(void)
     printf("=== chunk-delta sync tests ===\n");
     c.gen = gen_cb; c.mesh_upload = NULL; c.slot_free = NULL; c.user = NULL;
     c.is_air = is_air_cb;   /* 0.5 M1: sparse-air (sphere predicate) */
-    if (world_init(&HW, seed, &c) != 0 || world_init(&CW, seed, &c) != 0) {
+    if (world_init(&HW, seed, &c, WORLD_VIEW_RADIUS_DEFAULT) != 0 || world_init(&CW, seed, &c, WORLD_VIEW_RADIUS_DEFAULT) != 0) {
         printf("FAIL: world_init\n"); return 2;
     }
     world_prime(&HW, 8.0f, 136.0f, 8.0f);

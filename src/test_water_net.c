@@ -68,7 +68,7 @@ int main(void)
     printf("=== M5 two-peer water render-fidelity tests ===\n");
 
     c.gen = gen_cb; c.mesh_upload = NULL; c.slot_free = NULL; c.user = NULL; c.is_air = is_air_cb;
-    if (world_init(&HW, SEED, &c) != 0 || world_init(&CW, SEED, &c) != 0) { printf("FAIL: world_init\n"); return 2; }
+    if (world_init(&HW, SEED, &c, WORLD_VIEW_RADIUS_DEFAULT) != 0 || world_init(&CW, SEED, &c, WORLD_VIEW_RADIUS_DEFAULT) != 0) { printf("FAIL: world_init\n"); return 2; }
     world_prime(&HW, 8.0f, 136.0f, 8.0f);
     world_prime(&CW, 8.0f, 136.0f, 8.0f);
     hctx.world = &HW; hctx.persist = NULL; hctx.seed = SEED;

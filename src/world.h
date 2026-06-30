@@ -105,8 +105,9 @@ typedef struct {
  * smaller window (it must stay <= MAX_RENDER_CHUNKS render slots), so the hash
  * is sized to match. Bump WORLD_HASH_CAP (still a power of two, still
  * >= WORLD_WINDOW_CHUNKS / 0.7) when the window grows toward the shipping size. */
-#define WORLD_HASH_CAP   8192u   /* holds the radius-10 window (3969) at load 0.48;
-                                  * power-of-two (probe mask). 8192*16 B = 128 KiB */
+#define WORLD_HASH_CAP   65536u  /* holds the radius-32 ceiling window (38025) at load
+                                  * 0.58; power-of-two (probe mask). 64K*16 B = 1 MiB
+                                  * fixed - cheap, so the hash never needs runtime sizing */
 
 /* ======================================================================== *
  *  3. THE LOADED WINDOW + SLAB POOL geometry                                *
@@ -149,9 +150,17 @@ typedef struct {
  * reserved (fine on the 1 GiB XP box). The DEFAULT keeps the grain study's budgeted
  * radius-6 window (1521 chunks) unless the player turns view distance up; the FPS
  * counter lets them find the playable radius on the real hardware. */
-#define WORLD_RADIUS     10                      /* MAX Chebyshev radius, chunks  */
-#define WORLD_VIEW_RADIUS_DEFAULT 6              /* runtime default (grain budget)*/
-#define WORLD_DIAM       (2 * WORLD_RADIUS + 1)  /* 21 at the max (window 3969)   */
+#define WORLD_RADIUS     32                      /* MAX Chebyshev radius (256 m)  */
+#define WORLD_VIEW_RADIUS_DEFAULT 6              /* initial active radius (light) */
+#define WORLD_VIEW_RADIUS_MAX_DEFAULT 10         /* default session CEILING (no env): the
+                                                  * proven ~68 MiB pool, so a plain launch
+                                                  * never regresses. VOXEL_VIEW_RADIUS raises
+                                                  * it up to WORLD_RADIUS (256 m), RAM allowing. */
+#define WORLD_DIAM       (2 * WORLD_RADIUS + 1)  /* 65 at the ceiling             */
+/* Window-chunk count for an arbitrary Chebyshev radius r (the player-following band
+ * is WORLD_BAND_H layers tall). Used to size the runtime slab pool to the chosen view
+ * distance + by the tests; WORLD_WINDOW_CHUNKS below is this at the compile ceiling. */
+#define WORLD_WINDOW_AT(r) (((2*(r))+1) * ((2*(r))+1) * WORLD_BAND_H)
 
 /* 0.5 M2: the resident vertical band now FOLLOWS THE PLAYER. At R=64 the whole
  * ball fit a fixed cy 0..8 band; at R=512 (256 m) the planet is 64 chunks across
@@ -200,23 +209,21 @@ typedef struct {
  * from 27.8 MiB (inline voxels) to ~170 KiB. See SIZING below for why the reserved
  * slab pool itself must still cover the full window (the underground worst case).
  *
- * SIZING (corrected at M2 by the grain-review): the WORST reachable window is one
- * fully BELOW the surface - a player who flies or digs ~24 m+ down sits in solid
- * rock, so EVERY chunk in the 1521-window is non-uniform and needs a slab (the
- * surface window's 72%-air saving does NOT hold underground). A sub-window-sized
- * pool would silently drop those inserts (holes / fall-through), so the slab pool
- * must equal the chunk-record pool: WORLD_SLAB_SLOTS == WORLD_POOL_SLOTS. Then
- * realized <= resident <= WORLD_POOL_SLOTS and a uniform chunk returns its slab,
- * so a free record ALWAYS implies a free slab and world_realize can NEVER fail.
- * Sparse-air's win is therefore a WORKING-SET one (above/at the surface only ~28-44%
- * of slabs are touched) + the record-pool shrink (27.8 MiB -> ~170 KiB), NOT a
- * smaller reserved pool. The pool NEVER grows (no-per-chunk-malloc rule holds). */
-#define WORLD_SLAB_SLOTS  WORLD_POOL_SLOTS
-/* The no-holes invariant: a slab pool smaller than the record pool can be exhausted
- * by a fully-solid (underground) window, silently dropping inserts. Keep them equal
- * (or slabs larger) so world_realize can never fail. */
-_Static_assert(WORLD_SLAB_SLOTS >= WORLD_POOL_SLOTS,
-               "slab pool must cover the worst-case (fully solid) window - else underground holes");
+ * SIZING: the WORST reachable window is one fully BELOW the surface - a player who
+ * digs/flies deep sits in solid rock, so EVERY chunk in the window needs a slab (the
+ * surface 72%-air saving does NOT hold underground). So the slab pool must cover the
+ * ACTIVE window. 0.5 (256 m view distance): the active window is now RUNTIME (the
+ * player's chosen view distance, up to the radius-32 ceiling), and the radius-32
+ * window's slab pool is ~640 MiB - far too much to reserve always on the 1 GiB XP box.
+ * So the slab VOXEL pool (ws->slabs) is sized AT world_init to the session's view-
+ * distance CEILING (ws->view_radius_max), NOT this compile ceiling: a 96 m session
+ * reserves ~95 MiB, a 256 m session ~640 MiB (which only a big-RAM machine can give -
+ * world_init fails gracefully otherwise). world_set_view_radius then clamps the active
+ * radius to [2, view_radius_max], so the active window always fits ws->slab_slots and
+ * world_realize can never fail. The slab_free[] INDEX stack stays sized at the compile
+ * ceiling (WORLD_SLAB_SLOTS, ~150 KiB - cheap); only ws->slab_slots entries are live. */
+#define WORLD_SLAB_SLOTS  WORLD_POOL_SLOTS   /* index-array size (ceiling); ws->slab_slots
+                                              * is the RUNTIME live count (<= this) */
 
 /* Every resident chunk owns a render slot, and a window move briefly holds the window
  * PLUS one leading curtain (DIAM*BAND_H) before the trailing curtain evicts. Render
@@ -352,8 +359,9 @@ struct WorldStore {
      * non-uniform chunk (c->slab_idx, c->voxels = &slabs[idx*CHUNK_VOXELS]);
      * world_evict / world_set_uniform push it back. slab_inuse_peak tracks the
      * high-water mark so test_sparse can assert the pool sizing holds. */
-    Voxel      *slabs;                   /* WORLD_SLAB_SLOTS * CHUNK_VOXELS words */
-    uint32_t    slab_free[WORLD_SLAB_SLOTS]; /* free-list stack of slab indices  */
+    Voxel      *slabs;                   /* ws->slab_slots * CHUNK_VOXELS words (runtime) */
+    uint32_t    slab_slots;              /* RUNTIME slab count, sized to view_radius_max  */
+    uint32_t    slab_free[WORLD_SLAB_SLOTS]; /* free-list stack (ceiling-sized array)    */
     uint32_t    slab_free_top;
     uint32_t    slab_inuse_peak;         /* max slabs ever simultaneously realized */
 
@@ -384,7 +392,8 @@ struct WorldStore {
     int         have_center;             /* 0 until the first world_stream_update */
     int         center_cx, center_cz;    /* player chunk the current window centres on */
     int         center_cy;               /* 0.5 M2: player chunk-Y the band follows    */
-    int         view_radius;             /* 0.5: active Chebyshev radius [2..WORLD_RADIUS] */
+    int         view_radius;             /* 0.5: active Chebyshev radius [2..view_radius_max] */
+    int         view_radius_max;         /* session CEILING (slab pool sized for this)       */
 
     uint64_t    seed;                    /* world is a function of this (Section 7) */
     WorldCallbacks cb;                   /* gen / mesh-upload / slot-free        */
@@ -423,11 +432,15 @@ struct WorldStore {
 /* ======================================================================== *
  *  8. LIFECYCLE                                                             *
  * ======================================================================== */
-/* Allocate the slab pool, zero the hash, fill the free stacks, store the seed
- * and callbacks. cb.gen MUST be non-NULL. Returns 0 on success, non-zero on
- * allocation failure (the one big pool calloc). After this the store is empty
- * (no residents); the first world_stream_update fills the window. */
-int  world_init(WorldStore *ws, uint64_t seed, const WorldCallbacks *cb);
+/* Allocate the pools, zero the hash, fill the free stacks, store the seed and
+ * callbacks. cb.gen MUST be non-NULL. `view_radius_max` is the session's view-distance
+ * CEILING (chunks, clamped to [2, WORLD_RADIUS]): the VOXEL slab pool is sized to it
+ * (so a 256 m / radius-32 session reserves ~640 MiB while a default session reserves a
+ * fraction), and the active view radius is later clamped to it. Returns 0 on success,
+ * non-zero on allocation failure (e.g. view_radius_max too large for available RAM -
+ * the caller should report it and suggest a smaller view distance). After this the
+ * store is empty (no residents); the first world_stream_update fills the window. */
+int  world_init(WorldStore *ws, uint64_t seed, const WorldCallbacks *cb, int view_radius_max);
 
 /* Inject the persistence handle (persist.h Section 5; ARCHITECTURE Section 8).
  * OPTIONAL and separate from world_init so the init signature and every existing

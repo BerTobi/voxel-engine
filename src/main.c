@@ -1853,9 +1853,32 @@ int main(void)
         fprintf(stderr, "main: WorldStore malloc failed\n");
         return 1;
     }
-    if (world_init(world, seed, &cb) != 0) {
-        fprintf(stderr, "main: world_init failed (slab pool alloc)\n");
-        return 1;
+    /* VOXEL_VIEW_RADIUS sets the session view-distance CEILING (chunks): the slab pool
+     * is sized to it, so this is what scales RAM. Default WORLD_VIEW_RADIUS_MAX_DEFAULT;
+     * the player raises the ACTIVE distance toward it live with Up/Down. The ceiling
+     * goes up to WORLD_RADIUS (256 m), but a large one needs lots of RAM (radius 32 ~=
+     * 640 MiB) - more than the XP box has, so world_init fails gracefully there. */
+    {
+        const char *vr = getenv("VOXEL_VIEW_RADIUS");
+        int have_env = (vr != NULL && vr[0] != '\0');
+        int ceil = have_env ? atoi(vr) : WORLD_VIEW_RADIUS_MAX_DEFAULT;
+        if (ceil < 2)            ceil = 2;
+        if (ceil > WORLD_RADIUS) ceil = WORLD_RADIUS;
+        if (world_init(world, seed, &cb, ceil) != 0) {
+            char msg[256];
+            /* Almost always the slab-pool calloc: the requested view distance needs
+             * more RAM than is free. Tell the player how to dial it down. */
+            snprintf(msg, sizeof msg,
+                     "Could not allocate memory for view distance %d (~%d m).\n"
+                     "Set VOXEL_VIEW_RADIUS to a smaller number and try again.",
+                     ceil, (int)V2M((float)(ceil * CHUNK_DIM)));
+            plat_fatal_message(msg);
+            return 1;
+        }
+        /* No explicit env -> start at the light default ACTIVE radius (Up/Down raises
+         * it to the ceiling). With VOXEL_VIEW_RADIUS set, start AT it. */
+        if (!have_env)
+            world_set_view_radius(world, WORLD_VIEW_RADIUS_DEFAULT);
     }
 
     /* ---- 5b. World persistence (ARCHITECTURE Section 8) ------------------ *
@@ -1885,14 +1908,10 @@ int main(void)
             world_set_persist(world, persist);
     }
 
-    /* 0.5: apply the initial view distance (window radius + matching fog) BEFORE the
-     * prime, so the first window loads at the chosen radius. VOXEL_VIEW_RADIUS overrides
-     * the default for headless captures; live sessions adjust it with Up/Down. */
-    {
-        const char *vr = getenv("VOXEL_VIEW_RADIUS");
-        apply_view_distance(world, (vr != NULL && vr[0] != '\0')
-                                   ? atoi(vr) : world_view_radius(world));
-    }
+    /* 0.5: set the fog to match the initial active view radius (set above from
+     * VOXEL_VIEW_RADIUS / the default) BEFORE the prime, so the first window loads +
+     * fogs at the right distance. Up/Down re-applies both live. */
+    apply_view_distance(world, world_view_radius(world));
 
     /* 0.5 M2: prime the window around the spawn pole's Y (= the surface, CY+R) so
      * the player-following band loads the ground under the spawn before frame 1. */

@@ -69,7 +69,7 @@ static int slab_pop(WorldStore *ws, Chunk *c)
     c->slab_idx = (int32_t)sidx;
     c->voxels   = ws->slabs + (size_t)sidx * CHUNK_VOXELS;
     c->flags   &= ~(uint8_t)CHUNK_UNIFORM;
-    inuse = WORLD_SLAB_SLOTS - ws->slab_free_top;
+    inuse = ws->slab_slots - ws->slab_free_top;
     if (inuse > ws->slab_inuse_peak)
         ws->slab_inuse_peak = inuse;
     return 0;
@@ -634,9 +634,9 @@ void world_reset_to_seed(WorldStore *ws, int cx, int cy, int cz)
  *  Lifecycle                                                               *
  * ======================================================================== */
 
-int world_init(WorldStore *ws, uint64_t seed, const WorldCallbacks *cb)
+int world_init(WorldStore *ws, uint64_t seed, const WorldCallbacks *cb, int view_radius_max)
 {
-    uint32_t i;
+    uint32_t i, slab_slots;
 
     if (ws == NULL || cb == NULL || cb->gen == NULL)
         return 1;                        /* gen is REQUIRED */
@@ -645,24 +645,39 @@ int world_init(WorldStore *ws, uint64_t seed, const WorldCallbacks *cb)
     ws->seed = seed;
     ws->cb   = *cb;
 
+    /* Clamp the session view-distance ceiling to [2, WORLD_RADIUS] and size the VOXEL
+     * slab pool to ITS window (+ a churn curtain of slack), NOT the compile ceiling -
+     * so a small view distance reserves little and only a 256 m session asks for the
+     * ~640 MiB. The active radius (below) starts smaller and is clamped to this. */
+    if (view_radius_max < 2)            view_radius_max = 2;
+    if (view_radius_max > WORLD_RADIUS) view_radius_max = WORLD_RADIUS;
+    ws->view_radius_max = view_radius_max;
+    slab_slots = (uint32_t)(WORLD_WINDOW_AT(view_radius_max)
+                            + 2 * (2 * view_radius_max + 1) * WORLD_BAND_H);  /* +2 curtains */
+    if (slab_slots > WORLD_SLAB_SLOTS) slab_slots = WORLD_SLAB_SLOTS;  /* never exceed the index array */
+    ws->slab_slots = slab_slots;
+
     /* one big contiguous CHUNK-RECORD pool, reserved once and never grown.
      * 0.5 M1: a record no longer carries an inline 16 KiB voxel block, so this is
-     * now ~170 KiB (1777 small records) rather than 27.8 MiB. */
+     * small even at the ceiling (records are ~100 B). */
     ws->pool = (Chunk *)calloc(WORLD_POOL_SLOTS, sizeof(Chunk));
     if (ws->pool == NULL)
         return 1;
 
     /* 0.5 M1: the separate VOXEL-BLOCK slab sub-pool (one contiguous calloc, never
-     * grows) + its free-list. Realized (non-uniform) chunks borrow a block; uniform
-     * -air chunks borrow none. calloc-zero = a block of MAT_AIR. */
-    ws->slabs = (Voxel *)calloc((size_t)WORLD_SLAB_SLOTS * CHUNK_VOXELS, sizeof(Voxel));
+     * grows) + its free-list. 0.5 (256 m): sized to ws->slab_slots (the session view-
+     * distance ceiling), so this is the one allocation that scales with view distance.
+     * Realized (non-uniform) chunks borrow a block; uniform-air ones borrow none.
+     * calloc-zero = a block of MAT_AIR. A NULL here = the chosen view distance needs
+     * more RAM than is available (the caller reports it + suggests a smaller one). */
+    ws->slabs = (Voxel *)calloc((size_t)slab_slots * CHUNK_VOXELS, sizeof(Voxel));
     if (ws->slabs == NULL) {
         free(ws->pool);
         ws->pool = NULL;
         return 1;
     }
     ws->slab_free_top = 0;
-    for (i = WORLD_SLAB_SLOTS; i-- > 0; )
+    for (i = slab_slots; i-- > 0; )
         ws->slab_free[ws->slab_free_top++] = i;
     ws->slab_inuse_peak = 0;
 
@@ -688,21 +703,26 @@ int world_init(WorldStore *ws, uint64_t seed, const WorldCallbacks *cb)
     ws->genq_head = ws->genq_tail = 0;
     ws->remeshq_head = ws->remeshq_tail = 0;
     ws->have_center = 0;
-    ws->view_radius = WORLD_VIEW_RADIUS_DEFAULT;   /* 0.5: runtime-adjustable view distance */
+    /* Start the ACTIVE radius at the session ceiling (so an explicit view distance
+     * takes effect immediately, incl. headless captures). The caller may lower it
+     * afterwards via world_set_view_radius (main.c does, for the no-env default, so a
+     * plain launch starts light and the player raises it with Up/Down). */
+    ws->view_radius = view_radius_max;
 
     return 0;
 }
 
-/* Set the active view radius, clamped to [2, WORLD_RADIUS] (the pool-sizing max).
- * The change is picked up by the next world_stream_update: forcing have_center=0
- * makes that call re-evaluate the whole window against the new radius (shrinking ->
- * evict the now-out-of-range ring; growing -> enqueue the new ring), all under the
- * normal per-frame budget. Returns the clamped value. */
+/* Set the active view radius, clamped to [2, ws->view_radius_max] (the session ceiling
+ * the slab pool was sized for - going past it would exhaust the slab pool). The change
+ * is picked up by the next world_stream_update: forcing have_center=0 makes that call
+ * re-evaluate the whole window against the new radius (shrinking -> evict the now-out-
+ * of-range ring; growing -> enqueue the new ring), all under the normal per-frame
+ * budget. Returns the clamped value. */
 int world_set_view_radius(WorldStore *ws, int radius)
 {
     if (ws == NULL) return 0;
-    if (radius < 2)            radius = 2;
-    if (radius > WORLD_RADIUS) radius = WORLD_RADIUS;
+    if (radius < 2)                   radius = 2;
+    if (radius > ws->view_radius_max) radius = ws->view_radius_max;
     if (radius != ws->view_radius) {
         ws->view_radius = radius;
         ws->have_center = 0;        /* force a full window re-evaluation next stream */

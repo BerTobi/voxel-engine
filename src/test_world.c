@@ -60,6 +60,14 @@
 #define WORLD_BAND_Y0   (TEST_CCY - WORLD_BAND_HALF)               /* 60 */
 #define WORLD_BAND_Y1   (TEST_CCY + WORLD_BAND_HALF)               /* 68 */
 
+/* 0.5 (256 m view distance): the slab pool is sized at world_init to a session view-
+ * distance CEILING (up to the radius-32 / 256 m compile max), so the tests run at a
+ * fixed modest radius (fast + light, ~45 MiB) and assert against ITS window rather
+ * than the huge compile ceiling. TEST_VIEW_R is the streaming radius these cases use;
+ * TEST_VIEW_WINDOW is its resident-chunk count. */
+#define TEST_VIEW_R      8
+#define TEST_VIEW_WINDOW WORLD_WINDOW_AT(TEST_VIEW_R)
+
 /* ---- Tiny assertion plumbing (same idiom as test_mesher.c) -------------- */
 static int g_failures = 0;
 
@@ -120,14 +128,12 @@ static WorldStore *make_store(uint64_t seed)
     WorldCallbacks cb = headless_cb();
     if (ws == NULL)
         return NULL;
-    if (world_init(ws, seed, &cb) != 0) {
+    if (world_init(ws, seed, &cb, TEST_VIEW_R) != 0) {
         free(ws);
         return NULL;
     }
-    /* 0.5: view distance is runtime-adjustable; the window-count + coverage tests
-     * below assert against WORLD_WINDOW_CHUNKS / WORLD_RADIUS (the MAX), so exercise
-     * the store at the maximum radius rather than the smaller runtime default. */
-    world_set_view_radius(ws, WORLD_RADIUS);
+    /* world_init starts the active radius at the ceiling (TEST_VIEW_R), so the
+     * window-count + coverage cases below settle to TEST_VIEW_WINDOW. */
     return ws;
 }
 
@@ -148,14 +154,14 @@ static int cheby(int ax, int az, int bx, int bz)
 }
 
 /* Is (cx,cy,cz) inside the window centred on chunk (ccx,ccy,ccz)? Chebyshev radius
- * WORLD_RADIUS horizontally, and (0.5 M2) a player-following band of WORLD_BAND_HALF
+ * TEST_VIEW_R horizontally, and (0.5 M2) a player-following band of WORLD_BAND_HALF
  * layers above/below the centre chunk-Y. */
 static int in_window(int cx, int cy, int cz, int ccx, int ccy, int ccz)
 {
     int dy = cy - ccy; if (dy < 0) dy = -dy;
     if (dy > WORLD_BAND_HALF)
         return 0;
-    return cheby(cx, cz, ccx, ccz) <= WORLD_RADIUS;
+    return cheby(cx, cz, ccx, ccz) <= TEST_VIEW_R;
 }
 
 /* world->chunk coord of a world position (floor div by CHUNK_DIM; the same
@@ -477,7 +483,7 @@ static void test_worldgen_determinism(void)
  * Case 4 - the loaded WINDOW contains EXACTLY the in-radius chunks.
  * After world_prime around a position, every in-window (cx,cy,cz) is resident,
  * NOTHING out of window is resident, the resident count equals the window size
- * (WORLD_WINDOW_CHUNKS) and is <= the pool capacity. This is the residency
+ * (TEST_VIEW_WINDOW) and is <= the pool capacity. This is the residency
  * policy of Section 7 - the bounded set.
  * ========================================================================= */
 static void test_window_exact(void)
@@ -503,8 +509,8 @@ static void test_window_exact(void)
     world_prime(ws, px, TEST_PY, pz);
 
     /* every in-window coord must be resident. */
-    for (cz = ccz - WORLD_RADIUS; cz <= ccz + WORLD_RADIUS && ok; ++cz)
-        for (cx = ccx - WORLD_RADIUS; cx <= ccx + WORLD_RADIUS && ok; ++cx)
+    for (cz = ccz - TEST_VIEW_R; cz <= ccz + TEST_VIEW_R && ok; ++cz)
+        for (cx = ccx - TEST_VIEW_R; cx <= ccx + TEST_VIEW_R && ok; ++cx)
             for (cy = WORLD_BAND_Y0; cy <= WORLD_BAND_Y1; ++cy)
                 if (world_get(ws, cx, cy, cz) == NULL) {
                     ++missing;
@@ -516,8 +522,8 @@ static void test_window_exact(void)
     /* nothing out of the band / out of radius is resident; spot-check the ring
      * just outside the radius and the bands just outside [Y0..Y1]. */
     if (ok) {
-        for (cz = ccz - WORLD_RADIUS - 1; cz <= ccz + WORLD_RADIUS + 1 && ok; ++cz)
-            for (cx = ccx - WORLD_RADIUS - 1; cx <= ccx + WORLD_RADIUS + 1 && ok; ++cx)
+        for (cz = ccz - TEST_VIEW_R - 1; cz <= ccz + TEST_VIEW_R + 1 && ok; ++cz)
+            for (cx = ccx - TEST_VIEW_R - 1; cx <= ccx + TEST_VIEW_R + 1 && ok; ++cx)
                 for (cy = WORLD_BAND_Y0 - 1; cy <= WORLD_BAND_Y1 + 1; ++cy)
                     if (!in_window(cx, cy, cz, ccx, TEST_CCY, ccz)
                         && world_get(ws, cx, cy, cz) != NULL) {
@@ -528,10 +534,10 @@ static void test_window_exact(void)
                     }
     }
 
-    if (ok && world_resident_count(ws) != (uint32_t)WORLD_WINDOW_CHUNKS) {
+    if (ok && world_resident_count(ws) != (uint32_t)TEST_VIEW_WINDOW) {
         ok = 0; snprintf(buf, sizeof buf,
             "resident_count=%u, expected window size %d",
-            world_resident_count(ws), WORLD_WINDOW_CHUNKS);
+            world_resident_count(ws), TEST_VIEW_WINDOW);
     }
     if (ok && world_resident_count(ws) > (uint32_t)WORLD_POOL_SLOTS) {
         ok = 0; snprintf(buf, sizeof buf,
@@ -646,7 +652,7 @@ static void test_neighbour_links(void)
  * Drive world_stream_update over a long winding path (well beyond a window
  * width so every chunk loads and evicts many times, exercising the backward-
  * shift hash deletion under unbounded churn). On EVERY frame:
- *   - resident_count <= WORLD_WINDOW_CHUNKS (the bounded-set invariant), and
+ *   - resident_count <= TEST_VIEW_WINDOW (the bounded-set invariant), and
  *     <= WORLD_POOL_SLOTS (the pool never overflows).
  *   - the slab accounting closes: free_top + resident_count == POOL_SLOTS
  *     (every popped slab is tracked; none lost, none double-counted).
@@ -705,10 +711,10 @@ static void test_long_walk(void)
          * never exceed the pool. */
         {
             uint32_t rc = world_resident_count(ws);
-            if (rc > (uint32_t)WORLD_WINDOW_CHUNKS) {
+            if (rc > (uint32_t)TEST_VIEW_WINDOW) {
                 ok = 0; snprintf(buf, sizeof buf,
                     "step %d: resident_count=%u exceeds window %d",
-                    step, rc, WORLD_WINDOW_CHUNKS);
+                    step, rc, TEST_VIEW_WINDOW);
                 break;
             }
             if (rc > (uint32_t)WORLD_POOL_SLOTS) {
@@ -732,7 +738,7 @@ static void test_long_walk(void)
      * (world.h Section 7) is the bounded set, not pixel-exact convergence: every
      * IN-WINDOW coord must become resident (the player can see all of the
      * surrounding window), and residency must stay within the pool. We do NOT
-     * assert resident_count == WORLD_WINDOW_CHUNKS exactly here, because the
+     * assert resident_count == TEST_VIEW_WINDOW exactly here, because the
      * current world.c drain_gen() can leave a thin ring of out-of-window
      * stragglers resident after fast movement (see the PRODUCTION NOTE below);
      * they evict on the next boundary crossing and never breach the pool. The
@@ -746,13 +752,13 @@ static void test_long_walk(void)
 
         /* drain until every in-window coord is resident (or a frame cap). The cap
          * scales with the window: the budgeted drain loads <= WORLD_GEN_BUDGET
-         * chunks/frame, so a full window needs ~WORLD_WINDOW_CHUNKS/WORLD_GEN_BUDGET
+         * chunks/frame, so a full window needs ~TEST_VIEW_WINDOW/WORLD_GEN_BUDGET
          * frames (190 for the R=64 ball's 1521-chunk window) + margin. */
-        for (drain = 0; drain < WORLD_WINDOW_CHUNKS / WORLD_GEN_BUDGET + 128; ++drain) {
+        for (drain = 0; drain < TEST_VIEW_WINDOW / WORLD_GEN_BUDGET + 128; ++drain) {
             int cx, cy, cz, miss = 0;
             world_stream_update(ws, px, TEST_PY, pz);
-            for (cz = ccz - WORLD_RADIUS; cz <= ccz + WORLD_RADIUS && !miss; ++cz)
-                for (cx = ccx - WORLD_RADIUS; cx <= ccx + WORLD_RADIUS && !miss; ++cx)
+            for (cz = ccz - TEST_VIEW_R; cz <= ccz + TEST_VIEW_R && !miss; ++cz)
+                for (cx = ccx - TEST_VIEW_R; cx <= ccx + TEST_VIEW_R && !miss; ++cx)
                     for (cy = WORLD_BAND_Y0; cy <= WORLD_BAND_Y1; ++cy)
                         if (world_get(ws, cx, cy, cz) == NULL) miss = 1;
             if (!miss) break;
@@ -761,8 +767,8 @@ static void test_long_walk(void)
         /* re-test: all in-window coords resident? */
         {
             int cx, cy, cz;
-            for (cz = ccz - WORLD_RADIUS; cz <= ccz + WORLD_RADIUS && all_in; ++cz)
-                for (cx = ccx - WORLD_RADIUS; cx <= ccx + WORLD_RADIUS && all_in; ++cx)
+            for (cz = ccz - TEST_VIEW_R; cz <= ccz + TEST_VIEW_R && all_in; ++cz)
+                for (cx = ccx - TEST_VIEW_R; cx <= ccx + TEST_VIEW_R && all_in; ++cx)
                     for (cy = WORLD_BAND_Y0; cy <= WORLD_BAND_Y1; ++cy)
                         if (world_get(ws, cx, cy, cz) == NULL) {
                             all_in = 0;
@@ -786,7 +792,7 @@ static void test_long_walk(void)
     /* ----- Clean single-move convergence on a FRESH store ------------------ *
      * The design's supported moving-player convergence: from a freshly primed
      * window, cross ONE boundary, hold, and let the budgeted drain fill the new
-     * window EXACTLY (count == WORLD_WINDOW_CHUNKS, every in-window coord
+     * window EXACTLY (count == TEST_VIEW_WINDOW, every in-window coord
      * resident, nothing extra). This is order-independent (no stale queue from a
      * prior abusive path) and proves world_stream_update - not just world_prime
      * - streams the window in. It is the path that makes streaming visible as
@@ -814,21 +820,21 @@ static void test_long_walk(void)
                  * in that/budget frames, so scale the count to the (max-radius) window
                  * + headroom (a fixed 16 under-drained the radius-8 curtain of 153).
                  * NOTE: we cannot loop on resident_count here - it is already
-                 * WORLD_WINDOW_CHUNKS from the previous window, so a count-guard
+                 * TEST_VIEW_WINDOW from the previous window, so a count-guard
                  * would skip the move entirely. We always step, then test
                  * MEMBERSHIP (the sound convergence predicate). */
                 for (drain = 0; drain < (WORLD_DIAM * WORLD_BAND_H) / WORLD_GEN_BUDGET + 12; ++drain)
                     world_stream_update(fs, fx, TEST_PY, fz);
 
-                if (world_resident_count(fs) != (uint32_t)WORLD_WINDOW_CHUNKS) {
+                if (world_resident_count(fs) != (uint32_t)TEST_VIEW_WINDOW) {
                     conv_ok = 0;
                     snprintf(d3, sizeof d3,
                         "boundary %d: resident=%u, expected window %d",
-                        b, world_resident_count(fs), WORLD_WINDOW_CHUNKS);
+                        b, world_resident_count(fs), TEST_VIEW_WINDOW);
                     break;
                 }
-                for (cz = fcz - WORLD_RADIUS; cz <= fcz + WORLD_RADIUS && conv_ok; ++cz)
-                    for (cx = fcx - WORLD_RADIUS; cx <= fcx + WORLD_RADIUS && conv_ok; ++cx)
+                for (cz = fcz - TEST_VIEW_R; cz <= fcz + TEST_VIEW_R && conv_ok; ++cz)
+                    for (cx = fcx - TEST_VIEW_R; cx <= fcx + TEST_VIEW_R && conv_ok; ++cx)
                         for (cy = WORLD_BAND_Y0; cy <= WORLD_BAND_Y1; ++cy)
                             if (world_get(fs, cx, cy, cz) == NULL) {
                                 conv_ok = 0;
@@ -854,7 +860,7 @@ static void test_long_walk(void)
  * stragglers are transient (the next boundary crossing's evict_out_of_range
  * removes them) and bounded (residency never approaches the pool cap), so they
  * do NOT breach memory or crash - but they momentarily push resident_count a
- * few chunks above WORLD_WINDOW_CHUNKS and waste a gen+slab on an out-of-view
+ * few chunks above TEST_VIEW_WINDOW and waste a gen+slab on an out-of-view
  * chunk. Relatedly, gen_enqueue() has no full-queue guard and enqueue_in_range()
  * does not dedup against coords already queued, so a sustained sprint can lap
  * the bounded gen ring and drop pending leading-edge coords entirely. All three
@@ -941,7 +947,7 @@ static void test_slab_baseline(void)
          * the store is reusable and the baseline is restored. */
         {
             WorldCallbacks cb = headless_cb();
-            if (world_init(ws, 0x1ull, &cb) != 0) {
+            if (world_init(ws, 0x1ull, &cb, TEST_VIEW_R) != 0) {
                 ok2 = 0; snprintf(d2, sizeof d2, "re-init after shutdown failed");
             } else {
                 if (world_resident_count(ws) != 0 ||
@@ -990,9 +996,9 @@ static void test_stationary_stable(void)
                 i, rc0, world_resident_count(ws), ft0, ws->free_top);
         }
     }
-    if (ok && rc0 != (uint32_t)WORLD_WINDOW_CHUNKS) {
+    if (ok && rc0 != (uint32_t)TEST_VIEW_WINDOW) {
         ok = 0; snprintf(buf, sizeof buf,
-            "primed window=%u, expected %d", rc0, WORLD_WINDOW_CHUNKS);
+            "primed window=%u, expected %d", rc0, TEST_VIEW_WINDOW);
     }
     report("stationary player is stable (no churn)", ok, buf);
     free_store(ws);
@@ -1004,7 +1010,7 @@ int main(void)
     printf("=== M7 WorldStore + worldgen tests ===\n");
     printf("(window=%d chunks, pool=%d slots, radius=%d, band cy %d..%d, "
            "hash cap=%u)\n",
-           WORLD_WINDOW_CHUNKS, WORLD_POOL_SLOTS, WORLD_RADIUS,
+           TEST_VIEW_WINDOW, WORLD_POOL_SLOTS, TEST_VIEW_R,
            WORLD_BAND_Y0, WORLD_BAND_Y1, WORLD_HASH_CAP);
 
     test_key_codec();

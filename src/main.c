@@ -1947,6 +1947,12 @@ int main(void)
      * but doing it here keeps the first attach cheap). Idempotent. */
     sim_build_conduct_lut();
 
+    /* 0.5 M4: tell the sim where the planet centre is, so the RADIAL fill-and-spill
+     * finisher levels water to true horizontal shells (a spring fills a basin into a
+     * flat lake / ocean) everywhere on the ball, not just the -Y polar cap. Set once;
+     * it is a global in sim.c. The same centre the gravity + camera already use. */
+    sim_set_planet_center(WG_PLANET_CX, WG_PLANET_CY, WG_PLANET_CZ);
+
     /* ---- 6b. Progression observer (ARCHITECTURE Section 9) --------------- *
      * Stand up the event ring and the observer state, then HAND the ring to the
      * sim as its (borrowed) event sink. Both are heap-allocated (the observer's

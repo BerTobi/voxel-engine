@@ -734,6 +734,16 @@ int  sim_set_spring(SimState *s, uint16_t li, uint8_t hold_code);
  * after sim_init is 3 (-Y), the flat-gravity fallback for tests / the prototype. */
 void sim_set_down_face(SimState *s, int face);
 
+/* 0.5 M4: register the planet centre (world voxels) for the RADIAL fill-and-spill
+ * finisher. The leveller fills the lowest-potential cells first, where potential is
+ * the squared radial distance d2 = (wx-cx)^2 + (wy-cy)^2 + (wz-cz)^2 of each voxel.
+ * GLOBAL (one centre for the whole world), so it is a file-static in sim.c set once
+ * by main.c (with WG_PLANET_C*); this keeps sim.c free of any worldgen LINK
+ * dependency (m3_test compiles sim.c without worldgen.c). If NEVER set, the finisher
+ * falls back to levelling along the chunk's fluid_down axis (correct for the
+ * axis-gravity unit tests, which never call this). */
+void sim_set_planet_center(int cx, int cy, int cz);
+
 /* Attach (or detach) the OPTIONAL progression event sink (ARCHITECTURE Section
  * 9). `sink` is a BORROWED ProgressSink* (a ProgressRing the caller owns); the
  * sim only ever pushes to it, never frees it. Pass NULL to detach (the default

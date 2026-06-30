@@ -144,6 +144,30 @@ static uint64_t leveled_hash(void)
     { uint64_t h = sim_state_hash(&s); sim_shutdown(&s); free(c.voxels); return h; }
 }
 
+/* RADIAL: a spring high in a walled shaft with the RADIAL fill-and-spill finisher.
+ * The chunk sits at the planet's +Y pole (world Y ~ CY+R) and a planet centre is set,
+ * so sim_cell_pot takes its d2 (long) branch. Exercises the radial potential math +
+ * the spring body-donation ACROSS the LP64/ILP32 boundary - d2 must not overflow or
+ * differ by data model, and the donation order must be byte-identical on both. */
+static uint64_t radial_hash(void)
+{
+    static Chunk c; SimState s; int x, y, z, t;
+    c.voxels = (Voxel *)calloc(CHUNK_VOXELS, sizeof(Voxel));
+    c.slab_idx = -1;
+    c.cx = 0; c.cy = WG_PLANET_R / CHUNK_DIM; c.cz = 0;   /* world Y ~ CY+R: the +Y pole */
+    for (x = 0; x < 16; ++x) for (y = 0; y < 16; ++y) for (z = 0; z < 16; ++z)
+        put(&c, x,y,z, mk(MAT_STONE,15));
+    for (z = 6; z <= 10; ++z) for (y = 1; y <= 13; ++y) for (x = 6; x <= 10; ++x)
+        put(&c, x,y,z, mk(MAT_AIR,0));                    /* a shaft cavity            */
+    put(&c, 8,12,8, mk(MAT_WATER,15));                    /* spring high in the shaft  */
+    sim_set_planet_center(WG_PLANET_CX, WG_PLANET_CY, WG_PLANET_CZ);   /* d2 branch    */
+    sim_build_conduct_lut(); sim_init(&s, &c);
+    sim_set_down_face(&s, 3);
+    sim_set_spring(&s, (uint16_t)vox_index(8,12,8), 60u);
+    for (t = 0; t < 1500; ++t) sim_tick(&s);
+    { uint64_t h = sim_state_hash(&s); sim_shutdown(&s); free(c.voxels); return h; }
+}
+
 int main(void)
 {
     emit("HEAT",     heat_hash());
@@ -151,5 +175,6 @@ int main(void)
     emit("COMBINED", combined_hash());
     emit("WORLDGEN", worldgen_hash());
     emit("LEVELED",  leveled_hash());
+    emit("RADIAL",   radial_hash());
     return 0;
 }

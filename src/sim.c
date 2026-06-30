@@ -445,12 +445,15 @@ void sim_set_down_face(SimState *s, int face)
 {
     if (s != NULL && face >= 0 && face < 6) {
         s->fluid_down = (int8_t)face;
-        s->fluid_finisher_on = (uint8_t)(face == 3);   /* -Y down: Y-column leveling valid */
+        /* 0.5 M4: the finisher is now RADIAL (sim_cell_pot d2 / axis fallback), so it
+         * is valid for EVERY face orientation, not just the -Y polar cap. Turning it
+         * on for all faces is what lets a spring on the curved planet surface fill a
+         * basin into a flat (radially-levelled) lake / ocean instead of terracing. */
+        s->fluid_finisher_on = 1;
         /* When the finisher is on, WAKE every free (movable) liquid cell so a LOADED
          * or otherwise-static body reaches the settle-trigger and levels on bind (a
          * saved terraced lake flattens as it ticks, not only freshly-poured water).
-         * Held sources are woken by sim_init; this adds plain flowing water. Only the
-         * -Y polar cap pays this; other chunks keep the M3 terraced behaviour. */
+         * Held sources are woken by sim_init; this adds plain flowing water. */
         if (s->fluid_finisher_on && s->chunk != NULL && s->chunk->voxels != NULL) {
             int li;
             for (li = 0; li < CHUNK_VOXELS; ++li) {
@@ -761,102 +764,60 @@ static inline void moved_set(SimState *s, int li)
  * cannot raise a column against gravity through a bottom channel. These pieces do.
  * ===================================================================== */
 
-/* Surface level of a single cell in SUB-CELL units measured from the chunk floor:
- * the ly full cells below it are FLUID_FULL each, plus the cell's own fill on top.
- * (Matches the prototype surf_of = y*MAXFILL + fill.) */
-static inline int surf_of(const SimState *s, int lx, int ly, int lz)
+/* 0.5 M4: the M3 "communicating vessels" HEAD field (surf_of / free_surface /
+ * head_relax) was REMOVED here. It computed a per-body world-Y free-surface head
+ * that nothing consumes: the binary sim_liquid_unsettled mirrors fluid_step
+ * directly and never reads head, and head is not in sim_state_hash. The RADIAL
+ * rising-shell finisher (below) is the leveller now, so the dead per-tick
+ * whole-chunk head flood is gone (it ran on every water chunk once enabled). */
+
+/* Planet centre for the radial potential (world voxels). GLOBAL + settable once by
+ * main.c via sim_set_planet_center, so sim.c needs no worldgen LINK dependency
+ * (m3_test builds sim.c without worldgen.c). g_pc_set == 0 => not configured =>
+ * the potential falls back to the chunk's fluid_down axis (the axis-gravity unit
+ * tests never set a centre and must still level along their flat -Y gravity). */
+static int  g_pc_set = 0;
+static long g_pc_x = 0, g_pc_y = 0, g_pc_z = 0;
+
+void sim_set_planet_center(int cx, int cy, int cz)
 {
-    return ly * (int)FLUID_FULL +
-           (int)vox_fill(s->chunk->voxels[vox_index(lx, ly, lz)]);
+    g_pc_x = (long)cx; g_pc_y = (long)cy; g_pc_z = (long)cz; g_pc_set = 1;
 }
 
-/* A liquid cell whose cell directly above (+Y) is NOT covered by liquid (air,
- * solid lid, or out-of-chunk top): the air/lid-water interface where the head
- * field is SEEDED with the true surface level. Matches the prototype free_surface
- * (water cell, and above is top / wall / fill==0). */
-static int free_surface(const SimState *s, int lx, int ly, int lz)
-{
-    const Voxel *vox = s->chunk->voxels;
-    int li = vox_index(lx, ly, lz);
-    if (material_get(vox_mat(vox[li]))->phase != PHASE_LIQUID ||
-        vox_fill(vox[li]) == 0)
-        return 0;
-    if (ly + 1 >= CHUNK_DIM)
-        return 1;                            /* open at the chunk top */
-    {
-        int ali = vox_index(lx, ly + 1, lz);
-        if (material_get(vox_mat(vox[ali]))->phase == PHASE_LIQUID &&
-            vox_fill(vox[ali]) > 0)
-            return 0;                        /* covered by liquid above: interior */
-        return 1;                            /* air / solid lid above: a surface */
-    }
-}
-
-/* Scratch for the per-body head flood (file-static, single-chunk). */
-static int     g_hbody[CHUNK_VOXELS];   /* BFS queue of body cell indices */
-static uint8_t g_hseen[CHUNK_VOXELS];   /* flood visited marks            */
-
-/* Recompute the HEAD field FROM SCRATCH each tick: head[li] = the highest free-
- * surface level (surf_of, in sub-cell units) anywhere in the connected same-
- * material liquid body that li belongs to. A cell whose body has a taller free
- * surface somewhere (e.g. a second tank still below the level of a full first tank
- * joined through a bottom channel) gets a head ABOVE its own column surface, which
- * sim_liquid_unsettled reads to keep that cell AWAKE until the body is levelled.
- * Held sources (lava) are flooded as walls and keep head 0 (they never rise).
+/* The levelling POTENTIAL at LOCAL coords (lx,ly,lz) - which may be OUT of [0,16)
+ * for a one-cell-beyond-the-seam neighbour (the world position extends naturally).
+ * Lower = "more down" (filled / fallen to first). On the sphere (centre set) it is
+ * the squared radial distance of the voxel's WORLD position to the planet centre,
+ * computed in INT64 so it cannot overflow on the 32-bit ship target even for a far
+ * chunk (and so it is byte-identical LP64 vs ILP32). With NO centre configured it is
+ * the coordinate along the chunk's radial-down axis (so -Y gravity levels to a flat
+ * world-Y surface, +X to flat-X, etc.) - what keeps the axis-gravity tests correct.
  *
- * WHY A FRESH PER-BODY FLOOD, not an incremental relaxation: a relaxed standing
- * field stores last-tick values, so when a draining column lowers its surface the
- * OLD higher value circulates as a "ghost" (re-injected below the age cap) and the
- * head momentarily COLLAPSES to a cell's own seed during the ghost->reseed handoff;
- * the sleep guard latches that one-tick dip and sleeps the body PERMANENTLY un-
- * levelled (measured: head 113->29 in one tick, the whole pool asleep next). A
- * from-scratch flood has no stored state and no ghost, so head exactly tracks the
- * CURRENT surfaces and is rock-stable. O(liquid cells) per tick, deterministic
- * (bodies seeded in index order, fixed neighbour order), reads ONLY fill (never
- * the temperature buffer). Gated by the caller on "free liquid present", so a
- * still pond or a lava-only chunk never pays for it. */
-static void head_relax(SimState *s)
+ * BOTH the radial leveller AND the local flow rule (fluid_step / sim_liquid_unsettled)
+ * key off this same potential, so they AGREE on the fixed point: a body the leveller
+ * has snapped to the lowest-potential cells has no lower-potential neighbour for the
+ * local rule to move into, so it stays put (no leveller-vs-local-rule churn on the
+ * off-axis chunks where the radial shell cuts diagonally through the voxel grid). */
+static int64_t sim_pot_xyz(const SimState *s, int lx, int ly, int lz)
 {
-    const Voxel *vox = s->chunk->voxels;
-    int li;
-    for (li = 0; li < CHUNK_VOXELS; ++li) { s->head[li] = 0; g_hseen[li] = 0; }
-    for (li = 0; li < CHUNK_VOXELS; ++li) {
-        uint8_t mat = vox_mat(vox[li]);
-        int n = 0, qh = 0, maxsurf = 0, k;
-        if (g_hseen[li]) continue;
-        if (material_get(mat)->phase != PHASE_LIQUID || vox_fill(vox[li]) == 0)
-            continue;
-        if (is_held_source(s, li)) continue;     /* held lava: head 0, never rises */
-        g_hbody[n++] = li; g_hseen[li] = 1;
-        while (qh < n) {
-            int i = g_hbody[qh++];
-            int lx = i & 0x0F, ly = (i >> 4) & 0x0F, lz = (i >> 8) & 0x0F, nn;
-            if (free_surface(s, lx, ly, lz)) {
-                int sf = surf_of(s, lx, ly, lz);
-                if (sf > maxsurf) maxsurf = sf;
-            }
-            for (nn = 0; nn < 6; ++nn) {
-                int nx = lx + SIM_NEIGH[nn][0];
-                int ny = ly + SIM_NEIGH[nn][1];
-                int nz = lz + SIM_NEIGH[nn][2];
-                int nli;
-                if (nx < 0 || nx >= CHUNK_DIM || ny < 0 || ny >= CHUNK_DIM ||
-                    nz < 0 || nz >= CHUNK_DIM) continue;
-                nli = vox_index(nx, ny, nz);
-                if (g_hseen[nli]) continue;
-                /* Same-material liquid only (the mat gate already excludes lava and
-                 * every other material). No per-neighbour is_held_source scan here:
-                 * it cost an O(SIM_MAX_SOURCES) lookup on EVERY neighbour of every
-                 * flooded cell, and is unnecessary - a held water spring swept into
-                 * the body just contributes its surface to head (harmless; the
-                 * FINISHER excludes held sources independently). */
-                if (vox_mat(vox[nli]) == mat && vox_fill(vox[nli]) > 0) {
-                    g_hseen[nli] = 1; g_hbody[n++] = nli;
-                }
-            }
-        }
-        for (k = 0; k < n; ++k) s->head[g_hbody[k]] = maxsurf;
+    if (g_pc_set) {
+        int64_t wx = (int64_t)s->chunk->cx * CHUNK_DIM + lx - g_pc_x;
+        int64_t wy = (int64_t)s->chunk->cy * CHUNK_DIM + ly - g_pc_y;
+        int64_t wz = (int64_t)s->chunk->cz * CHUNK_DIM + lz - g_pc_z;
+        return wx * wx + wy * wy + wz * wz;
     }
+    switch (s->fluid_down) {              /* SIM_NEIGH: 0+X 1-X 2+Y 3-Y 4+Z 5-Z */
+        case 0:  return (CHUNK_DIM - 1) - lx;   /* +X is down -> larger x is lower */
+        case 1:  return lx;                     /* -X is down                      */
+        case 2:  return (CHUNK_DIM - 1) - ly;   /* +Y is down                      */
+        case 4:  return (CHUNK_DIM - 1) - lz;   /* +Z is down                      */
+        case 5:  return lz;                     /* -Z is down                      */
+        default: return ly;                     /* 3 == -Y is down (the default)   */
+    }
+}
+static int64_t sim_cell_pot(const SimState *s, int li)
+{
+    return sim_pot_xyz(s, li & 0x0F, (li >> 4) & 0x0F, (li >> 8) & 0x0F);
 }
 
 /* 0.5 M3: true iff li is a PHASE_LIQUID voxel that can still FLOW under the binary
@@ -873,6 +834,7 @@ int sim_liquid_unsettled(const SimState *s, uint16_t li)
     const Voxel *vox = s->chunk->voxels;
     uint8_t mat = vox_mat(vox[li]);
     int lx, ly, lz, down, down_axis, n;
+    int64_t pot_li;
 
     if (material_get(mat)->phase != PHASE_LIQUID)
         return 0;
@@ -882,15 +844,21 @@ int sim_liquid_unsettled(const SimState *s, uint16_t li)
     lx = li & 0x0F; ly = (li >> 4) & 0x0F; lz = (li >> 8) & 0x0F;
     down = s->fluid_down;
     down_axis = down >> 1;
+    /* This cell's radial potential. A move is real only if it reaches STRICTLY lower
+     * potential (mirrors fluid_step's gates), so a body the leveller has snapped to
+     * the lowest-potential cells SLEEPS instead of fighting the leveller every tick. */
+    pot_li = sim_cell_pot(s, li);
 
-    /* (a) can it FALL? radial-down neighbour (in-chunk) is air. */
+    /* (a) can it FALL? radial-down neighbour (in-chunk) is air AND lower potential. */
     {
         int nx = lx + SIM_NEIGH[down][0], ny = ly + SIM_NEIGH[down][1], nz = lz + SIM_NEIGH[down][2];
         if (nx >= 0 && nx < CHUNK_DIM && ny >= 0 && ny < CHUNK_DIM && nz >= 0 && nz < CHUNK_DIM &&
-            vox_mat(vox[vox_index(nx, ny, nz)]) == MAT_AIR)
+            vox_mat(vox[vox_index(nx, ny, nz)]) == MAT_AIR &&
+            sim_cell_pot(s, vox_index(nx, ny, nz)) < pot_li)
             return 1;
     }
-    /* (b) can it FLOW-TO-DESCENT? a lateral air neighbour whose own down is air. */
+    /* (b) can it FLOW-TO-DESCENT? a lateral air neighbour whose own down is air AND
+     * that descent cell is strictly lower potential (the descent must go DOWNHILL). */
     for (n = 0; n < 6; ++n) {
         int nx, ny, nz, dx, dy, dz;
         if ((n >> 1) == down_axis)
@@ -903,7 +871,8 @@ int sim_liquid_unsettled(const SimState *s, uint16_t li)
         dx = nx + SIM_NEIGH[down][0]; dy = ny + SIM_NEIGH[down][1]; dz = nz + SIM_NEIGH[down][2];
         if (dx < 0 || dx >= CHUNK_DIM || dy < 0 || dy >= CHUNK_DIM || dz < 0 || dz >= CHUNK_DIM)
             continue;
-        if (vox_mat(vox[vox_index(dx, dy, dz)]) == MAT_AIR)
+        if (vox_mat(vox[vox_index(dx, dy, dz)]) == MAT_AIR &&
+            sim_cell_pot(s, vox_index(dx, dy, dz)) < pot_li)
             return 1;
     }
     /* 0.5 M4: with cross-chunk flow enabled, a water voxel on the DOWN-FACE boundary
@@ -926,8 +895,9 @@ int sim_liquid_unsettled(const SimState *s, uint16_t li)
                 int nlx = (dnx + CHUNK_DIM) & (CHUNK_DIM - 1);
                 int nly = (dny + CHUNK_DIM) & (CHUNK_DIM - 1);
                 int nlz = (dnz + CHUNK_DIM) & (CHUNK_DIM - 1);
-                if (vox_mat(chunk_vox(nc, vox_index(nlx, nly, nlz))) == MAT_AIR)
-                    return 1;               /* air across the seam: keep retrying */
+                if (vox_mat(chunk_vox(nc, vox_index(nlx, nly, nlz))) == MAT_AIR &&
+                    sim_pot_xyz(s, dnx, dny, dnz) < pot_li)
+                    return 1;               /* lower-potential air across the seam: keep retrying */
             }
         }
     }
@@ -1022,20 +992,31 @@ static int fluid_step(SimState *s, int li, int is_source, int is_spring)
     int down_axis = down >> 1;
     int dn, oi, n, nlat = 0, rot;
     int lat[4];
+    int64_t pot_li;
 
     if (vox_fill(vox[li]) == 0)
         return 0;                       /* drained: nothing to move */
     if (is_source && !is_spring)
         return 0;                       /* lava / plain held source: conserve in place */
 
-    /* (a) GRAVITY: fall along the radial-down face. */
+    /* This cell's radial potential. EVERY move below must reach STRICTLY lower
+     * potential, so the local rule agrees with the radial leveller's fixed point
+     * (no leveller-vs-local-rule churn on off-axis chunks). With no planet centre
+     * (axis-gravity tests) sim_cell_pot is the down-axis coord, so the down/descent
+     * neighbour is always strictly lower and behaviour is unchanged. */
+    pot_li = sim_cell_pot(s, li);
+
+    /* (a) GRAVITY: fall along the radial-down face (only to LOWER potential). */
     if (fluid_neigh(lx, ly, lz, down, &dn)) {           /* down is IN-CHUNK */
-        if (vox_mat(vox[dn]) == MAT_AIR && !moved_test(s, dn)) {
+        if (vox_mat(vox[dn]) == MAT_AIR && !moved_test(s, dn) &&
+            sim_cell_pot(s, dn) < pot_li) {
             fluid_move_water(s, li, dn, mat, is_spring);
             return 1;
         }
         /* in-chunk down blocked -> fall through to lateral */
-    } else if (s->fluid_xfn != NULL && !is_spring) {    /* 0.5 M4: down is OUT-OF-CHUNK */
+    } else if (s->fluid_xfn != NULL && !is_spring &&
+               sim_pot_xyz(s, lx + SIM_NEIGH[down][0], ly + SIM_NEIGH[down][1],
+                           lz + SIM_NEIGH[down][2]) < pot_li) { /* 0.5 M4: down is OUT-OF-CHUNK + lower */
         /* Ask the WorldCA whether the chunk below has air at this column: if so it
          * enqueues a deferred ATOMIC cross-move (applied after all chunks commit -
          * materialise the neighbour cell + revert this one, conserving) and we stop
@@ -1069,6 +1050,7 @@ static int fluid_step(SimState *s, int li, int is_source, int is_spring)
         nlx = ln & 0x0F; nly = (ln >> 4) & 0x0F; nlz = (ln >> 8) & 0x0F;
         if (!fluid_neigh(nlx, nly, nlz, down, &lnd))  continue;   /* its down */
         if (vox_mat(vox[lnd]) != MAT_AIR)             continue;   /* can't descend */
+        if (sim_cell_pot(s, lnd) >= pot_li)           continue;   /* descent not DOWNHILL */
         fluid_move_water(s, li, ln, mat, is_spring);
         return 1;
     }
@@ -1076,19 +1058,24 @@ static int fluid_step(SimState *s, int li, int is_source, int is_spring)
 }
 
 /* ===================================================================== *
- * CONNECTED-BODY FINISHER (Approach B): a bounded, conserving, non-local snap
- * that levels a water body the local rule has left in a sub-cell limit cycle.
- * Fired RARELY (once per body per disturbance, gated by the limit-cycle trigger
- * in sim_tick), then the body is a true fixed point and sleeps. All scratch is
- * file-static (single-chunk this milestone).
+ * CONNECTED-BODY FINISHER (0.5 M4 RADIAL rising-shell fill-and-spill): a
+ * bounded, conserving, non-local snap that levels a water body the local rule
+ * has left terraced. Fired on SETTLE (once per distinct settled state, gated by
+ * the fired-hash set in sim_tick), then the body is a fixed point and sleeps.
+ *
+ * It LEVELS by RADIAL POTENTIAL (sim_cell_pot = squared distance to the planet
+ * centre), not world-Y: a body of N whole cells is rewritten as the N
+ * LOWEST-potential cells reachable from its floor through fillable space (air
+ * or the body's own water). That is a rising shell that fills the basin bottom
+ * up and SPILLS over the lowest saddle into a connected lower basin - the
+ * fill-and-spill proven in scratchpad/lake_finisher_proto.c (all P1-P10, six
+ * orientations, seam_step 0). All scratch is file-static (single-chunk).
  * ===================================================================== */
+
 static int      g_body[CHUNK_VOXELS];      /* BFS queue of body cell indices       */
-static int      g_col_lx[CHUNK_VOXELS];    /* per-column lx (<=256 columns used)   */
-static int      g_col_lz[CHUNK_VOXELS];    /* per-column lz                        */
-static int      g_col_floor[CHUNK_VOXELS]; /* lowest body cell ly in the column    */
-static int      g_col_ceil[CHUNK_VOXELS];  /* highest open ly the column may rise  */
-static int      g_col_vol[CHUNK_VOXELS];   /* assigned sub-cell volume per column  */
-static int      g_col_cap[CHUNK_VOXELS];   /* OPEN-cell capacity per column (units) */
+static int      g_acc[CHUNK_VOXELS];       /* accepted (rising-shell) cells         */
+static int      g_front[CHUNK_VOXELS];     /* current fillable frontier             */
+static uint8_t  g_onf[CHUNK_VOXELS];       /* visited mark for the shell flood      */
 static uint8_t  g_seen[CHUNK_VOXELS];      /* flood-fill visited marks (cumulative, outer-loop skip) */
 static uint8_t  g_inbody[CHUNK_VOXELS];    /* membership in the CURRENT body being levelled (per-body) */
 
@@ -1131,36 +1118,23 @@ static uint64_t fluid_fill_hash(const SimState *s)
     return h;
 }
 
-/* Flood one connected water body of material `mat` from seed `seed` (4/6-connected
+/* Flood one connected water body of material `mat` from seed `seed` (6-connected
  * through SAME-material liquid cells carrying fill; held sources are walls). Marks
- * g_seen, fills g_body[0..*pn), records each distinct column (lx,lz) with its
- * floor/ceil over the body's water extent, and returns the body's TOTAL fill.
- *
- * Connectivity is through WATER ONLY (the prototype also chained open airspace
- * above the body; we deliberately omit that so the flood is BOUNDED by actual
- * water cells and cannot "vacuum the open sky" of an open-world chunk - the column
- * CEILING the body may rise into is recovered separately by flat_write_body, which
- * extends each column up through its open vessel span). */
-static long flood_body(SimState *s, int seed, uint8_t mat, int *pn, int *pcols)
+ * g_seen, fills g_body[0..*pn) with the body's cells, and returns the body's TOTAL
+ * fill. Connectivity is through WATER ONLY (so the flood is BOUNDED by actual water
+ * cells and cannot vacuum the open sky); level_and_spill_body re-floods OUTWARD from
+ * here through fillable space to find the lowest-potential cells to occupy. */
+static long flood_body(SimState *s, int seed, uint8_t mat, int *pn)
 {
     const Voxel *vox = s->chunk->voxels;
-    int n = 0, ncols = 0, qh = 0;
+    int n = 0, qh = 0;
     long total = 0;
 
     g_body[n++] = seed; g_seen[seed] = 1;
     while (qh < n) {
         int i = g_body[qh++];
-        int lx = i & 0x0F, ly = (i >> 4) & 0x0F, lz = (i >> 8) & 0x0F;
-        int c, nn;
+        int lx = i & 0x0F, ly = (i >> 4) & 0x0F, lz = (i >> 8) & 0x0F, nn;
         total += vox_fill(vox[i]);
-        for (c = 0; c < ncols; ++c)
-            if (g_col_lx[c] == lx && g_col_lz[c] == lz) break;
-        if (c == ncols) {
-            g_col_lx[c] = lx; g_col_lz[c] = lz;
-            g_col_floor[c] = ly; g_col_ceil[c] = ly; ncols++;
-        }
-        if (ly < g_col_floor[c]) g_col_floor[c] = ly;
-        if (ly > g_col_ceil[c]) g_col_ceil[c] = ly;
         for (nn = 0; nn < 6; ++nn) {
             int nx = lx + SIM_NEIGH[nn][0];
             int ny = ly + SIM_NEIGH[nn][1];
@@ -1177,105 +1151,178 @@ static long flood_body(SimState *s, int seed, uint8_t mat, int *pn, int *pcols)
             }
         }
     }
-    *pn = n; *pcols = ncols;
+    *pn = n;
     return total;
 }
 
-/* Level the flooded body: extend every column to its full open vessel span, find
- * the flat surface level S (binary search) whose summed per-column volume equals
- * the body TOTAL, assign volumes (distributing the within-1 remainder one unit per
- * column in discovery order), and WRITE each column full-cells-bottom-up + a
- * partial top + empties above. Materialises air recipients and reverts drained
- * cells, wakes each changed cell's ring, resets its head (re-seeds next relax).
- * Redistributes the SAME total => CONSERVES EXACTLY. Returns 1 if anything moved. */
-static int flat_write_body(SimState *s, int ncols, long total, uint8_t mat)
+/* Push cell `nli` onto the rising-shell frontier if it is unvisited and fillable. */
+#define SHELL_PUSH(nli) do {                                                 \
+        int _i = (nli);                                                      \
+        if (!g_onf[_i] && cell_fillable(s, _i, mat)) {                       \
+            g_onf[_i] = 1; g_front[fn++] = _i;                               \
+        }                                                                    \
+    } while (0)
+#define SHELL_PUSH_NEIGH(idx) do {                                           \
+        int _x = (idx) & 0x0F, _y = ((idx) >> 4) & 0x0F, _z = ((idx) >> 8) & 0x0F, _k; \
+        for (_k = 0; _k < 6; ++_k) {                                         \
+            int _nx = _x + SIM_NEIGH[_k][0], _ny = _y + SIM_NEIGH[_k][1],    \
+                _nz = _z + SIM_NEIGH[_k][2];                                 \
+            if (_nx < 0 || _nx >= CHUNK_DIM || _ny < 0 || _ny >= CHUNK_DIM || \
+                _nz < 0 || _nz >= CHUNK_DIM) continue;                       \
+            SHELL_PUSH(vox_index(_nx, _ny, _nz));                            \
+        }                                                                    \
+    } while (0)
+
+/* RADIAL rising-shell leveller (0.5 M4; replaces the world-Y column solver). The
+ * flooded body holds water_cells = total/FLUID_FULL whole cells. Rewrite it as the
+ * water_cells LOWEST-POTENTIAL cells reachable from the body's floor through fillable
+ * space (air or this body's own water - cell_fillable + the per-body g_inbody mark),
+ * grown one lowest-potential frontier cell at a time. That is a shell that rises from
+ * the basin floor and, once it tops the lowest saddle, SPILLS into the connected
+ * lower basin (the frontier reaches over the saddle). Accepted -> water, un-accepted
+ * body cells -> air. CONSERVES exactly: water_cells in, water_cells out. The body is
+ * always reachable from its own floor through its own (fillable) water, so the loop
+ * always reaches water_cells accepted - no cell is ever destroyed. Returns 1 if
+ * anything changed; idempotent on an already-levelled body (so it self-terminates).
+ * Potential is sim_cell_pot (radial d2 on the sphere, axis fallback otherwise). */
+static int level_and_spill_body(SimState *s, const int *body, int nbody, long total,
+                                uint8_t mat)
+{
+    int water_cells = (int)(total / (long)FLUID_FULL);
+    int an = 0, fn = 0, b, a, changed = 0;
+    int floor; int64_t fb;
+
+    if (water_cells <= 0) return 0;
+    /* floor = the body's lowest-potential cell: the seed of the rising shell. */
+    floor = body[0]; fb = sim_cell_pot(s, body[0]);
+    for (b = 1; b < nbody; ++b) {
+        int64_t p = sim_cell_pot(s, body[b]);
+        if (p < fb) { fb = p; floor = body[b]; }
+    }
+    g_acc[an++] = floor; g_onf[floor] = 1;
+    SHELL_PUSH_NEIGH(floor);
+    /* Repeatedly accept the lowest-potential (ties: lowest index) frontier cell. */
+    while (an < water_cells && fn > 0) {
+        int bestpos = 0, pick; int64_t bestpot = sim_cell_pot(s, g_front[0]);
+        for (a = 1; a < fn; ++a) {
+            int64_t p = sim_cell_pot(s, g_front[a]);
+            if (p < bestpot || (p == bestpot && g_front[a] < g_front[bestpos])) {
+                bestpot = p; bestpos = a;
+            }
+        }
+        pick = g_front[bestpos];
+        g_front[bestpos] = g_front[--fn];        /* remove pick from the frontier */
+        g_acc[an++] = pick;
+        SHELL_PUSH_NEIGH(pick);
+    }
+    /* g_onf now marks accepted (g_acc) + the leftover frontier. Clear the leftover so
+     * g_onf marks EXACTLY the accepted set for the drain test below. */
+    for (a = 0; a < fn; ++a) g_onf[g_front[a]] = 0;
+    /* WRITE accepted -> water (materialise air, top up a partial same-mat cell). */
+    for (a = 0; a < an; ++a) {
+        int li = g_acc[a]; uint8_t cm = vox_mat(s->chunk->voxels[li]);
+        if (cm == MAT_AIR) {
+            fluid_occupy_air(s, li, mat, (int)FLUID_FULL);
+            changed = 1; wake_ring(s, li);
+        } else if (cm == mat &&
+                   (int)vox_fill(s->chunk->voxels[li]) != (int)FLUID_FULL) {
+            vox_set_fill(&s->chunk->voxels[li], (uint8_t)FLUID_FULL);
+            changed = 1; wake_ring(s, li);
+        }
+        s->head[li] = 0;
+        g_seen[li] = 1;     /* materialised: don't re-flood as a phantom new body */
+    }
+    /* DRAIN body water cells NOT accepted (above the new surface, or spilled away). */
+    for (b = 0; b < nbody; ++b) {
+        int li = body[b];
+        if (!g_onf[li] && vox_mat(s->chunk->voxels[li]) == mat) {
+            fluid_revert_to_air(s, li);
+            changed = 1; wake_ring(s, li); s->head[li] = 0;
+        }
+    }
+    for (a = 0; a < an; ++a) g_onf[g_acc[a]] = 0;   /* g_onf back to all-zero */
+    return changed;
+}
+
+/* d2 (squared-radius) units a spring may donate ABOVE its own shell. 1 admits a
+ * single tangential hop (the +1 curvature term of a step perpendicular to the radial
+ * gradient) but not a radial-up step (~2R), matching the validated prototype. */
+#define SPRING_DON_MARGIN 1
+
+/* Spring body-donation (0.5 M4): a registered SPRING that the local rule has left
+ * unable to descend (flat ground or submerged) DONATES one whole water voxel to the
+ * lowest-potential AIR cell reachable WITHIN ITS CHUNK through air/liquid at
+ * potential <= the spring's own potential - so it fills DOWN toward the basin floor,
+ * never UP into the open sky (sky is HIGHER potential). This is what turns an
+ * otherwise-inert spring into a basin / ocean filler; mirrors spring_emit_tile in
+ * scratchpad/lake_finisher_proto.c. Returns 1 if it placed a voxel. */
+static int fluid_spring_donate(SimState *s, int sli)
 {
     Voxel *vox = s->chunk->voxels;
-    int c, ly, changed = 0;
-    /* 0.5 BINARY leveling: every water cell is exactly FLUID_FULL, so the body holds
-     * a whole number of CELLS. Level it to a flat surface of WHOLE cells (no partial
-     * top - that would break the fill in {0,15} invariant) at a within-1-CELL flat
-     * height. Conserves exactly (the same cell count is redistributed). */
-    int water_cells = (int)(total / (long)FLUID_FULL);
-    int klo = CHUNK_DIM, khi = 0;        /* world-Y search range over the columns */
-    int k, lo, hi, best, assigned = 0, rem;
+    uint8_t mat = vox_mat(vox[sli]);
+    /* A spring emits plain MAT_WATER, NEVER its own id: a MAT_WATER_SOURCE (spring)
+     * cell would otherwise be donated as a held SPRING - which on the next sim_init
+     * re-registers as a spring (a whole basin of springs), and within a session is a
+     * DIFFERENT material that fragments the MAT_WATER body the leveller floods.
+     * Mirrors fluid_move_water's `emit = is_spring ? MAT_WATER : mat`. */
+    uint8_t emit = (mat == MAT_WATER_SOURCE) ? (uint8_t)MAT_WATER : mat;
+    /* cap = the spring's own shell + SPRING_DON_MARGIN. The margin admits a one-step
+     * TANGENTIAL hop (a step perpendicular to the radial gradient changes d2 by only
+     * the +1 curvature term) so a spring on a curved slope can still reach the basin
+     * just over a one-voxel lip; a radial-UP step costs ~2R >> 1 and stays excluded,
+     * so it never fills the open sky. Matches the validated proto (SPRING_DON_MARGIN). */
+    int64_t capp = sim_cell_pot(s, sli) + SPRING_DON_MARGIN;
+    int n = 0, qh = 0, target = -1, a; int64_t best = 0;
+    int sx = sli & 0x0F, sy = (sli >> 4) & 0x0F, sz = (sli >> 8) & 0x0F, k;
 
-    /* Extend each column through its open vessel span (stop at a solid / held cell);
-     * count its OPEN-cell capacity in CELLS. cell_fillable skips interior shelves so
-     * a shelf/lava plug adds ZERO phantom capacity. */
-    for (c = 0; c < ncols; ++c) {
-        int lx = g_col_lx[c], lz = g_col_lz[c];
-        int f = g_col_floor[c], ce = g_col_ceil[c], openc = 0;
-        while (f  - 1 >= 0        && cell_fillable(s, vox_index(lx, f  - 1, lz), mat)) f--;
-        while (ce + 1 < CHUNK_DIM && cell_fillable(s, vox_index(lx, ce + 1, lz), mat)) ce++;
-        for (ly = f; ly <= ce; ++ly)
-            if (cell_fillable(s, vox_index(lx, ly, lz), mat)) openc++;
-        g_col_floor[c] = f; g_col_ceil[c] = ce;
-        g_col_cap[c]   = openc;          /* capacity in CELLS */
-        if (f < klo) klo = f;
-        if (ce + 1 > khi) khi = ce + 1;
+    /* seed: the spring's in-chunk air/liquid neighbours with potential <= cap */
+    for (k = 0; k < 6; ++k) {
+        int nx = sx + SIM_NEIGH[k][0], ny = sy + SIM_NEIGH[k][1], nz = sz + SIM_NEIGH[k][2], nli;
+        if (nx < 0 || nx >= CHUNK_DIM || ny < 0 || ny >= CHUNK_DIM ||
+            nz < 0 || nz >= CHUNK_DIM) continue;
+        nli = vox_index(nx, ny, nz);
+        if (g_onf[nli] || sim_cell_pot(s, nli) > capp) continue;
+        { uint8_t cm = vox_mat(vox[nli]);
+          if (cm == MAT_AIR || material_get(cm)->phase == PHASE_LIQUID) {
+              g_onf[nli] = 1; g_front[n++] = nli; } }
     }
-    /* Highest flat surface level k (world-Y) whose total fillable cells strictly
-     * BELOW k is <= water_cells (binary search). Cells below a shared level k
-     * equalise even across interior shelves (water connected around the side). */
-    lo = klo; hi = khi; best = klo;
-    while (lo <= hi) {
-        int mid = (lo + hi) / 2, sum = 0;
-        for (c = 0; c < ncols; ++c) {
-            int lx = g_col_lx[c], lz = g_col_lz[c];
-            for (ly = g_col_floor[c]; ly <= g_col_ceil[c] && ly < mid; ++ly)
-                if (cell_fillable(s, vox_index(lx, ly, lz), mat)) sum++;
+    while (qh < n) {
+        int i = g_front[qh++];
+        int ix = i & 0x0F, iy = (i >> 4) & 0x0F, iz = (i >> 8) & 0x0F;
+        if (vox_mat(vox[i]) == MAT_AIR) {
+            int64_t p = sim_cell_pot(s, i);
+            if (target < 0 || p < best || (p == best && i < target)) { best = p; target = i; }
         }
-        if (sum <= water_cells) { best = mid; lo = mid + 1; } else hi = mid - 1;
-    }
-    k = best;
-    /* Per-column cell count: fillable cells below k. */
-    for (c = 0; c < ncols; ++c) {
-        int lx = g_col_lx[c], lz = g_col_lz[c], cells = 0;
-        for (ly = g_col_floor[c]; ly <= g_col_ceil[c] && ly < k; ++ly)
-            if (cell_fillable(s, vox_index(lx, ly, lz), mat)) cells++;
-        g_col_vol[c] = cells; assigned += cells;
-    }
-    /* Hand the within-1-CELL remainder out one CELL per column with open headroom
-     * (discovery order) - these columns get one extra cell at the surface, so the
-     * level is flat to within a single voxel. total <= sum(open cap), so it fits. */
-    rem = water_cells - assigned;
-    while (rem > 0) {
-        int progressed = 0;
-        for (c = 0; c < ncols && rem > 0; ++c)
-            if (g_col_vol[c] < g_col_cap[c]) { g_col_vol[c]++; rem--; progressed = 1; }
-        if (!progressed) break;
-    }
-    /* Write each column: the first g_col_vol[c] fillable cells full (bottom-up),
-     * the rest air. An interior obstruction is SKIPPED without consuming a cell (so
-     * water above a shelf resumes in the next open cell). All cells are whole
-     * (FLUID_FULL) or air -> the binary invariant holds. */
-    for (c = 0; c < ncols; ++c) {
-        int lx = g_col_lx[c], lz = g_col_lz[c], left = g_col_vol[c];
-        for (ly = g_col_floor[c]; ly <= g_col_ceil[c]; ++ly) {
-            int li = vox_index(lx, ly, lz);
-            uint8_t cm = vox_mat(vox[li]);
-            /* Mark the whole span seen so run_finisher does not re-flood a cell we
-             * MATERIALISE (air->water) this pass as a phantom new body. */
-            g_seen[li] = 1;
-            if (!cell_fillable(s, li, mat)) continue;   /* solid / held / other liquid */
-            if (left > 0) {
-                left--;
-                if (cm == MAT_AIR) {
-                    fluid_occupy_air(s, li, mat, (int)FLUID_FULL);
-                    changed = 1; wake_ring(s, li);
-                } else if ((int)vox_fill(vox[li]) != (int)FLUID_FULL) { /* cm == mat, partial */
-                    vox_set_fill(&vox[li], (uint8_t)FLUID_FULL);
-                    changed = 1; wake_ring(s, li);
-                }
-            } else if (cm == mat) {          /* above the new surface: drain */
-                fluid_revert_to_air(s, li);
-                changed = 1; wake_ring(s, li);
-            }
-            s->head[li] = 0;
+        for (k = 0; k < 6; ++k) {
+            int nx = ix + SIM_NEIGH[k][0], ny = iy + SIM_NEIGH[k][1], nz = iz + SIM_NEIGH[k][2], nli;
+            if (nx < 0 || nx >= CHUNK_DIM || ny < 0 || ny >= CHUNK_DIM ||
+                nz < 0 || nz >= CHUNK_DIM) continue;
+            nli = vox_index(nx, ny, nz);
+            if (g_onf[nli] || sim_cell_pot(s, nli) > capp) continue;
+            { uint8_t cm = vox_mat(vox[nli]);
+              if (cm == MAT_AIR || material_get(cm)->phase == PHASE_LIQUID) {
+                  g_onf[nli] = 1; g_front[n++] = nli; } }
         }
     }
-    return changed;
+    for (a = 0; a < n; ++a) g_onf[g_front[a]] = 0;   /* g_onf back to all-zero */
+    if (target < 0) return 0;                        /* basin full to the spring's shell */
+    fluid_occupy_air(s, target, emit, (int)FLUID_FULL);
+    wake_ring(s, target); s->head[target] = 0;
+    return 1;
+}
+
+/* Attempt one donation from every registered spring. Returns 1 if any placed water. */
+static int fluid_spring_donate_all(SimState *s)
+{
+    int i, donated = 0;
+    for (i = 0; i < (int)s->n_sources; ++i) {
+        int sli;
+        if (!s->sources[i].active || !s->sources[i].is_spring) continue;
+        sli = s->sources[i].li;
+        if (material_get(vox_mat(s->chunk->voxels[sli]))->phase != PHASE_LIQUID) continue;
+        if (fluid_spring_donate(s, sli)) donated = 1;
+    }
+    return donated;
 }
 
 /* Run the finisher over every connected water body in the chunk. Returns 1 if any
@@ -1286,19 +1333,21 @@ static int run_finisher(SimState *s)
 {
     const Voxel *vox = s->chunk->voxels;
     int i, wrote = 0;
-    for (i = 0; i < CHUNK_VOXELS; ++i)
+    for (i = 0; i < CHUNK_VOXELS; ++i) {
         g_seen[i] = 0;                       /* (no <string.h> dependency in sim.c) */
+        g_onf[i]  = 0;                       /* shell-flood marks: clean slate       */
+    }
     for (i = 0; i < CHUNK_VOXELS; ++i) {
         uint8_t mat = vox_mat(vox[i]);
-        int n = 0, ncols = 0;
+        int n = 0;
         long total;
         if (g_seen[i]) continue;
         if (material_get(mat)->phase != PHASE_LIQUID || vox_fill(vox[i]) == 0)
             continue;
         if (is_held_source(s, i)) continue;
-        total = flood_body(s, i, mat, &n, &ncols);
+        total = flood_body(s, i, mat, &n);
         { int b; for (b = 0; b < n; ++b) g_inbody[g_body[b]] = 1; }   /* mark THIS body */
-        if (flat_write_body(s, ncols, total, mat)) wrote = 1;
+        if (level_and_spill_body(s, g_body, n, total, mat)) wrote = 1;
         { int b; for (b = 0; b < n; ++b) g_inbody[g_body[b]] = 0; }   /* reset for the next */
     }
     return wrote;
@@ -1344,11 +1393,10 @@ int sim_init(SimState *s, Chunk *c)
     for (li = 0; li < CHUNK_VOXELS; ++li)
         s->latent[li] = 0;
 
-    /* Clear the communicating-vessels head field (transient acceleration state,
-     * NOT persisted): a fresh chunk starts with head 0 everywhere (no surface
-     * pressure recorded yet) and head_relax rebuilds it over the active front. A
-     * 0 head means sim_liquid_unsettled's rise test never fires at seed time, so a
-     * flat seeded pond still sleeps for free. */
+    /* Clear the (now vestigial) head field: the M3 communicating-vessels head
+     * machinery was removed (nothing consumed it; the binary sim_liquid_unsettled
+     * mirrors fluid_step directly). The field is still zeroed for a clean state and
+     * because a few fluid sites stamp it 0; it is never read and never persisted. */
     for (li = 0; li < CHUNK_VOXELS; ++li) {
         s->head[li] = 0;
     }
@@ -1848,6 +1896,7 @@ void sim_tick_ex(SimState *s, int phases, SimNeighFn nfn, SimWakeFn wfn, void *u
         int wi;
         int fluid_changed = 0;
         int has_free_liquid = 0;
+        int has_spring = 0;
         for (wi = 0; wi < SIM_ACTIVE_MASK_WORDS; ++wi)
             s->moved_mask[wi] = 0u;
 
@@ -1865,20 +1914,14 @@ void sim_tick_ex(SimState *s, int phases, SimNeighFn nfn, SimWakeFn wfn, void *u
                     !is_held_source(s, li)) { has_free_liquid = 1; break; }
             }
         }
-
-        /* HEAD field (per-body max free surface) BEFORE the flow + sleep passes, so
-         * sim_liquid_unsettled's rise clause reads a head consistent with this
-         * tick's surfaces and keeps an un-levelled connected body AWAKE (a second
-         * tank still below a taller first tank joined by a bottom channel) until the
-         * finisher levels it. The local gravity+lateral rule cannot raise a column
-         * against gravity; the connected-body finisher (below) does, as a snap. */
-        /* 0.5 M3: the head field + connected-body finisher are PARTIAL-FILL,
-         * world-Y machinery. The binary flow rule settles on its own (terraced),
-         * so they are OFF here (fluid_finisher_on==0). M4 replaces run_finisher
-         * with a RADIAL shell-snap and turns this on. Kept compiled + referenced
-         * (so no -Wunused) but not exercised in M3. */
-        if (s->fluid_finisher_on && has_free_liquid)
-            head_relax(s);
+        /* Is there a registered SPRING? Its body-donation (below) fires on SETTLE
+         * even with no free liquid yet, so an inert flat-ground spring still starts
+         * filling its basin. Cheap: scan the small source table, not the chunk. */
+        {
+            int si;
+            for (si = 0; si < (int)s->n_sources; ++si)
+                if (s->sources[si].active && s->sources[si].is_spring) { has_spring = 1; break; }
+        }
 
         for (i = 0; i < fluid_count; ++i) {
             int li = act->active[i];
@@ -1906,18 +1949,30 @@ void sim_tick_ex(SimState *s, int phases, SimNeighFn nfn, SimWakeFn wfn, void *u
          * again (water keeps lowering), and a state is never re-fired -> O(fires) is
          * bounded by the finite distinct states => TERMINATES (no spin). has_free_
          * liquid gates out still ponds / lava-only chunks (no hash cost there). */
-        if (s->fluid_finisher_on && has_free_liquid && !fluid_changed) {
-            uint64_t hh = fluid_fill_hash(s);       /* the settled state's signature */
-            int already = 0, j;
-            for (j = 0; j < (int)s->fluid_n_fired; ++j)
-                if (s->fluid_fired[j] == hh) { already = 1; break; }
-            if (!already) {
-                int wrote = run_finisher(s);
-                uint64_t fh = fluid_fill_hash(s);   /* post-snap signature */
-                if (s->fluid_n_fired < FLUID_FIRED_MAX)
-                    s->fluid_fired[s->fluid_n_fired++] = fh;   /* a flat state == its own post-hash -> never re-fires */
-                if (wrote) fluid_changed = 1;
+        if (s->fluid_finisher_on && (has_free_liquid || has_spring) && !fluid_changed) {
+            if (has_free_liquid) {
+                uint64_t hh = fluid_fill_hash(s);   /* the settled state's signature */
+                int already = 0, j;
+                for (j = 0; j < (int)s->fluid_n_fired; ++j)
+                    if (s->fluid_fired[j] == hh) { already = 1; break; }
+                if (!already) {
+                    int wrote = run_finisher(s);
+                    uint64_t fh = fluid_fill_hash(s);   /* post-snap signature */
+                    if (s->fluid_n_fired < FLUID_FIRED_MAX)
+                        s->fluid_fired[s->fluid_n_fired++] = fh;   /* a flat state == its own post-hash -> never re-fires */
+                    if (wrote) fluid_changed = 1;
+                }
             }
+            /* SPRING DONATION (0.5 M4): UNGATED by the fired-hash set. A settled spring
+             * that can still reach air at/below its own shell donates ONE voxel toward
+             * the basin floor; that perturbs the state so the next ticks re-flow +
+             * re-level, and it repeats until the basin is full to the spring's shell
+             * (donate returns 0 -> fluid_changed stays 0 -> the chunk finally sleeps).
+             * It must NOT be fired-hash gated: recording the post-donation state would
+             * make the spring go inert after a single voxel. Run it only when the
+             * levelling above did not already perturb this tick. */
+            if (!fluid_changed && has_spring && fluid_spring_donate_all(s))
+                fluid_changed = 1;
         }
 
         if (fluid_changed)

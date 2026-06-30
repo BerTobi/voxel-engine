@@ -13,8 +13,22 @@
 #include "chunk.h"
 #include "material.h"
 #include "sim.h"
+#include "worldgen.h"   /* WG_PLANET_C* constants only (no worldgen.c link dependency) */
 
 static int fails = 0;
+
+/* The SIM_NEIGH down face (0+X 1-X 2+Y 3-Y 4+Z 5-Z) most toward the planet centre for
+ * a chunk - mirrors main.c's chunk_down_face, for the radial test below. */
+static int down_face_toward(int cx, int cy, int cz)
+{
+    long dx = (long)cx * CHUNK_DIM + CHUNK_DIM / 2 - WG_PLANET_CX;
+    long dy = (long)cy * CHUNK_DIM + CHUNK_DIM / 2 - WG_PLANET_CY;
+    long dz = (long)cz * CHUNK_DIM + CHUNK_DIM / 2 - WG_PLANET_CZ;
+    long ax = dx < 0 ? -dx : dx, ay = dy < 0 ? -dy : dy, az = dz < 0 ? -dz : dz;
+    if (ax >= ay && ax >= az) return dx > 0 ? 1 : 0;   /* toward centre on X */
+    if (ay >= az)             return dy > 0 ? 3 : 2;   /* toward centre on Y */
+    return dz > 0 ? 5 : 4;                              /* toward centre on Z */
+}
 #define CHECK(c,msg) do{ if(c) printf("PASS: %s\n",msg); else {printf("FAIL: %s\n",msg); fails++;} }while(0)
 
 /* SIM_NEIGH face order (mirrors sim.c): 0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z. */
@@ -211,6 +225,132 @@ static void test_determinism(void)
     sim_shutdown(&sa); sim_shutdown(&sb); free(ca.voxels); free(cb.voxels);
 }
 
+/* ---- (7) M4 RADIAL finisher LEVELS a U-TUBE. Two vertical shafts joined ONLY by a
+ * bottom channel; all water seeded in shaft A. The local gravity+flow rule alone can
+ * never raise water UP the empty arm B (it only moves DOWNHILL / to lower potential),
+ * so water reaching arm B PROVES the finisher ran - this test FAILS if the leveller is
+ * stubbed out. Asserts both arms reach a flat (within-1) level, conserve, and settle.
+ * No planet centre => -Y axis pot (pot == ly). ---- */
+static void test_finisher_levels_utube(void)
+{
+    static Chunk c; SimState s; int x, y, z, t; long before, after; int settled = 0;
+    int topA = -1, topB = -1;
+    back(&c);
+    for (z = 0; z < CHUNK_DIM; z++) for (y = 0; y < CHUNK_DIM; y++) for (x = 0; x < CHUNK_DIM; x++)
+        put(&c, x,y,z, mk(MAT_STONE,15));
+    for (y = 1; y <= 14; y++) { put(&c, 4,y,8, mk(MAT_AIR,0)); put(&c, 11,y,8, mk(MAT_AIR,0)); }
+    for (x = 4; x <= 11; x++) put(&c, x,1,8, mk(MAT_AIR,0));        /* bottom channel joins the arms */
+    for (y = 2; y <= 14; y++) put(&c, 4,y,8, mk(MAT_WATER,15));     /* seed ALL water in arm A */
+    sim_build_conduct_lut(); sim_init(&s, &c);
+    sim_set_down_face(&s, 3);                    /* -Y down: finisher ON, axis pot */
+    before = water_count(&c);
+    for (t = 0; t < 2000; t++) { sim_tick(&s); if (s.act.count == 0) { settled = 1; break; } }
+    after = water_count(&c);
+    for (y = 14; y >= 1; y--) {
+        if (topA < 0 && matat(&c, 4, y, 8) == MAT_WATER) topA = y;
+        if (topB < 0 && matat(&c, 11, y, 8) == MAT_WATER) topB = y;
+    }
+    CHECK(settled, "M4 U-tube: equalised state SETTLES to active==0");
+    CHECK(after == before, "M4 U-tube: leveling CONSERVES water exactly");
+    CHECK(topB > 0, "M4 U-tube: water ROSE up the empty arm (proves the finisher ran)");
+    CHECK(topA > 0 && topA - topB <= 1 && topB - topA <= 1,
+          "M4 U-tube: both arms level to within 1 cell");
+    sim_shutdown(&s); free(c.voxels);
+}
+
+/* ---- (7b) M4 NO-CHURN on a DIAGONAL chunk. The regression test for the integration
+ * bug an adversarial review caught: with the radial leveller but an axis-based local
+ * rule, a water body on an OFF-AXIS chunk (where the radial shell cuts diagonally
+ * through the voxel grid - most of the planet) never settled, churning every tick
+ * forever (leveller vs local rule fighting). With both keyed off sim_cell_pot it must
+ * SETTLE to active==0 and hold a byte-stable fill state. Uses the REAL planet centre
+ * and a 45-degree chunk - the worst diagonal. ---- */
+static void test_no_churn_diagonal(void)
+{
+    static Chunk c; SimState s; int x, y, z, t, settled_tick = -1;
+    unsigned long long lasth = 0; int stable = 0, maxstable = 0;
+    back(&c);
+    c.cx = 24; c.cy = 56; c.cz = 24;             /* off all three axes: diagonal radial shell */
+    for (z = 0; z < CHUNK_DIM; z++) for (y = 0; y < CHUNK_DIM; y++) for (x = 0; x < CHUNK_DIM; x++)
+        put(&c, x,y,z, mk(MAT_STONE,15));
+    for (z = 1; z <= 14; z++) for (y = 1; y <= 14; y++) for (x = 1; x <= 14; x++) put(&c, x,y,z, mk(MAT_AIR,0));
+    for (y = 1; y <= 12; y++) for (x = 1; x <= 5; x++) for (z = 1; z <= 14; z++) put(&c, x,y,z, mk(MAT_WATER,15));
+    sim_set_planet_center(WG_PLANET_CX, WG_PLANET_CY, WG_PLANET_CZ);
+    sim_build_conduct_lut(); sim_init(&s, &c);
+    sim_set_down_face(&s, down_face_toward(c.cx, c.cy, c.cz));
+    for (t = 0; t < 3000; t++) {
+        unsigned long long h;
+        sim_tick(&s);
+        if (s.act.count == 0 && settled_tick < 0) settled_tick = t + 1;
+        h = sim_state_hash(&s);
+        if (h == lasth) { if (++stable > maxstable) maxstable = stable; } else { stable = 0; lasth = h; }
+    }
+    CHECK(settled_tick > 0, "M4 diagonal: off-axis water body SETTLES to active==0 (no churn)");
+    CHECK(maxstable > 1000, "M4 diagonal: settled state is byte-STABLE (does not churn each tick)");
+    sim_shutdown(&s); free(c.voxels);
+}
+
+/* ---- (8) M4 spring fill-and-spill: a high spring FILLS a basin bottom-up,
+ * LEVELS it, and never fills the open sky ABOVE its own shell. Exercises the
+ * RADIAL branch of sim_cell_pot (planet centre set far below => d2 gradient ~ -Y
+ * but via the real radial formula) + the spring body-donation. Determinism too. ---- */
+static long fill_in_yrange(const Chunk *c, int ylo, int yhi)
+{
+    long n = 0; int x, y, z;
+    for (z = 0; z < CHUNK_DIM; z++)
+        for (y = ylo; y <= yhi; y++)
+            for (x = 0; x < CHUNK_DIM; x++)
+                if (vox_mat(c->voxels[vox_index(x, y, z)]) == MAT_WATER) n++;
+    return n;
+}
+static void build_cavity(Chunk *c, int *sli)
+{
+    int x, y, z;
+    back(c);
+    /* solid block with a small open shaft (x,z in 6..10, y in 1..13) */
+    for (z = 0; z < CHUNK_DIM; z++) for (y = 0; y < CHUNK_DIM; y++) for (x = 0; x < CHUNK_DIM; x++)
+        put(c, x,y,z, mk(MAT_STONE, 15));
+    for (z = 6; z <= 10; z++) for (y = 1; y <= 13; y++) for (x = 6; x <= 10; x++)
+        put(c, x,y,z, mk(MAT_AIR, 0));
+    *sli = vox_index(8, 12, 8);
+    /* The spring is a MAT_WATER_SOURCE voxel (id 13) - EXACTLY as the engine places it
+     * (main.c make_liquid(MAT_WATER_SOURCE)), so this exercises the real donate path:
+     * a spring must emit plain MAT_WATER, never copy its own MAT_WATER_SOURCE id. */
+    put(c, 8, 12, 8, mk(MAT_WATER_SOURCE, 15));  /* the spring, high in the shaft */
+}
+static long count_mat(const Chunk *c, uint8_t m)
+{ long n = 0; int i; for (i = 0; i < CHUNK_VOXELS; ++i) if (vox_mat(c->voxels[i]) == m) n++; return n; }
+static unsigned long long run_spring_fill(Chunk *c, int sli, int ticks)
+{
+    SimState s;
+    sim_set_planet_center(8, -2000, 8);          /* far below: radial pot, ~-Y down */
+    sim_build_conduct_lut(); sim_init(&s, c);
+    sim_set_down_face(&s, 3);                     /* finisher ON */
+    sim_set_spring(&s, (uint16_t)sli, 60u);
+    { int t; for (t = 0; t < ticks; t++) sim_tick(&s); }
+    { unsigned long long h = sim_state_hash(&s); sim_shutdown(&s); return h; }
+}
+static void test_spring_fill_and_spill(void)
+{
+    static Chunk c, c2; int sli, sli2; long below, above, springs; unsigned long long h1, h2;
+    build_cavity(&c, &sli);
+    (void)run_spring_fill(&c, sli, 4000);
+    below   = fill_in_yrange(&c, 1, 11);             /* the shaft below the spring's y=12 shell */
+    above   = fill_in_yrange(&c, 13, CHUNK_DIM - 1); /* the open sky above the spring           */
+    springs = count_mat(&c, MAT_WATER_SOURCE);       /* must stay exactly ONE (the spring)      */
+    CHECK(below > 150, "M4 spring: donation FILLED the basin below the spring bottom-up");
+    CHECK(above == 0,  "M4 spring: water never fills the SKY above the spring's shell");
+    CHECK(springs == 1, "M4 spring: donated cells are plain WATER, not a field of SPRINGS");
+    free(c.voxels);
+    /* determinism: two FRESH identical worlds reach a byte-identical state. */
+    build_cavity(&c, &sli);
+    build_cavity(&c2, &sli2);
+    h1 = run_spring_fill(&c, sli, 1200);
+    h2 = run_spring_fill(&c2, sli2, 1200);
+    CHECK(h1 == h2, "M4 spring: two identical spring worlds hash-equal (deterministic)");
+    free(c.voxels); free(c2.voxels);
+}
+
 int main(void)
 {
     printf("== test_water (0.5 M3: binary-fill water CA) ==\n");
@@ -221,6 +361,13 @@ int main(void)
     test_cross_chunk_seam();
     test_heat_water_coexist();
     test_determinism();
+    /* ORDER MATTERS: sim_set_planet_center sets a GLOBAL (g_pc_set) that has no reset.
+     * Every test ABOVE leaves it unset (axis-gravity fallback); the two M4 tests that
+     * set a centre run LAST, and the one M4 test relying on the axis fallback
+     * (test_finisher_levels_utube) runs BEFORE either sets it. Keep this order. */
+    test_finisher_levels_utube();    /* M4: leveling requires the finisher (U-tube); axis pot */
+    test_no_churn_diagonal();        /* M4: off-axis chunk must SETTLE, not churn (sets centre) */
+    test_spring_fill_and_spill();    /* M4: spring donation + radial pot (sets centre LAST) */
     printf("=== %d failure(s) ===\n", fails);
     return fails;
 }

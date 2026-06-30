@@ -18,7 +18,7 @@
 /* A small fixed slot table; one VBO per resident chunk. Sized for the visible
  * working set, not the whole 10,000-chunk window (most chunks are culled,
  * underground, or empty). The shipping engine keys slots off chunk residency. */
-#define MAX_RENDER_CHUNKS 4096
+#define MAX_RENDER_CHUNKS 8192   /* covers the radius-10 window (3969) + churn curtain */
 
 /* Initialise the renderer: compile + link the opaque (and liquid) shaders,
  * build the placeholder material atlas (1024x1024 RGBA8, 16x16 grid of 64x64

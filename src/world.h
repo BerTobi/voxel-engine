@@ -105,7 +105,8 @@ typedef struct {
  * smaller window (it must stay <= MAX_RENDER_CHUNKS render slots), so the hash
  * is sized to match. Bump WORLD_HASH_CAP (still a power of two, still
  * >= WORLD_WINDOW_CHUNKS / 0.7) when the window grows toward the shipping size. */
-#define WORLD_HASH_CAP   4096u   /* 4096 * 16 B = 64 KiB (Section 7 hash line) */
+#define WORLD_HASH_CAP   8192u   /* holds the radius-10 window (3969) at load 0.48;
+                                  * power-of-two (probe mask). 8192*16 B = 128 KiB */
 
 /* ======================================================================== *
  *  3. THE LOADED WINDOW + SLAB POOL geometry                                *
@@ -143,12 +144,14 @@ typedef struct {
  * is the compile-time MAXIMUM (it sizes the slab/render/hash pools, so it cannot grow
  * at runtime); the active window uses ws->view_radius in [2, WORLD_RADIUS], defaulting
  * to WORLD_VIEW_RADIUS_DEFAULT. Raising the MAX grows the reserved pools (more RAM) +
- * must stay under MAX_RENDER_CHUNKS: at 8, (2*8+1)^2 * 9 = 2601 chunks < 4096 slots, ok;
- * lower it for the tightest XP-target build. The DEFAULT keeps the grain study's
- * budgeted radius-6 window (1521 chunks) unless the player turns view distance up. */
-#define WORLD_RADIUS     8                       /* MAX Chebyshev radius, chunks  */
+ * must stay under MAX_RENDER_CHUNKS: at 10, (2*10+1)^2*9 = 3969 chunks + a churn
+ * curtain (4158) < 8192 slots, and the hash holds it at load 0.48. Slab pool ~68 MiB
+ * reserved (fine on the 1 GiB XP box). The DEFAULT keeps the grain study's budgeted
+ * radius-6 window (1521 chunks) unless the player turns view distance up; the FPS
+ * counter lets them find the playable radius on the real hardware. */
+#define WORLD_RADIUS     10                      /* MAX Chebyshev radius, chunks  */
 #define WORLD_VIEW_RADIUS_DEFAULT 6              /* runtime default (grain budget)*/
-#define WORLD_DIAM       (2 * WORLD_RADIUS + 1)  /* 17 at the max                 */
+#define WORLD_DIAM       (2 * WORLD_RADIUS + 1)  /* 21 at the max (window 3969)   */
 
 /* 0.5 M2: the resident vertical band now FOLLOWS THE PLAYER. At R=64 the whole
  * ball fit a fixed cy 0..8 band; at R=512 (256 m) the planet is 64 chunks across
@@ -214,6 +217,13 @@ typedef struct {
  * (or slabs larger) so world_realize can never fail. */
 _Static_assert(WORLD_SLAB_SLOTS >= WORLD_POOL_SLOTS,
                "slab pool must cover the worst-case (fully solid) window - else underground holes");
+
+/* Every resident chunk owns a render slot, and a window move briefly holds the window
+ * PLUS one leading curtain (DIAM*BAND_H) before the trailing curtain evicts. Render
+ * slots must cover that peak, or a slot allocation fails mid-move. Guards a future
+ * WORLD_RADIUS bump against silently exceeding MAX_RENDER_CHUNKS. */
+_Static_assert(MAX_RENDER_CHUNKS >= WORLD_WINDOW_CHUNKS + WORLD_DIAM * WORLD_BAND_H,
+               "render-slot pool must cover the window + a churn curtain (raise MAX_RENDER_CHUNKS)");
 
 /* ======================================================================== *
  *  4. PER-FRAME STREAMING BUDGET  (ARCHITECTURE Section 6 / Section 7)      *

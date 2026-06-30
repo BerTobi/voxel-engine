@@ -538,6 +538,10 @@ static uint64_t g_sea_clock = 0;  /* per-FRAME clock driving the rise (independe
                                    * the forge CA, so the sea keeps rising even when the
                                    * player roams to the coast, away from any active sim) */
 
+/* Smoothed frame time (ms) for the on-screen FPS counter - an exponential moving
+ * average so the readout is steady, not jittering every frame. Seeded at 60 FPS. */
+static double g_frame_ms_ema = 16.7;
+
 /* ---- 0.4 M3b: the world-wide CA active set ------------------------------- *
  * The heat CA is no longer a single bound chunk. The forge `sim` (main, below)
  * is the PRIMARY chunk; g_xsim[] holds ADDITIONAL chunks woken by cross-chunk
@@ -1048,7 +1052,8 @@ static int apply_view_distance(WorldStore *ws, int radius)
     int   r    = world_set_view_radius(ws, radius);
     float edge = (float)(r * CHUNK_DIM);   /* the loaded window edge, world voxels   */
     float end  = edge - 6.0f;              /* fog reaches full sky a touch inside it  */
-    float start = end * 0.55f;             /* begin fading past mid-view              */
+    float start = end * 0.72f;             /* keep most of the view CLEAR; fade only the
+                                            * far ~28% (was 0.55 = a much foggier half) */
     render_set_fog(start, end);
     return r;
 }
@@ -1093,6 +1098,18 @@ static void mark_home_modified(Chunk *c)
 /* ---- 0.3 pause menu (screen-space, drawn over the frozen frame) ---------- *
  * NDC: x,y in [-1,1], centre (0,0), y up. `aspect` keeps the font square. The
  * coordinates are tuned by eye against the headless VOXEL_MENU screenshot. */
+/* Top-left FPS + view-distance readout (live HUD). The player asked for an FPS
+ * counter to tune view distance against framerate on the real XP hardware; showing
+ * the current view radius (metres) right next to it makes that correlation direct.
+ * frame_ms is the smoothed per-frame time (g_frame_ms_ema). */
+static void draw_fps_hud(float aspect, double frame_ms, int view_m)
+{
+    char buf[48];
+    int  fps = (frame_ms > 0.01) ? (int)(1000.0 / frame_ms + 0.5) : 999;
+    snprintf(buf, sizeof buf, "FPS %d   view %d m", fps, view_m);
+    render_text(-0.97f, 0.93f, 0.040f, aspect, 0.55f, 1.0f, 0.65f, 1.0f, buf);
+}
+
 /* 0.4 M2: the in-world progression JOURNAL HUD. Surfaces the read-only observer
  * (progress.c, console-only since 0.1) with the 0.3 text/UI primitives: a
  * transient discovery TOAST when a new (kind,material) is first observed, and a
@@ -2155,6 +2172,9 @@ int main(void)
         if (real_dt_ms < 0.0)
             real_dt_ms = 0.0;
         dt_s = (float)(real_dt_ms / 1000.0);
+        /* Smooth the frame time for the FPS HUD (10% new each frame). */
+        if (real_dt_ms > 0.0)
+            g_frame_ms_ema += (real_dt_ms - g_frame_ms_ema) * 0.1;
 
         /* --- Input: pump the OS queue once per frame, then sample keys --- */
         plat_poll();
@@ -2921,6 +2941,10 @@ int main(void)
              * paused. */
             if (!paused)
                 draw_hotbar(aspect, sel_mat);
+            /* FPS + view-distance readout (live only; kept out of headless captures). */
+            if (shot_path == NULL && !paused)
+                draw_fps_hud(aspect, g_frame_ms_ema,
+                             (int)V2M((float)(world_view_radius(world) * CHUNK_DIM)));
             if (paused)                          /* 0.3: pause menu over the frozen scene */
                 draw_pause_menu(aspect, menu_sel, fullscreen_on);
         }

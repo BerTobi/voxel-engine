@@ -30,6 +30,14 @@ static int fails = 0;
 #define TEST_VIEW_R      8
 #define TEST_VIEW_WINDOW WORLD_WINDOW_AT(TEST_VIEW_R)
 
+/* Chunk-Y coords DERIVED from the planet params so they track any R. The +Y pole
+ * surface is at world-Y CY+R (chunk POLE_CY); a chunk a few above it is wholly air,
+ * the chunk just below is solid crust. (At R=512 these were cy 80 / 63.) */
+#define POLE_CY   ((WG_PLANET_CY + WG_PLANET_R) / CHUNK_DIM)
+#define AIR_CY    (POLE_CY + 8)                       /* wholly above the surface -> air  */
+#define SOLID_CY  (POLE_CY - 1)                       /* crust just under the surface     */
+#define POLE_Y    ((float)(WG_PLANET_CY + WG_PLANET_R))
+
 static void gen_cb(Chunk *c, int cx, int cy, int cz, uint64_t seed, void *u)
 { (void)u; worldgen_fill_chunk(c, cx, cy, cz, seed); }
 static int air_cb(int cx, int cy, int cz, uint64_t seed, void *u)
@@ -48,12 +56,12 @@ int main(void)
 
     printf("== test_sparse (0.5 M1 sparse-air storage) ==\n");
 
-    /* The R=512 ball is centred at world (8,512,8); the north pole surface is at
-     * world-Y 1024 (chunk cy 64). Chunk (0,80,0) is world-Y ~1280, far above the
-     * pole -> wholly air; chunk (0,63,0) is the solid crust just under the pole. */
+    /* AIR_CY is a chunk wholly ABOVE the pole surface (uniform air, no slab); SOLID_CY
+     * is the crust chunk just UNDER it (realized). Both derived from R (see the defines
+     * above) so this tracks the planet size instead of hardcoding the R=512 pole. */
     {
-        Chunk *air   = world_insert(ws, 0, 80, 0);
-        Chunk *solid = world_insert(ws, 0, 63, 0);
+        Chunk *air   = world_insert(ws, 0, AIR_CY, 0);
+        Chunk *solid = world_insert(ws, 0, SOLID_CY, 0);
         CHECK(air && air->voxels == NULL && (air->flags & CHUNK_UNIFORM),
               "exterior chunk inserts uniform-air (NULL voxels, no slab)");
         CHECK(air && vox_mat(chunk_vox(air, 0)) == MAT_AIR,
@@ -67,8 +75,8 @@ int main(void)
     /* Mesh: uniform-air -> 0 quads; realized solid -> >0. */
     {
         MeshBuffer mb;
-        Chunk *air   = world_get(ws, 0, 80, 0);
-        Chunk *solid = world_get(ws, 0, 63, 0);
+        Chunk *air   = world_get(ws, 0, AIR_CY, 0);
+        Chunk *solid = world_get(ws, 0, SOLID_CY, 0);
         if (mesh_buffer_init(&mb, 65536u, 98304u) != 0) { printf("mb fail\n"); return 2; }
         CHECK(greedy_mesh(air, &mb) == 0, "uniform-air chunk meshes to 0 quads");
         CHECK(greedy_mesh(solid, &mb) > 0, "realized solid chunk meshes to >0 quads");
@@ -77,7 +85,7 @@ int main(void)
 
     /* realize / set_uniform round-trip on the uniform chunk. */
     {
-        Chunk *air = world_get(ws, 0, 80, 0);
+        Chunk *air = world_get(ws, 0, AIR_CY, 0);
         Voxel uw = air->uniform_word;
         uint32_t free_before = ws->slab_free_top;
         int i, all_uw = 1;
@@ -97,7 +105,7 @@ int main(void)
         uint32_t resident, realized;
         int k;
         for (k = 0; k < 600; ++k)
-            world_stream_update(ws, 8.0f, 1024.0f, 8.0f);
+            world_stream_update(ws, 8.0f, POLE_Y, 8.0f);
         resident = world_resident_count(ws);
         realized = ws->slab_slots - ws->slab_free_top;
         printf("  settled window: %u resident chunks, %u realized blocks "

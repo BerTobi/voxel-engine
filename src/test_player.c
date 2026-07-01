@@ -6,6 +6,13 @@
 #include <stdio.h>
 #include <math.h>
 #include "player.h"
+#include "units.h"   /* M2V: the player is authored in metres, so scene heights must be too */
+
+/* Head-bonk ceiling: a FIXED 1 m gap above the floor top (y=1), so the 0.9 m-diameter
+ * collision sphere fits with a little jump room at ANY grain. = y>=3 at 0.5 m (2 vox),
+ * y>=5 at 0.25 m (4 vox). A raw voxel constant (the old y>=3) would shrink to 0.5 m at
+ * 0.25 m grain and the taller-in-voxels sphere would clip the ceiling from the start. */
+#define CEIL_Y   (1 + (int)M2V(1.0f))
 
 static int g_fail = 0;
 static void check(const char *name, int cond)
@@ -16,7 +23,7 @@ static void check(const char *name, int cond)
 
 /* ---- synthetic worlds (kind: 0 passable, 1 solid, 2 liquid) -------------- */
 static int w_floor(void *c, int x, int y, int z){ (void)c;(void)x;(void)z; return y <= 0 ? 1 : 0; }
-static int w_floor_ceil(void *c,int x,int y,int z){ (void)c;(void)x;(void)z; return (y<=0||y>=3)?1:0; }
+static int w_floor_ceil(void *c,int x,int y,int z){ (void)c;(void)x;(void)z; return (y<=0||y>=CEIL_Y)?1:0; }
 static int w_floor_wallx(void *c,int x,int y,int z){ (void)c;(void)z; if(y<=0)return 1; return x>=2?1:0; }
 static int w_floor_corner(void *c,int x,int y,int z){ if(y<=0)return 1; (void)c; return (x>=2||z>=2)?1:0; }
 static int w_thinwall(void *c,int x,int y,int z){ (void)c;(void)y;(void)z; return x==3?1:0; }
@@ -70,7 +77,7 @@ int main(void)
             player_step(&p, &pp, none, jump, 0, DT, w_floor_ceil, 0);
             if (p.pos.y + pp.r_p > max_head) max_head = p.pos.y + pp.r_p;
         }
-        check("ceiling: sphere top never passes y=3", max_head <= 3.0f + 0.05f);
+        check("ceiling: sphere top never passes the ceiling", max_head <= (float)CEIL_Y + 0.05f);
     }
 
     /* (3) WALL: floor + solid x>=2. Walk +X; the AABB max (x+half) clamps to 2.0

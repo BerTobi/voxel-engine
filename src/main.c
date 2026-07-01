@@ -113,7 +113,10 @@
  * already decorated, home_is_decorated detects the held-lava marker and we skip
  * re-decoration, preserving the player/sim's evolved state.) */
 #define HOME_CX           0
-#define HOME_CY           63    /* 0.5 M2: crust chunk under the new pole (surface cy 64 at R=512) */
+/* Crust chunk directly under the +Y pole surface (world-Y = CY+R). DERIVED from the
+ * planet params so it tracks any R change (R=4096 -> surface Y 8192 -> chunk cy 512 ->
+ * crust chunk 511). The pole axis (WG_PLANET_CX/CZ = 8,8) lives in chunk (0,*,0). */
+#define HOME_CY           (((WG_PLANET_CY + WG_PLANET_R) / CHUNK_DIM) - 1)
 #define HOME_CZ           0
 
 /* 0.5 M3: chunk-local index of the demo water spring (top of the carved pocket). */
@@ -776,8 +779,8 @@ static void demo_decorate(WorldStore *ws, Chunk *c)
         return;
 
     /* 0.4 M1 - a REACHABLE SURFACE FORGE. HOME is the crust chunk directly under
-     * the spawn pole (0.5 M2 grain: chunk (0,63,0), world-Y 1008..1023); the pole
-     * surface voxel is world-Y 1024, in the chunk ABOVE (we open its centre cap at
+     * the spawn pole (HOME_CY, derived from R: the pole surface voxel is world-Y
+     * CY+R, in the chunk ABOVE; we open its centre cap at
      * the end of this function so the chimney vents to sky). The chunk arrives
      * from worldgen as solid stone, so we CARVE a stone CAVITY into it and stand a
      * held lava pool inside with a copper charge SUBMERGED: the surrounding stone
@@ -843,7 +846,7 @@ static void demo_decorate(WorldStore *ws, Chunk *c)
                 chunk_set(c, x, y, z, air);
     chunk_set(c, DEMO_SPRING_LX, DEMO_SPRING_LY, DEMO_SPRING_LZ, make_liquid(MAT_WATER_SOURCE));
 
-    /* 0.5 M2 grain: at R=512 the pole-axis SURFACE voxel is world-Y 1024, which lives
+    /* The pole-axis SURFACE voxel is world-Y CY+R, which lives
      * in the chunk ABOVE home (cy HOME_CY+1, ly 0) - a solid dirt cap sitting directly
      * over the chimney top (8,15,8 here). The 8 shaft cells ringing it open to air, but
      * the exact centre column would be sealed, occluding the forge glow there. Open that

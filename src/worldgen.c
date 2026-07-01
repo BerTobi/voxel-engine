@@ -526,16 +526,16 @@ static uint32_t g_gen_version = WG_GEN_VERSION;   /* the active world's generato
 
 void worldgen_select_version(uint32_t v) { g_gen_version = v; }
 uint32_t worldgen_active_version(void)   { return g_gen_version; }
-int worldgen_version_supported(uint32_t v) { return v >= 3u && v <= 6u; }
+int worldgen_version_supported(uint32_t v) { return v == 7u; }   /* R=4096 reset: 3-6 retired */
 
 void worldgen_fill_chunk(Chunk *c, int cx, int cy, int cz, uint64_t seed)
 {
     (void)seed;   /* one fixed asteroid; generation is seed-independent */
     switch (g_gen_version) {
-        case 3u:           gen_fill_v3(c, cx, cy, cz); break;
-        case 4u:           gen_fill_v4(c, cx, cy, cz); break;
-        case 5u:           gen_fill_v5(c, cx, cy, cz); break;
-        case 6u: default:  gen_fill_v6(c, cx, cy, cz); break;
+        case 3u:           gen_fill_v3(c, cx, cy, cz); break;   /* retired (differ-test only) */
+        case 4u:           gen_fill_v4(c, cx, cy, cz); break;   /* retired (differ-test only) */
+        case 5u:           gen_fill_v5(c, cx, cy, cz); break;   /* retired (differ-test only) */
+        case 7u: default:  gen_fill_v6(c, cx, cy, cz); break;   /* v7 = drainage+valleys @ R=4096 */
     }
 }
 

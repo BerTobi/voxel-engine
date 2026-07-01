@@ -24,7 +24,7 @@
  * implicit grain); 500 = 0.5 m (the 0.5 ship grain, k=2). Integer millimetres so
  * the "divides 1 m cleanly" invariant is a compile-time check, not a float
  * compare. M0 leaves this at 500 but applies it nowhere; M2 is the flip. */
-#define VOX_GRAIN_MM     500
+#define VOX_GRAIN_MM     250
 
 /* Physical size of one voxel edge, and its reciprocal, as float scale factors.
  * (1000.0f forces FLOAT division, so VOX_GRAIN_MM=500 -> 0.5f, not integer 0.) */

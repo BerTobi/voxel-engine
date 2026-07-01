@@ -51,9 +51,11 @@
 /* Bump on ANY change to generated output (Section 8 versioning). A save written
  * by an older version is "from an older generator" and must not silently
  * regenerate differently (the doc's default: refuse to load on mismatch). */
-#define WG_GEN_VERSION   6u   /* 6: 0.5 DRAINAGE terrain + incised river VALLEYS (steep channels
-                               * the water CA can flow down); 5 was smooth drainage; 4 small
-                               * relief; 3 the smooth R=512 ball */
+#define WG_GEN_VERSION   7u   /* 7: DRAINAGE + river VALLEYS on the BIG planet (R=4096 vox =
+                               * 1 km @ 0.25 m). The R=512-era generators 3-6 are RETIRED:
+                               * R is a global world parameter (sim/camera/gen all key off it),
+                               * so a bigger planet is a new baseline, not a retained-generator
+                               * terrain variant. Old (3-6) worlds are refused, not migrated. */
 
 /* ---- Surface band (binding; the WorldStore vertical band brackets this) ---- *
  * The heightmap surface lives entirely within [WG_HEIGHT_MIN, WG_HEIGHT_MAX]
@@ -93,9 +95,9 @@
  * tall fixed band. Kept near the world origin so float32 radial math stays precise
  * (test_grain asserts the worst-case `up` error < 0.25 vox at this R). */
 #define WG_PLANET_CX     8     /* planet center, world voxels (X)                */
-#define WG_PLANET_CY     512   /* planet center, world voxels (Y) = R (ball Y 0..2R) */
+#define WG_PLANET_CY     4096  /* planet center, world voxels (Y) = R (ball Y 0..2R) */
 #define WG_PLANET_CZ     8     /* planet center, world voxels (Z)                */
-#define WG_PLANET_R      512   /* planet radius, voxels (x0.5 m = 256 m physical) */
+#define WG_PLANET_R      4096  /* planet radius, voxels (x0.25 m = 1024 m physical) */
 
 /* ---- Radial terrain RELIEF (0.5: hills, ridges, basins for water) ----------- *
  * The smooth sphere surface is displaced in/out by a deterministic INTEGER 3D

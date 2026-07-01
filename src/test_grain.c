@@ -20,11 +20,11 @@ static void ck(const char *name, double got, double want)
 int main(void)
 {
     printf("== test_grain (0.5 M0: units.h metres<->voxels, grain=%d mm) ==\n", VOX_GRAIN_MM);
-    ck("METRES_PER_VOXEL",         METRES_PER_VOXEL, 0.5);
-    ck("VOXELS_PER_METRE",         VOXELS_PER_METRE, 2.0);
-    ck("M2V(1 m) == 2 voxels",     M2V(1.0f),  2.0);
-    ck("V2M(2 voxels) == 1 m",     V2M(2.0f),  1.0);
-    ck("M2V(0.45 m player r)",     M2V(0.45f), 0.9);   /* collision radius stays 0.45 m */
+    ck("METRES_PER_VOXEL",         METRES_PER_VOXEL, 0.25);
+    ck("VOXELS_PER_METRE",         VOXELS_PER_METRE, 4.0);
+    ck("M2V(1 m) == 4 voxels",     M2V(1.0f),  4.0);
+    ck("V2M(4 voxels) == 1 m",     V2M(4.0f),  1.0);
+    ck("M2V(0.45 m player r)",     M2V(0.45f), 1.8);   /* collision radius stays 0.45 m = 1.8 vox */
     ck("round-trip V2M(M2V(3.7))", V2M(M2V(3.7f)), 3.7);
 
     /* 0.5 M2 float-precision regression: radial gravity computes up =

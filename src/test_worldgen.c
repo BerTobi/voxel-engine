@@ -19,6 +19,18 @@
 #include "voxel.h"
 #include "material.h"
 
+/* Chunk coords DERIVED from R (planet size) so the tests track any radius. POLE_CY is
+ * the +Y pole surface chunk (world-Y CY+R); FORGE_CY the crust just under it; FAR_CY
+ * well above it (exterior air); CORE_CY the central chunk (deep stone); SURF_C* an
+ * EQUATORIAL surface chunk off the pole axis, where the relief (and the generator
+ * versions) actually vary. (At R=512 these were the old fixed 63/40,40,40/32/32,32,0.) */
+#define POLE_CY   ((WG_PLANET_CY + WG_PLANET_R) / CHUNK_DIM)
+#define FORGE_CY  (POLE_CY - 1)
+#define FAR_CY    (POLE_CY + 8)
+#define CORE_CY   (WG_PLANET_CY / CHUNK_DIM)
+#define SURF_CX   ((WG_PLANET_CX + WG_PLANET_R) / CHUNK_DIM)
+#define SURF_CY   (WG_PLANET_CY / CHUNK_DIM)
+
 static int g_fail = 0;
 static void check(const char *n, int ok) { if (ok) printf("PASS: %s\n", n); else { printf("FAIL: %s\n", n); ++g_fail; } }
 
@@ -79,17 +91,17 @@ int main(void)
 
         /* The HOME forge chunk (0,63,0) holds the pole axis (x=8,z=8): its centre
          * column must be solid crust (pole-flattened), or the forge carve breaks. */
-        worldgen_fill_chunk(c, 0, 63, 0, 0);
+        worldgen_fill_chunk(c, 0, FORGE_CY, 0, 0);
         check("pole/forge chunk: centre column top is SOLID (flat crust under spawn)",
               vox_mat(c->voxels[vox_index(8, 15, 8)]) != MAT_AIR);
 
         /* A deep interior chunk is all STONE; a far exterior chunk is all AIR. */
-        worldgen_fill_chunk(c, 0, 32, 0, 0);            /* world-Y ~512, near the core */
+        worldgen_fill_chunk(c, 0, CORE_CY, 0, 0);            /* world-Y ~512, near the core */
         check("deep core chunk is solid (no air)",
               vox_mat(c->voxels[vox_index(8, 8, 8)]) == MAT_STONE);
         check("worldgen_chunk_all_air agrees a far chunk is air",
-              worldgen_chunk_all_air(40, 40, 40));
-        check("worldgen_chunk_all_air: a core chunk is NOT all-air", !worldgen_chunk_all_air(0, 32, 0));
+              worldgen_chunk_all_air(0, FAR_CY, 0));
+        check("worldgen_chunk_all_air: a core chunk is NOT all-air", !worldgen_chunk_all_air(0, CORE_CY, 0));
     }
 
     /* The relief never lets the surface exceed R+AMP (what all_air relies on). */
@@ -117,21 +129,22 @@ int main(void)
             c->slab_idx = -1;
             if (c->voxels == NULL) { check("alloc version-test chunk", 0); }
             else {
-                check("v3..v6 supported, others rejected",
-                      worldgen_version_supported(3) && worldgen_version_supported(4)
-                      && worldgen_version_supported(5) && worldgen_version_supported(6)
-                      && !worldgen_version_supported(2) && !worldgen_version_supported(7));
+                check("v7 supported; the retired R=512 generators (2..6) + v8 rejected",
+                      worldgen_version_supported(7)
+                      && !worldgen_version_supported(6) && !worldgen_version_supported(5)
+                      && !worldgen_version_supported(4) && !worldgen_version_supported(3)
+                      && !worldgen_version_supported(2) && !worldgen_version_supported(8));
                 worldgen_select_version(5);
-                worldgen_fill_chunk(c, 32, 32, 0, 0);   /* equatorial surface: relief active */
+                worldgen_fill_chunk(c, SURF_CX, SURF_CY, 0, 0);   /* equatorial surface: relief active */
                 check("worldgen_active_version reflects the selection", worldgen_active_version() == 5u);
                 memcpy(v5buf, c->voxels, (size_t)CHUNK_VOXELS * sizeof(Voxel));
                 worldgen_select_version(4);
-                worldgen_fill_chunk(c, 32, 32, 0, 0);   /* same chunk, small-relief generator */
+                worldgen_fill_chunk(c, SURF_CX, SURF_CY, 0, 0);   /* same chunk, small-relief generator */
                 memcpy(v4buf, c->voxels, (size_t)CHUNK_VOXELS * sizeof(Voxel));
                 check("v5 (drainage) differs from v4 (relief) at the surface",
                       memcmp(v5buf, c->voxels, (size_t)CHUNK_VOXELS * sizeof(Voxel)) != 0);
                 worldgen_select_version(3);
-                worldgen_fill_chunk(c, 32, 32, 0, 0);   /* same chunk, smooth generator */
+                worldgen_fill_chunk(c, SURF_CX, SURF_CY, 0, 0);   /* same chunk, smooth generator */
                 check("v3 (smooth) differs from v4 (relief) at the surface",
                       memcmp(v4buf, c->voxels, (size_t)CHUNK_VOXELS * sizeof(Voxel)) != 0);
                 worldgen_select_version(WG_GEN_VERSION);   /* restore the latest */

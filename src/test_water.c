@@ -189,6 +189,48 @@ static void test_cross_chunk_seam(void)
     sim_shutdown(&sa); sim_shutdown(&sb); free(a.voxels); free(b.voxels);
 }
 
+/* ---- (4c) CROSS-CHUNK LATERAL flow-to-descent (M4b): on the round planet a valley
+ * descends TANGENTIAL to a chunk's dominant down-face, so a river must cross a seam
+ * SIDEWAYS, not just straight down. Two chunks A and its -X neighbour B whose floor is
+ * one voxel LOWER; a water voxel on A's -X boundary CANNOT fall in-chunk (solid floor
+ * under it, and every in-chunk lateral's own-down is solid too) but CAN step across the
+ * seam into B, from where it descends. With no planet centre set the potential is the
+ * down-axis (-Y) coordinate, so B's sub-seam cell is strictly lower. This is the exact
+ * "fills one chunk, never crosses" bug: it FAILS (crossed==0) if the lateral seam-
+ * descent path (fluid_seam_descent) is removed - only the down-face would cross. ---- */
+static void test_cross_chunk_lateral(void)
+{
+    static Chunk a, b; SimState sa, sb; SeamCtx ctx; long before; int crossed; int x,y,z;
+    back(&a); back(&b);
+    a.neigh[0] = &b;   /* A's -X (FACE_NEG_X) neighbour is B; SIM -X (1) -> neigh[1^1]=neigh[0] */
+    b.neigh[1] = &a;   /* B's +X (FACE_POS_X) neighbour is A                                    */
+    for (z=0;z<CHUNK_DIM;z++) for (x=0;x<CHUNK_DIM;x++) for (y=0;y<=4;y++)
+        put(&a,x,y,z, mk(MAT_STONE,15));       /* A floor solid up to y=4 (no in-chunk descent) */
+    for (z=0;z<CHUNK_DIM;z++) for (x=0;x<CHUNK_DIM;x++) for (y=0;y<=3;y++)
+        put(&b,x,y,z, mk(MAT_STONE,15));       /* B floor one LOWER: B's (15,4,8) is air+lower  */
+    put(&a, 0, 5, 8, mk(MAT_WATER, 15));       /* water on A's -X boundary, resting on A's floor */
+    sim_build_conduct_lut();
+    sim_init(&sa, &a); sim_init(&sb, &b);      /* down = -Y (face 3); -X is a lateral face       */
+    sa.fluid_xfn = seam_xfn; sa.fluid_xfn_user = &ctx;
+    sim_notify_edit(&sa, vox_index(0, 5, 8));
+    before = water_count(&a) + water_count(&b);
+    ctx.pending = 0;
+    sim_tick(&sa);                              /* A's fluid pass enqueues the LATERAL cross-move */
+    crossed = 0;
+    if (ctx.pending && vox_mat(b.voxels[ctx.n_li]) == MAT_AIR &&
+        vox_mat(a.voxels[ctx.src_li]) == MAT_WATER) {
+        b.voxels[ctx.n_li]   = mk(MAT_WATER, 15);
+        a.voxels[ctx.src_li] = mk(MAT_AIR, 0);
+        crossed = 1;
+    }
+    CHECK(crossed, "M4b: boundary water crosses a seam SIDEWAYS (lateral flow-to-descent)");
+    CHECK(vox_mat(b.voxels[vox_index(15,5,8)]) == MAT_WATER,
+          "M4b: water landed in the -X neighbour at the seam");
+    CHECK(vox_mat(a.voxels[vox_index(0,5,8)]) == MAT_AIR, "M4b: lateral source cell vacated");
+    CHECK(water_count(&a) + water_count(&b) == before, "M4b: lateral cross-chunk move CONSERVES water");
+    sim_shutdown(&sa); sim_shutdown(&sb); free(a.voxels); free(b.voxels);
+}
+
 /* ---- (5) water + heat coexist (lava stays hot while water flows) ---- */
 static void test_heat_water_coexist(void)
 {
@@ -359,6 +401,7 @@ int main(void)
     test_spring();
     test_bounded_settle();
     test_cross_chunk_seam();
+    test_cross_chunk_lateral();      /* M4b: water crosses a seam SIDEWAYS (axis pot; before centre) */
     test_heat_water_coexist();
     test_determinism();
     /* ORDER MATTERS: sim_set_planet_center sets a GLOBAL (g_pc_set) that has no reset.

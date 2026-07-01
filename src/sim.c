@@ -820,6 +820,58 @@ static int64_t sim_cell_pot(const SimState *s, int li)
     return sim_pot_xyz(s, li & 0x0F, (li >> 4) & 0x0F, (li >> 8) & 0x0F);
 }
 
+/* 0.5 M4b: can water at li FLOW-TO-DESCENT across the chunk seam on LATERAL `face`?
+ * True iff the neighbour's lateral cell `ln` (one step across `face`) is AIR and its
+ * OWN down-cell `lnd` (ln + the down face) is AIR and STRICTLY-lower potential than
+ * li. This is the in-chunk flow-to-descent rule extended over a seam: on the round
+ * planet a valley usually descends TANGENTIAL to a chunk's dominant down-face, so a
+ * river must step SIDEWAYS across a chunk boundary to keep falling. On success the
+ * neighbour-local coords of `ln` land in pnlx, pnly, pnlz (the cross-deposit target).
+ *
+ * Reads ONE-deep through neigh[face^1] (Face-enum order; SIM_NEIGH is the per-axis
+ * swap, so the neighbour on SIM face `face` is neigh[face^1]). `ln` is out of range on
+ * the face axis only; `lnd` is accepted only when it also lives in that SAME neighbour
+ * (out of range on the face axis only) - the rare corner case where lnd would fall
+ * into a 2-away diagonal chunk is skipped (a cell at the down-boundary is handled by
+ * the gravity / down-cross path first, so nothing is lost). Position-only potential
+ * (sim_pot_xyz) needs no neighbour link and is data-model-identical. */
+static int fluid_seam_descent(const SimState *s, int li, int down, int face,
+                              int *pnlx, int *pnly, int *pnlz)
+{
+    int lx = li & 0x0F, ly = (li >> 4) & 0x0F, lz = (li >> 8) & 0x0F;
+    int ox = lx + SIM_NEIGH[face][0], oy = ly + SIM_NEIGH[face][1], oz = lz + SIM_NEIGH[face][2];
+    int dx = ox + SIM_NEIGH[down][0], dy = oy + SIM_NEIGH[down][1], dz = oz + SIM_NEIGH[down][2];
+    int fax = face >> 1, wx, wy, wz;
+    const Chunk *nc;
+
+    if (s->fluid_xfn == NULL) return 0;             /* single-chunk / tests: closed wall */
+    nc = s->chunk->neigh[face ^ 1];
+    if (nc == NULL) return 0;                       /* window edge: closed wall           */
+    /* `ln` air (out of range on the face axis only, so it lives in nc) */
+    wx = (ox + CHUNK_DIM) & (CHUNK_DIM - 1);
+    wy = (oy + CHUNK_DIM) & (CHUNK_DIM - 1);
+    wz = (oz + CHUNK_DIM) & (CHUNK_DIM - 1);
+    if (vox_mat(chunk_vox(nc, vox_index(wx, wy, wz))) != MAT_AIR) return 0;
+    /* `lnd` = ln's own down; accept only if it too is out of range on the face axis
+     * ONLY (still in nc) - else the descent target is a 2-away diagonal chunk: skip. */
+    {
+        int outx = (dx < 0 || dx >= CHUNK_DIM);
+        int outy = (dy < 0 || dy >= CHUNK_DIM);
+        int outz = (dz < 0 || dz >= CHUNK_DIM);
+        if (outx + outy + outz != 1) return 0;
+        if ((outx && fax != 0) || (outy && fax != 1) || (outz && fax != 2)) return 0;
+        {
+            int wdx = (dx + CHUNK_DIM) & (CHUNK_DIM - 1);
+            int wdy = (dy + CHUNK_DIM) & (CHUNK_DIM - 1);
+            int wdz = (dz + CHUNK_DIM) & (CHUNK_DIM - 1);
+            if (vox_mat(chunk_vox(nc, vox_index(wdx, wdy, wdz))) != MAT_AIR) return 0;
+        }
+    }
+    if (sim_pot_xyz(s, dx, dy, dz) >= sim_cell_pot(s, li)) return 0;  /* descent not DOWNHILL */
+    *pnlx = wx; *pnly = wy; *pnlz = wz;
+    return 1;
+}
+
 /* 0.5 M3: true iff li is a PHASE_LIQUID voxel that can still FLOW under the binary
  * rule - i.e. fluid_step would move it this tick. It MIRRORS fluid_step exactly so
  * the sleep guard and the flow agree on the fixed point: a voxel that can neither
@@ -898,6 +950,18 @@ int sim_liquid_unsettled(const SimState *s, uint16_t li)
                 if (vox_mat(chunk_vox(nc, vox_index(nlx, nly, nlz))) == MAT_AIR &&
                     sim_pot_xyz(s, dnx, dny, dnz) < pot_li)
                     return 1;               /* lower-potential air across the seam: keep retrying */
+            }
+        }
+        /* 0.5 M4b: also stay awake while a LATERAL flow-to-descent across a seam is
+         * possible (a valley descending tangential to the down-face). fluid_step
+         * mirrors this via the same fluid_seam_descent helper, so the sleep guard and
+         * the flow agree on the fixed point - else the boundary cell sleeps and the
+         * river never crosses the seam sideways. */
+        {
+            int f, a, b, c;
+            for (f = 0; f < 6; ++f) {
+                if ((f >> 1) == down_axis) continue;      /* lateral faces only */
+                if (fluid_seam_descent(s, li, down, f, &a, &b, &c)) return 1;
             }
         }
     }
@@ -1045,7 +1109,20 @@ static int fluid_step(SimState *s, int li, int is_source, int is_spring)
     for (oi = 0; oi < 4; ++oi) {
         int face = lat[(oi + rot) & 3];
         int ln, lnd, nlx, nly, nlz;
-        if (!fluid_neigh(lx, ly, lz, face, &ln))      continue;
+        if (!fluid_neigh(lx, ly, lz, face, &ln)) {
+            /* 0.5 M4b: the lateral neighbour is OUT-OF-CHUNK. On the round planet a
+             * valley's descent is usually TANGENTIAL to the dominant down-face, so a
+             * river must step SIDEWAYS across the seam to keep falling. Extend the
+             * flow-to-descent rule over the seam: if the neighbour's lateral cell is
+             * air and its own down is air + strictly lower, enqueue a deferred ATOMIC
+             * cross-move to it (worldca applies + wakes the neighbour). A spring keeps
+             * its held cell - its DONATED water (plain MAT_WATER) is what crosses. */
+            if (!is_spring &&
+                fluid_seam_descent(s, li, down, face, &nlx, &nly, &nlz) &&
+                s->fluid_xfn(s->fluid_xfn_user, s, li, face ^ 1, nlx, nly, nlz))
+                return 0;                /* cross-move enqueued (deferred, not in-chunk) */
+            continue;
+        }
         if (vox_mat(vox[ln]) != MAT_AIR || moved_test(s, ln)) continue;
         nlx = ln & 0x0F; nly = (ln >> 4) & 0x0F; nlz = (ln >> 8) & 0x0F;
         if (!fluid_neigh(nlx, nly, nlz, down, &lnd))  continue;   /* its down */

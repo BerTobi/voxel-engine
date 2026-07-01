@@ -161,6 +161,19 @@ static float      g_frame_mvp[16];
 static int        g_frame_have_mvp = 0;
 static float      g_frame_sun = 1.0f;
 
+/* 0.5 frustum culling: 6 world-space planes {a,b,c,d} (inside = a*x+b*y+c*z+d>=0),
+ * extracted from the frame MVP each render_begin. g_frustum_valid gates the test off
+ * when no MVP was given (headless one-chunk path). Per-frame drawn/culled counters
+ * (both passes) so the HUD / telemetry can show the cut. VIEW-ONLY: touches no sim
+ * or voxel state, so the deterministic CA is unaffected. */
+static float      g_frustum[6][4];
+static int        g_frustum_valid = 0;
+static int        g_cull_enabled  = 1;   /* VOXEL_NOCULL clears it (A/B verification) */
+static int        g_drawn_chunks  = 0;
+static int        g_culled_chunks = 0;
+
+void render_set_cull_enabled(int enabled) { g_cull_enabled = enabled ? 1 : 0; }
+
 /* Current view-distance fog band (world-space depth). Defaults match the radius-6
  * window (~92 vox); render_set_fog updates them + pushes to both chunk programs. */
 static float      g_fog_start = 55.0f;
@@ -870,6 +883,58 @@ void render_set_fog(float start, float end)
         glUseProgram(g_opaque.program);  /* leave opaque current */
 }
 
+/* Extract the 6 frustum planes (world space) from a COLUMN-MAJOR MVP via
+ * Gribb-Hartmann (m[col*4+row]; rowN = [m[N],m[4+N],m[8+N],m[12+N]]; clip.w +- clip.xyz).
+ * Each plane is normalized by |(a,b,c)| so plane distances are in world-voxel units
+ * (lets the AABB inflate be a real 1-voxel margin). Inside a plane iff a*x+b*y+c*z+d>=0. */
+static void extract_frustum(const float *m)
+{
+    int p, i;
+    /* row3 +/- row{0,1,2}: left,right, bottom,top, near,far */
+    const float rows[6][4] = {
+        { m[3]+m[0], m[7]+m[4], m[11]+m[8],  m[15]+m[12] },  /* left   */
+        { m[3]-m[0], m[7]-m[4], m[11]-m[8],  m[15]-m[12] },  /* right  */
+        { m[3]+m[1], m[7]+m[5], m[11]+m[9],  m[15]+m[13] },  /* bottom */
+        { m[3]-m[1], m[7]-m[5], m[11]-m[9],  m[15]-m[13] },  /* top    */
+        { m[3]+m[2], m[7]+m[6], m[11]+m[10], m[15]+m[14] },  /* near   */
+        { m[3]-m[2], m[7]-m[6], m[11]-m[10], m[15]-m[14] },  /* far    */
+    };
+    for (p = 0; p < 6; ++p) {
+        float a = rows[p][0], b = rows[p][1], c = rows[p][2];
+        float len = (float)sqrt((double)(a*a + b*b + c*c));
+        float inv = (len > 1e-12f) ? 1.0f / len : 1.0f;
+        for (i = 0; i < 4; ++i) g_frustum[p][i] = rows[p][i] * inv;
+    }
+}
+
+/* True if the chunk's world AABB [ox..ox+16]^3 (inflated 1 voxel to avoid edge-pop)
+ * is at least partially inside the frustum. Positive-vertex test: if the AABB's most
+ * positive corner along a plane normal is behind that plane, the whole box is outside. */
+static int slot_in_frustum(const ChunkSlot *s)
+{
+    float mnx = s->ox - 1.0f, mny = s->oy - 1.0f, mnz = s->oz - 1.0f;
+    float mxx = s->ox + (float)CHUNK_DIM + 1.0f;
+    float mxy = s->oy + (float)CHUNK_DIM + 1.0f;
+    float mxz = s->oz + (float)CHUNK_DIM + 1.0f;
+    int p;
+    for (p = 0; p < 6; ++p) {
+        float a = g_frustum[p][0], b = g_frustum[p][1], c = g_frustum[p][2], d = g_frustum[p][3];
+        float px = (a >= 0.0f) ? mxx : mnx;
+        float py = (b >= 0.0f) ? mxy : mny;
+        float pz = (c >= 0.0f) ? mxz : mnz;
+        if (a*px + b*py + c*pz + d < 0.0f)
+            return 0;                     /* fully outside this plane -> cull */
+    }
+    return 1;
+}
+
+/* Per-frame drawn/culled chunk counts (both passes) since the last render_begin. */
+void render_frustum_stats(int *drawn, int *culled)
+{
+    if (drawn)  *drawn  = g_drawn_chunks;
+    if (culled) *culled = g_culled_chunks;
+}
+
 void render_begin(const float *mvp4x4, float sun)
 {
     if (!g_inited)
@@ -881,9 +946,13 @@ void render_begin(const float *mvp4x4, float sun)
         int k;
         for (k = 0; k < 16; ++k) g_frame_mvp[k] = mvp4x4[k];
         g_frame_have_mvp = 1;
+        extract_frustum(g_frame_mvp);      /* 0.5: planes for per-chunk culling */
+        g_frustum_valid = 1;
     } else {
         g_frame_have_mvp = 0;
+        g_frustum_valid = 0;               /* headless one-chunk path: draw all */
     }
+    g_drawn_chunks = g_culled_chunks = 0;  /* reset per-frame cull counters      */
     g_frame_sun = (float)sun;
 
     /* Derive u_sun_tint from the live sun: a cool blue night, a warm daylight,
@@ -948,6 +1017,11 @@ void render_draw_chunk(int slot)
     s = &g_slots[slot];
     if (s->vbo == 0 || s->ibo == 0 || s->index_count == 0)
         return;   /* empty / unset slot -> no-op */
+    if (g_frustum_valid && g_cull_enabled && !slot_in_frustum(s)) {   /* 0.5: skip off-screen chunks */
+        ++g_culled_chunks;
+        return;
+    }
+    ++g_drawn_chunks;
 
     /* Per-chunk origin: the only per-chunk uniform (Section 5.3). */
     if (g_opaque.u_chunk_origin >= 0)
@@ -1068,6 +1142,11 @@ void render_end(void)
             ChunkSlot *s = &g_slots[i];
             if (s->liq_vbo == 0 || s->liq_ibo == 0 || s->liq_index_count == 0)
                 continue;   /* no liquid geometry in this slot */
+            if (g_frustum_valid && g_cull_enabled && !slot_in_frustum(s)) {   /* 0.5: cull off-screen liquid */
+                ++g_culled_chunks;
+                continue;
+            }
+            ++g_drawn_chunks;
 
             if (g_liquid.u_chunk_origin >= 0)
                 glUniform3f(g_liquid.u_chunk_origin, s->ox, s->oy, s->oz);

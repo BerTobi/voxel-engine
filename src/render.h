@@ -77,6 +77,12 @@ void render_draw_chunk(int slot);
  * swap buffers - that is the platform's plat_swap_buffers(). */
 void render_end(void);
 
+/* 0.5 frustum culling: chunks drawn vs culled (both passes) since the last
+ * render_begin. For the FPS HUD / perf telemetry. */
+void render_frustum_stats(int *drawn, int *culled);
+/* Enable/disable frustum culling at runtime (VOXEL_NOCULL A/B check). Default on. */
+void render_set_cull_enabled(int enabled);
+
 /* Draw a wireframe outline around world voxel (wx,wy,wz) - the block-target
  * highlight for break/place. Uses the MVP captured in render_begin, depth-tested
  * but not depth-writing. Call AFTER render_end (so it overlays the scene) and

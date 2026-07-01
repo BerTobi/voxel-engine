@@ -1674,6 +1674,10 @@ int main(void)
                            "upload).\nSee voxel_log.txt next to the game for details.");
         return 1;
     }
+    /* 0.5 frustum culling A/B: VOXEL_NOCULL forces every chunk to draw (for verifying
+     * the cull removes ONLY off-screen chunks). Default: culling on. */
+    if (getenv("VOXEL_NOCULL") != NULL)
+        render_set_cull_enabled(0);
 
     /* ---- 4. Two reusable greedy-mesh scratch buffers --------------------- *
      * The mesher emits TWO streams per chunk (ARCHITECTURE 5.1/5.6): the opaque
@@ -2935,6 +2939,17 @@ int main(void)
                     render_draw_chunk(slot);
             }
             render_end();
+            /* 0.5 frustum-cull telemetry (VOXEL_CULL_LOG): drawn vs culled, throttled.
+             * The GUI app has no console on XP, so this also lands in voxel_log.txt. */
+            if (getenv("VOXEL_CULL_LOG") != NULL) {
+                static long cull_frame = 0;
+                if ((cull_frame++ % 120) == 0) {
+                    int dn = 0, cl = 0; render_frustum_stats(&dn, &cl);
+                    fprintf(stderr, "cull: drawn=%d culled=%d (%.0f%% culled) resident=%u\n",
+                            dn, cl, (dn + cl) ? 100.0 * cl / (dn + cl) : 0.0,
+                            (unsigned)world_resident_count(world));
+                }
+            }
 
             /* 0.3: remote-player avatars - drawn after render_end (so they sit in
              * the frame's depth + reuse its MVP), before the overlays. No-op in

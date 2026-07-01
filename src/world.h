@@ -187,7 +187,7 @@ typedef struct {
  * refinement; 6 is the simple fix that covers the useful range. */
 #define WORLD_BAND_HALF  6                       /* layers above/below center_cy */
 #define WORLD_BAND_H     (2 * WORLD_BAND_HALF + 1)            /* 13 layers     */
-#define WORLD_WINDOW_CHUNKS (WORLD_DIAM * WORLD_DIAM * WORLD_BAND_H) /* 1521    */
+#define WORLD_WINDOW_CHUNKS (WORLD_DIAM * WORLD_DIAM * WORLD_BAND_H) /* 65*65*13 = 54925 at the r=32 ceiling */
 
 /* SLAB POOL (Section 7 "Fixed-Size Slab Pool, No Per-Chunk malloc"). A single
  * pre-allocated contiguous array of Chunk slots + a free-list STACK of indices.
@@ -199,16 +199,17 @@ typedef struct {
  * pushes it back; a full pool is a hard error (the window is sized so it cannot
  * happen under the distance policy, asserted in tests).
  *
- *   pool slots : WORLD_WINDOW_CHUNKS + WORLD_POOL_SLACK = 338 + 64 = 402
- *   pool bytes : 402 * sizeof(Chunk) ~= 402 * 16 KiB ~= 6.3 MiB (one block)
+ *   pool slots : WORLD_WINDOW_CHUNKS + WORLD_POOL_SLACK = 54925 + 1690 = 56615 (r=32 ceiling)
+ *   pool bytes : 56615 * sizeof(Chunk) (Chunk is now a small record; VOXELS live in
+ *                the separate slab pool, so this is ~11 MiB of records, not 900 MiB)
  *
  * The pool is reserved ONCE at world_init (Section 7 "reserve big and early"):
  * one calloc of WORLD_POOL_SLOTS * sizeof(Chunk). On the XP target this single
  * contiguous block is grabbed before the heap fragments. */
 #define WORLD_POOL_SLACK  (2u * WORLD_DIAM * WORLD_BAND_H)  /* 2 leading curtains
-                                 * (=306 at the radius-8 max); scales with the max so a
+                                 * (=1690 at the r=32 ceiling); scales with the max so a
                                  * curtain-plus always fits during a budgeted move */
-#define WORLD_POOL_SLOTS  (WORLD_WINDOW_CHUNKS + WORLD_POOL_SLACK)  /* 1521+256 = 1777 */
+#define WORLD_POOL_SLOTS  (WORLD_WINDOW_CHUNKS + WORLD_POOL_SLACK)  /* 54925+1690 = 56615: the record pool is sized for the FULL r=32 window (fits any runtime view_radius) */
 
 /* SLAB SUB-POOL (0.5 M1 sparse-air storage). A Chunk RECORD (~96 B: coords,
  * neigh[6], flags, the voxels pointer + uniform_word) is always resident in the
